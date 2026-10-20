@@ -94,7 +94,7 @@ impl ModelRegistry {
     /// - Whatever [`ModelRegistry::validate`] returns, if any parsed model fails validation.
     pub fn load_from_file(path: &str) -> Result<ModelRegistry> {
         let contents = std::fs::read_to_string(path)?;
-        let catalog: CatalogFile = serde_yaml::from_str(&contents)?;
+        let catalog: CatalogFile = crate::yaml::from_str(&contents)?;
 
         let mut registry = ModelRegistry::new(format!("file://{path}"), catalog.version);
         for model in catalog.models {

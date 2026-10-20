@@ -185,7 +185,7 @@ impl RoutePolicy {
     }
 
     pub fn from_yaml(s: &str) -> Result<Self> {
-        Ok(serde_yaml::from_str(s)?)
+        Ok(crate::yaml::from_str(s)?)
     }
 
     fn for_class(&self, c: TaskClass) -> ClassPolicy {

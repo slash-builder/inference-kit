@@ -85,6 +85,7 @@ pub mod routed;
 pub mod router;
 pub mod service;
 pub mod types;
+mod yaml;
 
 // Re-export key types at crate root
 #[cfg(feature = "embedding")]

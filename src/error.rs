@@ -137,7 +137,7 @@ pub enum AiKitError {
 
     /// YAML parsing error.
     #[error("YAML parse error: {0}")]
-    YamlError(#[from] serde_yaml::Error),
+    YamlError(#[from] serde_saphyr::Error),
 
     /// JSON parsing error.
     #[error("JSON parse error: {0}")]
