@@ -1,0 +1,42 @@
+# cargo-deny policy for inference-kit (from the studio template). Standard: context/rust-and-crates-io-standard.md
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"            # a dependency that was yanked is a build we should not ship
+# Vulnerabilities and yanked crates are always errors. A crate flagged "unmaintained" is tracked debt: it is an
+# error here until the Kit lists it below WITH a reason and a review date, so it can never be silently ignored.
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "paste (unmaintained proc-macro) via gemm via candle-core; upstream's choice. Review 2026-11-19; drop when candle moves off it." },
+  { id = "RUSTSEC-2026-0367", reason = "zip 8.6.0 via candle-core: only ZipArchive::new is called to read model entries (pickle.rs, npy.rs); extract() is never used. Review 2026-11-19; fixed in zip >= 9, needs a candle bump." },
+  { id = "RUSTSEC-2026-0368", reason = "same as RUSTSEC-2026-0367 (ZipStreamReader/ZipArchive::extract only)." },
+  { id = "RUSTSEC-2026-0369", reason = "same as RUSTSEC-2026-0367 (ZipArchive::extract only)." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+unused-allowed-license = "allow"   # the allow-list is shared; not every Kit uses every licence
+# Permissive only (Rust API Guidelines, Necessities: the crate and its dependencies have a permissive license).
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",   # webpki-roots (Mozilla CA bundle data), pulled in by reqwest/hyper-rustls; permissive
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"  # only crates.io: a public crate cannot depend on a private registry
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
