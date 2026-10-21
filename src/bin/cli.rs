@@ -52,7 +52,7 @@ fn eprint_usage() {
     eprintln!("  ai-kit-cli cache-stats [--catalog <path>]");
     eprintln!("  ai-kit-cli devices");
     eprintln!("  ai-kit-cli route (--prompt <text> | --prompt-file <path> | --batch <jsonl>) [--explain] [--class C] [--privacy private|shareable]");
-    eprintln!("                   [--verify none|nonempty|json|svg|exec|maxwords:N] [--local-model <id>] [--device D] [--cloud-cmd <shell cmd>] [--policy <yaml>] [--max-tokens N]");
+    eprintln!("                   [--verify none|nonempty|json|svg|exec|maxwords:N]  (exec runs model-generated python UNSANDBOXED) [--local-model <id>] [--device D] [--cloud-cmd <shell cmd>] [--policy <yaml>] [--max-tokens N]");
     eprintln!("  ai-kit-cli imagine --model <id> --prompt <text> --out <file.png> [--width N] [--height N] [--steps N] [--seed N] [--guidance F] [--negative <text>] [--device D]");
     eprintln!("  ai-kit-cli embed --model <id> (--text <t> ...) [--query <q>] [--device D]");
     eprintln!("  ai-kit-cli bench --model <id> (--prompt <text> | --prompt-file <path>) [--device D] [--max-tokens N] [--repeat R]");
@@ -468,8 +468,74 @@ impl ai_kit::InferenceService for CommandCloud {
     }
 }
 
+/// A private scratch directory for one verifier run: created fresh (never reused), readable only by the current user.
+///
+/// A predictable name in the shared temp directory lets another local user pre-plant a symlink there, and a plain write would follow it
+/// and clobber whatever it points at. `create` fails if the path already exists (a symlink included), so a collision is retried under a
+/// new name rather than followed.
+#[cfg(feature = "candle")]
+fn private_scratch_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut last = None;
+    for _ in 0..16 {
+        let name = format!(
+            "ak-verify-{}-{nanos:x}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        );
+        let dir = base.join(name);
+        match create_private_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no free scratch directory name")))
+}
+
+/// Create `dir` (not its parents), mode 0700 on Unix. Fails with `AlreadyExists` if anything, a dangling symlink included, is there.
+#[cfg(feature = "candle")]
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+}
+
+/// Write `contents` to a new file `name` in `dir`: created exclusively (it must not already exist), mode 0600 on Unix.
+#[cfg(feature = "candle")]
+fn write_private_file(
+    dir: &std::path::Path,
+    name: &str,
+    contents: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let path = dir.join(name);
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(&path)?.write_all(contents.as_bytes())?;
+    Ok(path)
+}
+
 /// `exec` verifier: pull the first ```python block (or the whole answer) out of a completion,
 /// append `tests`, and run it with python3. Passing means exit code 0 within 10 seconds.
+///
+/// **This runs model-generated code on the host with the caller's full privileges. It is not sandboxed**: no container, no seccomp, no
+/// network or filesystem restriction, no resource limit beyond the 10-second wall-clock kill. The script is kept in a private (0700)
+/// directory with a 0600 file so other local users cannot read or swap it; that protects the file, not the machine. Use it only on a
+/// machine and an account where running arbitrary code from the model is acceptable, never on unreviewed prompts from others.
 #[cfg(feature = "candle")]
 fn exec_verifier(tests: String) -> ai_kit::Verifier {
     ai_kit::Verifier::Custom(std::sync::Arc::new(move |out: &str| {
@@ -477,10 +543,13 @@ fn exec_verifier(tests: String) -> ai_kit::Verifier {
             Some(b) => b.strip_prefix("python").unwrap_or(b).to_string(),
             None => out.to_string(),
         };
-        let path = std::env::temp_dir().join(format!("ak-verify-{}.py", std::process::id()));
-        if std::fs::write(&path, format!("{code}\n{tests}\n")).is_err() {
+        let Ok(dir) = private_scratch_dir(&std::env::temp_dir()) else {
             return false;
-        }
+        };
+        let Ok(path) = write_private_file(&dir, "verify.py", &format!("{code}\n{tests}\n")) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return false;
+        };
         let Ok(mut child) = std::process::Command::new("python3")
             .arg(&path)
             .stdout(std::process::Stdio::null())
@@ -502,7 +571,7 @@ fn exec_verifier(tests: String) -> ai_kit::Verifier {
                 }
             }
         };
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
         ok
     }))
 }
@@ -1067,5 +1136,50 @@ fn cmd_embed(args: &[String]) -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(all(test, feature = "candle", unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt};
+
+    #[test]
+    fn the_scratch_dir_is_new_private_and_never_reused() {
+        let base = tempfile::tempdir().unwrap();
+        let a = private_scratch_dir(base.path()).unwrap();
+        let b = private_scratch_dir(base.path()).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::metadata(&a).unwrap().mode() & 0o777, 0o700);
+        let f = write_private_file(&a, "verify.py", "print(1)\n").unwrap();
+        assert_eq!(std::fs::metadata(&f).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "print(1)\n");
+    }
+
+    #[test]
+    fn a_pre_planted_symlink_is_refused_not_followed() {
+        let base = tempfile::tempdir().unwrap();
+        let victim = base.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        // a symlink where the directory would go: creation must fail rather than follow it
+        let planted = base.path().join("planted");
+        symlink(base.path(), &planted).unwrap();
+        let e = create_private_dir(&planted).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        // and a symlink where the file would go: exclusive creation refuses it
+        let dir = private_scratch_dir(base.path()).unwrap();
+        symlink(&victim, dir.join("verify.py")).unwrap();
+        assert!(write_private_file(&dir, "verify.py", "evil").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+    }
+
+    #[test]
+    fn the_exec_verifier_passes_and_fails_on_the_exit_code() {
+        let v = exec_verifier("assert add(1, 2) == 3".to_string());
+        let ai_kit::Verifier::Custom(f) = v else {
+            panic!("exec is a custom verifier")
+        };
+        assert!(f("```python\ndef add(a, b):\n    return a + b\n```"));
+        assert!(!f("```python\ndef add(a, b):\n    return a - b\n```"));
     }
 }
