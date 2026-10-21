@@ -81,6 +81,12 @@ impl Pricing {
             + per_million(u.cache_write_tokens, self.cache_write_micro_per_mtok)
     }
 
+    /// True when neither the input nor the output rate is declared. Such a price makes every worst case zero, so a ledger could never refuse
+    /// the call: a provider that leaves home must not be run on it.
+    pub fn is_unpriced(&self) -> bool {
+        self.input_micro_per_mtok == 0 && self.output_micro_per_mtok == 0
+    }
+
     /// The most a call could cost: every input token at the highest input rate (a cache write is the dearest) and the full output allowance.
     pub fn worst_case(&self, input_tokens: u64, max_output_tokens: u64) -> u64 {
         let in_rate = self
@@ -96,6 +102,13 @@ impl Pricing {
 #[derive(Debug)]
 #[must_use = "settle or release a reservation, or the money stays reserved"]
 pub struct Reservation(u64);
+
+impl Reservation {
+    /// The micro-dollars this reservation holds.
+    pub fn amount(&self) -> u64 {
+        self.0
+    }
+}
 
 struct State {
     remaining: u64,
@@ -184,6 +197,14 @@ impl Ledger {
                 d.spends.push_back((now, actual));
             }
         }
+    }
+
+    /// The call may have been billed but the cost is not known (the reply carried no usage, or the connection timed out or broke after the
+    /// request was sent): charge the **whole reservation**, the worst case it was sized for. Charging nothing here would let a provider that
+    /// omits usage, or a network that drops replies, spend without limit.
+    pub fn settle_reserved(&self, r: Reservation) {
+        let amount = r.0;
+        self.settle(r, amount);
     }
 
     /// The call failed without being billed: give the reservation back, charge nothing.

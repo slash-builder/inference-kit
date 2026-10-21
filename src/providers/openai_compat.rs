@@ -82,6 +82,12 @@ impl fmt::Debug for OpenAiCompatAdapter {
     }
 }
 
+/// Why a POST failed, and whether the vendor may nevertheless have billed it.
+struct PostFailure {
+    err: ProviderError,
+    maybe_billed: bool,
+}
+
 fn host_of(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1)?;
     let authority = rest.split('/').next()?;
@@ -122,6 +128,11 @@ impl OpenAiCompatAdapter {
         creds: Option<Arc<dyn CredentialSource>>,
         budget: Option<Budget>,
     ) -> Result<Self, ConfigError> {
+        if let Some(b) = &budget {
+            if cfg.locality.leaves_home() {
+                b.validate()?;
+            }
+        }
         let host = host_of(&cfg.base_url).ok_or(ConfigError::BadUrl)?;
         match cfg.locality {
             Locality::Device if !is_loopback(&host) => {
@@ -234,24 +245,35 @@ impl OpenAiCompatAdapter {
         self.discover_models("").await.is_ok()
     }
 
-    async fn post(&self, path: &str, body: &Value) -> Result<(u64, Value, u64), ProviderError> {
-        let bytes = serde_json::to_vec(body).map_err(|_| ProviderError::Other)?;
+    /// POST and parse. On failure the error says whether the request may have reached the vendor (`maybe_billed`): a connection that was
+    /// never made, or a refusal to even build the request, cannot have been.
+    async fn post(&self, path: &str, body: &Value) -> Result<(u64, Value, u64), PostFailure> {
+        let not_sent = |err| PostFailure {
+            err,
+            maybe_billed: false,
+        };
+        let bytes = serde_json::to_vec(body).map_err(|_| not_sent(ProviderError::Other))?;
         let sent = bytes.len() as u64;
         let mut rb = self
             .http
             .post(self.url(path))
             .header("content-type", "application/json")
             .body(bytes);
-        if let Some(k) = self.auth()? {
+        if let Some(k) = self.auth().map_err(not_sent)? {
             rb = rb.bearer_auth(k);
         }
-        let resp = rb.send().await.map_err(|e| self.transport(e))?;
+        let transport_failure = |e: reqwest::Error| PostFailure {
+            maybe_billed: super::may_have_been_billed(&e),
+            err: self.transport(e),
+        };
+        let resp = rb.send().await.map_err(transport_failure)?;
         let status = resp.status().as_u16();
         let retry = retry_after(resp.headers());
-        let text = resp.text().await.map_err(|e| self.transport(e))?;
+        let text = resp.text().await.map_err(transport_failure)?;
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if status != 200 {
-            return Err(classify(status, retry, &parsed));
+            // an error status is not billed
+            return Err(not_sent(classify(status, retry, &parsed)));
         }
         Ok((sent, parsed, text.len() as u64))
     }
@@ -283,11 +305,15 @@ impl OpenAiCompatAdapter {
         });
         let (sent, resp, received) = match self.post("/v1/chat/completions", &body).await {
             Ok(r) => r,
-            Err(e) => {
+            Err(f) => {
                 if let (Some(b), Some(r)) = (&self.budget, reservation) {
-                    b.ledger.release(r);
+                    if f.maybe_billed {
+                        b.ledger.settle_reserved(r);
+                    } else {
+                        b.ledger.release(r);
+                    }
                 }
-                return Err(e);
+                return Err(f.err);
             }
         };
         let usage = Usage {
@@ -296,7 +322,14 @@ impl OpenAiCompatAdapter {
             ..Usage::default()
         };
         if let (Some(b), Some(r)) = (&self.budget, reservation) {
-            b.ledger.settle(r, b.pricing.cost(&usage));
+            if resp["usage"]["prompt_tokens"].is_u64()
+                && resp["usage"]["completion_tokens"].is_u64()
+            {
+                b.ledger.settle(r, b.pricing.cost(&usage));
+            } else {
+                // no usage in a billed reply: charge the worst case, never zero
+                b.ledger.settle_reserved(r);
+            }
         }
         let choice = &resp["choices"][0];
         let message = &choice["message"];
@@ -348,12 +381,43 @@ impl OpenAiCompatAdapter {
             .embedding_model
             .as_deref()
             .ok_or(ProviderError::Other)?;
-        let (sent, resp, received) = self
+        // a remote embedding call is paid for like a chat call: reserve first, refuse before sending if it does not fit
+        let reservation = match &self.budget {
+            Some(b) => Some(b.ledger.reserve(b.embedding_worst_case(&p.inputs))?),
+            None => None,
+        };
+        let posted = self
             .post(
                 "/v1/embeddings",
                 &json!({"model": model, "input": p.inputs}),
             )
-            .await?;
+            .await;
+        let (sent, resp, received) = match posted {
+            Ok(r) => r,
+            Err(f) => {
+                if let (Some(b), Some(r)) = (&self.budget, reservation) {
+                    if f.maybe_billed {
+                        b.ledger.settle_reserved(r);
+                    } else {
+                        b.ledger.release(r);
+                    }
+                }
+                return Err(f.err);
+            }
+        };
+        // settle from the reply's usage when it has one, else at the reserved estimate
+        if let (Some(b), Some(r)) = (&self.budget, reservation) {
+            match resp["usage"]["prompt_tokens"].as_u64() {
+                Some(t) => b.ledger.settle(
+                    r,
+                    b.pricing.cost(&Usage {
+                        input_tokens: t,
+                        ..Usage::default()
+                    }),
+                ),
+                None => b.ledger.settle_reserved(r),
+            }
+        }
         let mut vectors: Vec<Vec<f32>> = resp["data"]
             .as_array()
             .map(|a| {
@@ -704,7 +768,11 @@ mod tests {
         let b = || {
             Some(Budget {
                 ledger: Arc::new(Ledger::new(1_000_000)),
-                pricing: Pricing::default(),
+                pricing: Pricing {
+                    input_micro_per_mtok: 1_000_000,
+                    output_micro_per_mtok: 2_000_000,
+                    ..Pricing::default()
+                },
             })
         };
         assert_eq!(
@@ -999,5 +1067,164 @@ mod tests {
             sink.0.lock().unwrap().is_empty(),
             "a purely local answer needs no egress audit record"
         );
+    }
+
+    // ---- the ledger fails closed ----
+
+    const PAID: Pricing = Pricing {
+        input_micro_per_mtok: 1_000_000,
+        output_micro_per_mtok: 2_000_000,
+        cache_read_micro_per_mtok: 0,
+        cache_write_micro_per_mtok: 0,
+    };
+
+    fn saas(
+        s: &MockServer,
+        ledger: &Arc<Ledger>,
+        pricing: Pricing,
+        timeout: Duration,
+    ) -> Result<OpenAiCompatAdapter, ConfigError> {
+        let mut c = cfg(s);
+        c.locality = Locality::Saas;
+        c.credential_name = Some("key".into());
+        c.embedding_model = Some("embed-model".into());
+        c.timeout = timeout;
+        OpenAiCompatAdapter::new(
+            c,
+            Some(Arc::new(InMemoryCredentials::with("key", "sk-test"))),
+            Some(Budget {
+                ledger: ledger.clone(),
+                pricing,
+            }),
+        )
+    }
+    fn embed_req(inputs: &[&str]) -> Request {
+        Request::Embedding(EmbeddingParams {
+            model_id: "x".into(),
+            inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
+            normalize: false,
+            session_id: None,
+            request_id: None,
+        })
+    }
+    fn chat_worst() -> u64 {
+        PAID.worst_case("hi".len() as u64 / 3 + 1, 50)
+    }
+
+    #[tokio::test]
+    async fn saas_embeddings_are_reserved_and_refused_before_anything_is_sent_when_they_do_not_fit()
+    {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"data":[{"embedding":[1.0]}],"usage":{"prompt_tokens":1}}),
+                ),
+            )
+            .expect(0)
+            .mount(&s)
+            .await;
+        // one micro-dollar cannot cover the worst case of a long input
+        let ledger = Arc::new(Ledger::new(1));
+        let a = saas(&s, &ledger, PAID, Duration::from_secs(5)).unwrap();
+        let long = "x".repeat(30_000_000);
+        assert_eq!(
+            a.call(&embed_req(&[&long])).await.unwrap_err(),
+            ProviderError::BudgetExceeded
+        );
+        assert_eq!(ledger.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn saas_embeddings_are_settled_from_the_reported_usage() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"data":[{"embedding":[1.0]}],"usage":{"prompt_tokens":2000}}),
+            ))
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas(&s, &ledger, PAID, Duration::from_secs(5)).unwrap();
+        a.call(&embed_req(&["a"])).await.unwrap();
+        assert_eq!(
+            ledger.spent(),
+            PAID.cost(&Usage {
+                input_tokens: 2000,
+                ..Usage::default()
+            })
+        );
+        assert_eq!(ledger.available(), 10_000_000 - ledger.spent());
+    }
+
+    #[tokio::test]
+    async fn a_chat_200_without_usage_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        serve(
+            &s,
+            200,
+            json!({"model":"m","choices":[{"message":{"content":"x"},"finish_reason":"stop"}]}),
+        )
+        .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas(&s, &ledger, PAID, Duration::from_secs(5)).unwrap();
+        a.call(&text("hi")).await.unwrap();
+        assert_eq!(ledger.spent(), chat_worst());
+    }
+
+    #[tokio::test]
+    async fn a_chat_timeout_after_the_request_was_sent_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(chat_ok("late", "stop"))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas(&s, &ledger, PAID, Duration::from_millis(200)).unwrap();
+        assert_eq!(
+            a.call(&text("hi")).await.unwrap_err(),
+            ProviderError::Timeout
+        );
+        assert_eq!(ledger.spent(), chat_worst());
+    }
+
+    #[tokio::test]
+    async fn a_chat_connection_that_was_never_made_is_released_at_no_charge() {
+        let s = MockServer::start().await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let mut c = cfg(&s);
+        c.locality = Locality::Saas;
+        c.base_url = "http://127.0.0.1:1".into();
+        c.credential_name = Some("key".into());
+        let a = OpenAiCompatAdapter::new(
+            c,
+            Some(Arc::new(InMemoryCredentials::with("key", "sk-test"))),
+            Some(Budget {
+                ledger: ledger.clone(),
+                pricing: PAID,
+            }),
+        )
+        .unwrap();
+        assert!(a.call(&text("hi")).await.is_err());
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[tokio::test]
+    async fn an_unpriced_remote_provider_is_refused() {
+        let s = MockServer::start().await;
+        let ledger = Arc::new(Ledger::new(1_000_000));
+        assert_eq!(
+            saas(&s, &ledger, Pricing::default(), Duration::from_secs(5)).err(),
+            Some(ConfigError::UnpricedProvider),
+            "zero prices make every reservation free"
+        );
+        assert!(saas(&s, &ledger, PAID, Duration::from_secs(5)).is_ok());
     }
 }

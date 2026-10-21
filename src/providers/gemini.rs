@@ -33,6 +33,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Why a POST failed, and whether the vendor may nevertheless have billed it.
+struct PostFailure {
+    err: ProviderError,
+    maybe_billed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct GeminiConfig {
     pub provider_id: String,
@@ -85,6 +91,7 @@ impl GeminiAdapter {
         creds: Arc<dyn CredentialSource>,
         budget: Budget,
     ) -> Result<Self, ConfigError> {
+        budget.validate()?;
         creds
             .get(&cfg.credential_name)
             .map_err(|_| ConfigError::CredentialUnavailable)?;
@@ -120,6 +127,14 @@ impl GeminiAdapter {
             .map_err(|_| ProviderError::Auth)
     }
 
+    fn close_failed(&self, r: crate::budget::Reservation, f: &PostFailure) {
+        if f.maybe_billed {
+            self.budget.ledger.settle_reserved(r);
+        } else {
+            self.budget.ledger.release(r);
+        }
+    }
+
     /// `GET /v1beta/models` as cards. A model that lists `generateContent` serves text, `embedContent` serves embeddings; capability flags the
     /// listing does not carry stay unknown. Only the first page is read. `today` is `YYYY-MM-DD`.
     pub async fn discover_models(&self, today: &str) -> Result<Vec<ModelCard>, ProviderError> {
@@ -141,10 +156,19 @@ impl GeminiAdapter {
         Ok(parse_models(&self.cfg.provider_id, &body, today))
     }
 
-    async fn post(&self, path: &str, body: &Value) -> Result<(u64, Value, u64), ProviderError> {
-        let key = self.key()?;
-        let bytes = serde_json::to_vec(body).map_err(|_| ProviderError::Other)?;
+    /// POST and parse. On failure the error says whether the request may have reached the vendor (`maybe_billed`).
+    async fn post(&self, path: &str, body: &Value) -> Result<(u64, Value, u64), PostFailure> {
+        let not_sent = |err| PostFailure {
+            err,
+            maybe_billed: false,
+        };
+        let key = self.key().map_err(not_sent)?;
+        let bytes = serde_json::to_vec(body).map_err(|_| not_sent(ProviderError::Other))?;
         let sent = bytes.len() as u64;
+        let transport_failure = |e: reqwest::Error| PostFailure {
+            maybe_billed: super::may_have_been_billed(&e),
+            err: transport_error(e),
+        };
         let resp = self
             .http
             .post(self.url(path))
@@ -153,13 +177,14 @@ impl GeminiAdapter {
             .body(bytes)
             .send()
             .await
-            .map_err(transport_error)?;
+            .map_err(transport_failure)?;
         let status = resp.status().as_u16();
         let retry = retry_after(resp.headers());
-        let text = resp.text().await.map_err(transport_error)?;
+        let text = resp.text().await.map_err(transport_failure)?;
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if status != 200 {
-            return Err(classify(status, retry, &parsed));
+            // an error status is not billed
+            return Err(not_sent(classify(status, retry, &parsed)));
         }
         Ok((sent, parsed, text.len() as u64))
     }
@@ -185,9 +210,9 @@ impl GeminiAdapter {
         let path = format!("/v1beta/models/{}:generateContent", self.cfg.model);
         let (sent, resp, received) = match self.post(&path, &body).await {
             Ok(r) => r,
-            Err(e) => {
-                self.budget.ledger.release(reservation);
-                return Err(e);
+            Err(f) => {
+                self.close_failed(reservation, &f);
+                return Err(f.err);
             }
         };
         let u = &resp["usageMetadata"];
@@ -204,9 +229,14 @@ impl GeminiAdapter {
             cache_read_tokens: cached,
             cache_write_tokens: 0,
         };
-        self.budget
-            .ledger
-            .settle(reservation, self.budget.pricing.cost(&usage));
+        if u["promptTokenCount"].is_u64() {
+            self.budget
+                .ledger
+                .settle(reservation, self.budget.pricing.cost(&usage));
+        } else {
+            // no usage in a billed reply: charge the worst case, never zero
+            self.budget.ledger.settle_reserved(reservation);
+        }
 
         let cand = &resp["candidates"][0];
         let parts = cand["content"]["parts"]
@@ -267,12 +297,26 @@ impl GeminiAdapter {
             .as_deref()
             .ok_or(ProviderError::Other)?;
         let requests: Vec<Value> = p.inputs.iter().map(|t| json!({"model": format!("models/{model}"), "content": {"parts": [{"text": t}]}})).collect();
-        let (sent, resp, received) = self
+        // a paid embedding call is reserved like a text call; refused before sending if it does not fit
+        let reservation = self
+            .budget
+            .ledger
+            .reserve(self.budget.embedding_worst_case(&p.inputs))?;
+        let (sent, resp, received) = match self
             .post(
                 &format!("/v1beta/models/{model}:batchEmbedContents"),
                 &json!({"requests": requests}),
             )
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(f) => {
+                self.close_failed(reservation, &f);
+                return Err(f.err);
+            }
+        };
+        // the batch endpoint reports no usage: the reserved estimate (input at the input rate) is what is charged
+        self.budget.ledger.settle_reserved(reservation);
         let mut vectors: Vec<Vec<f32>> = resp["embeddings"]
             .as_array()
             .map(|a| {
@@ -758,7 +802,7 @@ mod tests {
             cfg,
             Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
             Budget {
-                ledger: Arc::new(Ledger::new(1)),
+                ledger: Arc::new(Ledger::new(10_000_000)),
                 pricing: PRICING,
             },
         )
@@ -805,7 +849,7 @@ mod tests {
             cfg2,
             Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
             Budget {
-                ledger: Arc::new(Ledger::new(1)),
+                ledger: Arc::new(Ledger::new(10_000_000)),
                 pricing: PRICING,
             },
         )
@@ -883,6 +927,135 @@ mod tests {
                 .iter()
                 .all(|c| !c.image_input.is_yes() && !c.tool_use.is_yes()),
             "capabilities the listing does not carry stay unknown"
+        );
+    }
+
+    // ---- the ledger fails closed ----
+
+    fn gemini_with(
+        s: &MockServer,
+        ledger: &Arc<Ledger>,
+        pricing: Pricing,
+        timeout: Duration,
+    ) -> Result<GeminiAdapter, ConfigError> {
+        let mut cfg = GeminiConfig::new("gemini-api-key", "gemini-test");
+        cfg.base_url = s.uri();
+        cfg.embedding_model = Some("embed-test".into());
+        cfg.timeout = timeout;
+        GeminiAdapter::new(
+            cfg,
+            Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
+            Budget {
+                ledger: ledger.clone(),
+                pricing,
+            },
+        )
+    }
+    fn worst_for_hi() -> u64 {
+        PRICING.worst_case("hi".len() as u64 / 3 + 1, 100)
+    }
+    fn embed_req(inputs: &[&str]) -> Request {
+        Request::Embedding(EmbeddingParams {
+            model_id: "x".into(),
+            inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
+            normalize: false,
+            session_id: None,
+            request_id: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn embeddings_are_reserved_and_refused_before_anything_is_sent_when_they_do_not_fit() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"embeddings":[{"values":[1.0]}]})),
+            )
+            .expect(0)
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(1));
+        let a = gemini_with(&s, &ledger, PRICING, Duration::from_secs(5)).unwrap();
+        let long = "x".repeat(30_000_000);
+        assert_eq!(
+            a.call(&embed_req(&[&long])).await.unwrap_err(),
+            ProviderError::BudgetExceeded
+        );
+        assert_eq!(ledger.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn embeddings_are_charged_their_reserved_estimate_because_the_reply_has_no_usage() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"embeddings":[{"values":[1.0]}]})),
+            )
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = gemini_with(&s, &ledger, PRICING, Duration::from_secs(5)).unwrap();
+        a.call(&embed_req(&["a"])).await.unwrap();
+        assert!(ledger.spent() > 0, "an embedding call is not free");
+        assert_eq!(ledger.available(), 10_000_000 - ledger.spent());
+    }
+
+    #[tokio::test]
+    async fn a_200_without_usage_metadata_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        let mut b = ok("STOP", "hello");
+        b.as_object_mut().unwrap().remove("usageMetadata");
+        serve(&s, 200, b).await;
+        let (a, ledger) = adapter(&s, 10_000_000);
+        a.call(&text("hi")).await.unwrap();
+        assert_eq!(ledger.spent(), worst_for_hi());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_after_the_request_was_sent_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ok("STOP", "late"))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = gemini_with(&s, &ledger, PRICING, Duration::from_millis(200)).unwrap();
+        assert_eq!(
+            a.call(&text("hi")).await.unwrap_err(),
+            ProviderError::Timeout
+        );
+        assert_eq!(ledger.spent(), worst_for_hi());
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_was_never_made_is_released_at_no_charge() {
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let mut cfg = GeminiConfig::new("gemini-api-key", "gemini-test");
+        cfg.base_url = "http://127.0.0.1:1".into();
+        let a = GeminiAdapter::new(
+            cfg,
+            Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
+            Budget {
+                ledger: ledger.clone(),
+                pricing: PRICING,
+            },
+        )
+        .unwrap();
+        assert!(a.call(&text("hi")).await.is_err());
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[tokio::test]
+    async fn an_unpriced_adapter_is_refused() {
+        let s = MockServer::start().await;
+        let ledger = Arc::new(Ledger::new(1_000_000));
+        assert_eq!(
+            gemini_with(&s, &ledger, Pricing::default(), Duration::from_secs(5)).err(),
+            Some(ConfigError::UnpricedProvider)
         );
     }
 }
