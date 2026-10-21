@@ -88,21 +88,39 @@ struct PostFailure {
     maybe_billed: bool,
 }
 
-fn host_of(url: &str) -> Option<String> {
-    let rest = url.split("://").nth(1)?;
-    let authority = rest.split('/').next()?;
-    let authority = authority.rsplit('@').next()?;
-    // [::1]:11434, 127.0.0.1:11434, localhost:11434, host
-    let host = if let Some(stripped) = authority.strip_prefix('[') {
-        stripped.split(']').next()?
+/// The host of the base URL **as the HTTP client will read it**. The locality check must use the same parser that connects (WHATWG, via
+/// `reqwest::Url`): a hand-written splitter disagrees on `#`, `?` and `\\`, and a disagreement is a way to make a remote host pass as
+/// loopback. The parser also normalises numeric hosts (`127.1`, `2130706433`) to dotted-quad form.
+fn parse_host(base_url: &str) -> Result<String, ConfigError> {
+    let u = reqwest::Url::parse(base_url).map_err(|_| ConfigError::BadUrl)?;
+    let host = u.host_str().ok_or(ConfigError::BadUrl)?;
+    // an IPv6 literal is serialised in brackets
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    Ok(host.to_ascii_lowercase())
+}
+
+/// Only http(s), and no user-info, query or fragment: none has a use in a base URL, and each is a way to confuse a reader of the URL about
+/// where the request goes.
+fn check_shape(base_url: &str) -> Result<(), ConfigError> {
+    let u = reqwest::Url::parse(base_url).map_err(|_| ConfigError::BadUrl)?;
+    let plain = matches!(u.scheme(), "http" | "https")
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.query().is_none()
+        && u.fragment().is_none();
+    if plain {
+        Ok(())
     } else {
-        authority.split(':').next()?
-    };
-    (!host.is_empty()).then(|| host.to_string())
+        Err(ConfigError::BadUrl)
+    }
 }
 
 fn is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
+    // one trailing dot is the root label (`localhost.`); `localhost..` is not a name that resolves, so it is not accepted
+    host.strip_suffix('.').unwrap_or(host) == "localhost"
         || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
@@ -112,10 +130,11 @@ fn is_private(host: &str) -> bool {
         Ok(IpAddr::V6(v6)) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
         // a name: only the usual home-network suffixes count as the household
         Err(_) => {
-            host.eq_ignore_ascii_case("localhost")
-                || host.ends_with(".local")
-                || host.ends_with(".lan")
-                || host.ends_with(".home.arpa")
+            let d = host.strip_suffix('.').unwrap_or(host);
+            d == "localhost"
+                || d.ends_with(".local")
+                || d.ends_with(".lan")
+                || d.ends_with(".home.arpa")
         }
     }
 }
@@ -133,7 +152,7 @@ impl OpenAiCompatAdapter {
                 b.validate()?;
             }
         }
-        let host = host_of(&cfg.base_url).ok_or(ConfigError::BadUrl)?;
+        let host = parse_host(&cfg.base_url)?;
         match cfg.locality {
             Locality::Device if !is_loopback(&host) => {
                 return Err(ConfigError::DeviceMustBeLoopback)
@@ -152,6 +171,8 @@ impl OpenAiCompatAdapter {
             }
             _ => {}
         }
+        // after the locality check, so a host hidden behind user-info is reported as the wrong place, not just as a malformed URL
+        check_shape(&cfg.base_url)?;
         if let (Some(name), Some(c)) = (&cfg.credential_name, &creds) {
             c.get(name)
                 .map_err(|_| ConfigError::CredentialUnavailable)?;
@@ -160,10 +181,13 @@ impl OpenAiCompatAdapter {
         if cfg.embedding_model.is_some() {
             kinds.push(RequestKind::Embedding);
         }
-        let http = reqwest::Client::builder()
-            .timeout(cfg.timeout)
-            .build()
-            .map_err(|_| ConfigError::HttpClient)?;
+        let mut builder = reqwest::Client::builder().timeout(cfg.timeout);
+        if !cfg.locality.leaves_home() {
+            // a Device or Home provider must be reached directly: an `HTTP(S)_PROXY` in the environment would otherwise carry household
+            // content off the machine while the locality check had passed
+            builder = builder.no_proxy();
+        }
+        let http = builder.build().map_err(|_| ConfigError::HttpClient)?;
         Ok(Self {
             info: ProviderInfo {
                 provider_id: cfg.provider_id.clone(),
@@ -1226,5 +1250,88 @@ mod tests {
             "zero prices make every reservation free"
         );
         assert!(saas(&s, &ledger, PAID, Duration::from_secs(5)).is_ok());
+    }
+
+    // ---- the locality check must agree with the URL parser that actually connects ----
+
+    /// Build a Device or Home adapter and also report which host the HTTP client will really connect to.
+    fn locality_of(url: &str, loc: Locality) -> (Option<ConfigError>, Option<String>) {
+        let mut c = OpenAiCompatConfig::ollama("m");
+        c.base_url = url.into();
+        c.locality = loc;
+        let real_host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string));
+        (OpenAiCompatAdapter::new(c, None, None).err(), real_host)
+    }
+
+    #[test]
+    fn a_url_that_hides_a_remote_host_behind_a_loopback_lookalike_is_not_device() {
+        for url in [
+            // '#', '?' and '\' end the authority for the parser reqwest uses, so the host is the remote one
+            "http://remote.example#@127.0.0.1",
+            "http://remote.example?x=@127.0.0.1",
+            "http://remote.example\\@127.0.0.1/",
+            "http://remote.example#@[::1]:11434",
+        ] {
+            let (err, real_host) = locality_of(url, Locality::Device);
+            assert_eq!(
+                real_host.as_deref(),
+                Some("remote.example"),
+                "premise: reqwest connects to the remote host for {url}"
+            );
+            assert_eq!(
+                err,
+                Some(ConfigError::DeviceMustBeLoopback),
+                "{url} must not pass as a Device (loopback) provider"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_that_hides_a_public_host_behind_a_private_lookalike_is_not_home() {
+        let (err, real_host) = locality_of("http://8.8.8.8#@192.168.0.10", Locality::Home);
+        assert_eq!(real_host.as_deref(), Some("8.8.8.8"));
+        assert_eq!(err, Some(ConfigError::HomeMustBePrivate));
+    }
+
+    #[test]
+    fn a_base_url_with_user_info_a_query_a_fragment_or_a_foreign_scheme_is_refused() {
+        for url in [
+            "http://user:pw@127.0.0.1:11434",
+            "http://127.0.0.1:11434/?token=x",
+            "http://127.0.0.1:11434/#frag",
+            "ftp://127.0.0.1/",
+            "file:///etc/hosts",
+        ] {
+            let (err, _) = locality_of(url, Locality::Device);
+            assert_eq!(err, Some(ConfigError::BadUrl), "{url}");
+        }
+    }
+
+    #[test]
+    fn hosts_are_classified_from_the_parsed_host() {
+        // every spelling the URL parser resolves to loopback is loopback, and nothing else is
+        for url in [
+            "http://127.0.0.1:1",
+            "http://127.1:1",
+            "http://2130706433:1",
+            "http://LOCALHOST:1",
+            "http://localhost.:1",
+            "http://[::1]:1",
+        ] {
+            assert_eq!(locality_of(url, Locality::Device).0, None, "{url}");
+        }
+        for url in [
+            "http://127.0.0.1.evil.example",
+            "http://[::2]:1",
+            "http://localhost..:1",
+        ] {
+            assert_eq!(
+                locality_of(url, Locality::Device).0,
+                Some(ConfigError::DeviceMustBeLoopback),
+                "{url}"
+            );
+        }
     }
 }
