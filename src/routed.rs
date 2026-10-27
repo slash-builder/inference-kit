@@ -7,7 +7,7 @@
 //!
 //! What this adds on top of the text path:
 //!
-//! - **RequestKind negotiation.** A request no tier can serve is [`AiKitError::UnsupportedKind`] with the
+//! - **RequestKind negotiation.** A request no tier can serve is [`Error::UnsupportedKind`] with the
 //!   reason, never a wrong-kind-of-model answer. A request only the *cloud* can serve, with private content, is
 //!   also unavailable: the router will not leak private data to get an answer.
 //! - **Re-typing.** Free-form text such as "paint a cottage at dawn" is classified, and if it is really an image
@@ -17,7 +17,7 @@
 //!   has the request kind, exactly as for text.
 //! - **Egress accounting.** [`RouteStats::cloud_payload_bytes`] counts what was sent off the device, whatever its type.
 
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::hybrid::{
     classify, estimate_tokens, Attempt, Decision, Plan, Privacy, RoutePolicy, RouteStats,
     RouteTrace, Router, TaskClass, Tier,
@@ -206,7 +206,7 @@ impl MultiHybridService {
         tier: Tier,
         req: &Request,
         check: &OutputCheck,
-    ) -> (Attempt, Option<Output>, Option<AiKitError>) {
+    ) -> (Attempt, Option<Output>, Option<Error>) {
         let cap = req.kind();
         let set = if tier == Tier::Local {
             &self.local
@@ -302,7 +302,7 @@ impl MultiHybridService {
         }
         if let Some(g) = &r.granted {
             if !g.contains(&r.request.kind()) {
-                return Err(AiKitError::CapabilityDenied {
+                return Err(Error::CapabilityDenied {
                     app_id: String::new(),
                     model_id: String::new(),
                     request_kind: r.request.kind().as_str().to_string(),
@@ -337,7 +337,7 @@ impl MultiHybridService {
                 ..
             } => {
                 return Err(if needs_shareable {
-                    AiKitError::RequiresShareable {
+                    Error::RequiresShareable {
                         request_kind: cap.as_str().to_string(),
                     }
                 } else {
@@ -380,7 +380,7 @@ impl MultiHybridService {
                         );
                     }
                     // Keep the typed error (an `InferenceOom` must stay one, so callers and the wire contract can tell it apart).
-                    Err(e1.unwrap_or_else(|| AiKitError::Internal {
+                    Err(e1.unwrap_or_else(|| Error::Internal {
                         reason: "request failed".into(),
                     }))
                 }
@@ -410,7 +410,7 @@ impl MultiHybridService {
                 trace.final_tier = Some(Tier::Local);
                 Ok((local, trace))
             }
-            (None, None) => Err(AiKitError::RemoteBackendError {
+            (None, None) => Err(Error::RemoteBackendError {
                 backend: "cloud".into(),
                 reason: err2.unwrap_or_else(|| "both tiers failed".into()),
             }),
@@ -495,7 +495,7 @@ mod tests {
         async fn handle(&self, req: Request) -> Result<Output> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
-                return Err(AiKitError::InferenceOom {
+                return Err(Error::InferenceOom {
                     model_id: "model".into(),
                     required_mb: 8800,
                     available_mb: 7600,
@@ -609,7 +609,7 @@ mod tests {
                 .handle_routed(RoutedRequest::new(r).shareable())
                 .await
                 .unwrap_err();
-            assert!(matches!(e, AiKitError::UnsupportedKind { .. }), "{e:?}");
+            assert!(matches!(e, Error::UnsupportedKind { .. }), "{e:?}");
         }
         assert_eq!((local.calls(), cloud.calls()), (0, 0));
     }
@@ -636,7 +636,7 @@ mod tests {
             .handle_routed(RoutedRequest::new(r.clone()))
             .await
             .unwrap_err();
-        assert!(matches!(e, AiKitError::RequiresShareable { .. }), "{e:?}");
+        assert!(matches!(e, Error::RequiresShareable { .. }), "{e:?}");
         assert_eq!(
             e.to_inference_error_code(),
             crate::error::InferenceErrorCode::RequiresShareable
@@ -764,7 +764,7 @@ mod tests {
             .handle_routed(RoutedRequest::new(Request::ImageGeneration(bad)))
             .await
             .unwrap_err();
-        assert!(matches!(e, AiKitError::InvalidParams { .. }));
+        assert!(matches!(e, Error::InvalidParams { .. }));
         assert_eq!(local.calls(), 0);
     }
 
@@ -797,7 +797,7 @@ mod tests {
             )))
             .await
             .unwrap_err();
-        assert!(matches!(e, AiKitError::InferenceOom { .. }), "{e:?}");
+        assert!(matches!(e, Error::InferenceOom { .. }), "{e:?}");
         assert_eq!(
             e.to_inference_error_code(),
             crate::error::InferenceErrorCode::Oom,
@@ -861,7 +861,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&e, AiKitError::CapabilityDenied { request_kind, .. } if request_kind == "image_generation"),
+            matches!(&e, Error::CapabilityDenied { request_kind, .. } if request_kind == "image_generation"),
             "{e:?}"
         );
         assert_eq!(

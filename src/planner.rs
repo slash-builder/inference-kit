@@ -26,7 +26,7 @@ use crate::egress::{
     Attempt, AuditSink, DenyReason, EgressRecord, Label, Locality, Outcome, Policy, Purpose,
     Verdict,
 };
-use crate::error::AiKitError;
+use crate::error::Error;
 use crate::modality::{Request, RequestKind};
 use crate::model_card::ModelCard;
 use crate::provider::{
@@ -541,7 +541,7 @@ impl ProviderSet {
         req: &Request,
         policy: &Policy,
         sink: &dyn AuditSink,
-    ) -> (Result<ProviderReply, AiKitError>, EgressRecord, Plan) {
+    ) -> (Result<ProviderReply, Error>, EgressRecord, Plan) {
         let plan = self.plan(pr, policy);
         let chain: Vec<Arc<dyn ProviderAdapter>> = plan
             .runnable()
@@ -619,11 +619,11 @@ impl AuditSink for DiscardSink {
 /// Why a plan with nothing to run produced no answer. A privacy denial (or a hop that needs the owner's answer first) is
 /// `RequiresShareable`, whatever else also excluded providers: that is the answer the caller can act on. If nothing but the request
 /// kind excluded anyone, keep the executor's `UnsupportedKind`. Otherwise name the filters.
-fn no_runnable_error(plan: &Plan, kind: RequestKind, fallback: AiKitError) -> AiKitError {
+fn no_runnable_error(plan: &Plan, kind: RequestKind, fallback: Error) -> Error {
     let egress = plan.rejected.iter().any(|r| r.filter == Filter::Egress)
         || plan.hops.iter().any(|h| h.needs_consent);
     if egress {
-        return AiKitError::RequiresShareable {
+        return Error::RequiresShareable {
             request_kind: kind.as_str().to_string(),
         };
     }
@@ -636,7 +636,7 @@ fn no_runnable_error(plan: &Plan, kind: RequestKind, fallback: AiKitError) -> Ai
     if filters.is_empty() {
         return fallback;
     }
-    AiKitError::NoEligibleProvider {
+    Error::NoEligibleProvider {
         request_kind: kind.as_str().to_string(),
         reason: filters
             .iter()

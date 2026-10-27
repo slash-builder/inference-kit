@@ -225,21 +225,21 @@ pipeline {
             path=$(printf '%s' "$origin" | sed -E 's#(git@github.com:|https://github.com/)##; s#[.]git$##')
             remote="https://${GIT_USER}:${GIT_TOKEN}@github.com/${path}.git"
 
-            # Tags are the version source of truth — bump the patch above the latest vX.Y.Z.
+            # Cargo.toml is the version source of truth, and the release tag must equal it
+            # (tag v0.2.0 == `version = "0.2.0"`). A release is a deliberate act: bump
+            # `version` in Cargo.toml and merge. A merge that leaves the version alone
+            # publishes nothing. Nothing here edits the working tree.
             git fetch --tags --quiet "$remote" || true
-            latest=$(git tag -l 'v*.*.*' | sort -V | tail -1)
-            if [ -z "$latest" ]; then
-              next="0.1.0"
-            else
-              v=${latest#v}; maj=${v%%.*}; rest=${v#*.}; min=${rest%%.*}; pat=${rest##*.}
-              next="${maj}.${min}.$((pat + 1))"
+            next=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+            if [ -z "$next" ]; then
+              echo "Could not read the crate version from Cargo.toml" >&2
+              exit 1
+            fi
+            if git rev-parse -q --verify "refs/tags/v${next}" >/dev/null; then
+              echo "v${next} is already released (tag exists) - nothing to publish. Bump Cargo.toml to cut a release."
+              exit 0
             fi
             echo "Publishing ${path} v${next}"
-
-            # Set the crate version for this publish (ephemeral; tags stay the source of truth).
-            if [ -f Cargo.toml ]; then
-              sed -i 's/^version = ".*"/version = "'"$next"'"/' Cargo.toml
-            fi
 
             # Cargo registry auth.
             # Registry auth lives in a throwaway CARGO_HOME OUTSIDE the workspace
@@ -266,9 +266,8 @@ EOF
               "${BASIC}" "${BASIC}" >> "$CARGO_HOME/credentials.toml"
             chmod 0600 "$CARGO_HOME/credentials.toml"
 
-            # --allow-dirty stays only because the version bump above edits Cargo.toml
-            # (and the build creates Cargo.lock). Refuse to publish if anything else is
-            # dirty or untracked, then run the package gate. Names only are printed.
+            # Refuse to publish if anything but the generated Cargo.lock is dirty or
+            # untracked, then run the package gate. Names only are printed.
             unexpected=$(git status --porcelain --untracked-files=all | grep -v -E '^( M|[?][?]) Cargo[.](toml|lock)$' || true)
             if [ -n "$unexpected" ]; then
               echo "Refusing to publish: unexpected files in the workspace:"
@@ -277,11 +276,12 @@ EOF
             fi
             ./scripts/check-package.sh
 
-            # Publish (allow-dirty: the version was just set in-tree).
+            # Publish. No --allow-dirty: the tree was verified clean above, so cargo's own
+            # dirty-tree check is a second line of defence.
             # Idempotent: a version already present on Nexus is treated as success,
             # so re-running a build that already published doesn't fail the pipeline.
             set +e
-            pub_out=$(cargo publish --registry lockamy-hosted --allow-dirty 2>&1)   # resolve via group (default), publish to hosted
+            pub_out=$(cargo publish --registry lockamy-hosted 2>&1)   # resolve via group (default), publish to hosted
             pub_rc=$?
             set -e
             printf '%s\n' "$pub_out"

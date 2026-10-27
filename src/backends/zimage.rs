@@ -27,7 +27,7 @@
 //! - Dimensions must be multiples of 16. No img2img, LoRA or batching.
 //! - Candle's attention here is the plain matmul-softmax form, so 1024x1024 uses a lot of activation memory.
 
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::modality::ImageGenParams;
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 use candle_core::{DType, Device, Module, Tensor};
@@ -75,8 +75,8 @@ pub(crate) struct ZImagePipeline {
     dtype: DType,
 }
 
-fn internal(what: &str, e: impl std::fmt::Display) -> AiKitError {
-    AiKitError::Internal {
+fn internal(what: &str, e: impl std::fmt::Display) -> Error {
+    Error::Internal {
         reason: format!("z_image {what}: {e}"),
     }
 }
@@ -103,7 +103,7 @@ impl ZImagePipeline {
     /// Check the request against what this model can do (before any weight is read).
     pub(crate) fn validate(p: &ImageGenParams) -> Result<()> {
         if !p.width.is_multiple_of(16) || !p.height.is_multiple_of(16) {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: format!(
                     "Z-Image needs width and height that are multiples of 16 (got {}x{})",
                     p.width, p.height
@@ -735,7 +735,7 @@ mod tests {
         p.width = 520;
         assert!(matches!(
             ZImagePipeline::validate(&p),
-            Err(AiKitError::InvalidParams { .. })
+            Err(Error::InvalidParams { .. })
         ));
         p.width = 512;
         assert!(ZImagePipeline::validate(&p).is_ok());
@@ -841,18 +841,19 @@ mod tests {
     }
 
     fn env(k: &str) -> String {
-        std::env::var(k)
-            .unwrap_or_else(|_| panic!("set {k} (see zimage_ref_dump.py in the studio vault)"))
+        crate::env::var(k).unwrap_or_else(|| {
+            panic!("set INFERENCE_KIT_{k} (the path to the reference data for this test)")
+        })
     }
 
-    /// Compare against `zimage_ref_dump.py` output: prompt embeddings, the latents after every step from the same noise, and the image.
-    /// `AI_KIT_ZIMAGE_NATIVE` = the Tongyi-MAI/Z-Image-Turbo snapshot dir, `AI_KIT_ZIMAGE_GGUF` = z-image-turbo-Q4_K_M.gguf,
-    /// `AI_KIT_ZIMAGE_REF` = the dump dir (prompt "a cozy cottage at dusk, watercolor", 512x512, 9 steps, seed 0).
+    /// Compare against the output of a reference dump script (diffusers): prompt embeddings, the latents after every step from the same noise, and the image.
+    /// `INFERENCE_KIT_ZIMAGE_NATIVE` = the Tongyi-MAI/Z-Image-Turbo snapshot dir, `INFERENCE_KIT_ZIMAGE_GGUF` = z-image-turbo-Q4_K_M.gguf,
+    /// `INFERENCE_KIT_ZIMAGE_REF` = the dump dir (prompt "a cozy cottage at dusk, watercolor", 512x512, 9 steps, seed 0).
     #[test]
     #[ignore = "needs the Z-Image weights and a diffusers reference dump"]
     fn matches_the_diffusers_reference() {
-        let native = env("AI_KIT_ZIMAGE_NATIVE");
-        let device = if std::env::var("AI_KIT_DEVICE").is_ok_and(|d| d.starts_with("cuda")) {
+        let native = env("ZIMAGE_NATIVE");
+        let device = if crate::env::var("DEVICE").is_some_and(|d| d.starts_with("cuda")) {
             crate::backends::common::device_for(crate::backends::common::DevicePreference::Cuda(0))
                 .unwrap()
                 .0
@@ -863,14 +864,14 @@ mod tests {
             .map(|n| format!("{native}/text_encoder/model-{n}-of-00003.safetensors"));
         let pipe = ZImagePipeline::new(
             ZImageFiles {
-                gguf: env("AI_KIT_ZIMAGE_GGUF"),
+                gguf: env("ZIMAGE_GGUF"),
                 text_encoder_shards: te.to_vec(),
                 vae: format!("{native}/vae/diffusion_pytorch_model.safetensors"),
                 tokenizer: format!("{native}/tokenizer/tokenizer.json"),
             },
             device.clone(),
         );
-        let refdir = env("AI_KIT_ZIMAGE_REF");
+        let refdir = env("ZIMAGE_REF");
         let r = candle_core::safetensors::load(format!("{refdir}/ref.safetensors"), &Device::Cpu)
             .unwrap();
 
@@ -983,7 +984,7 @@ mod tests {
     #[test]
     #[ignore = "needs the Z-Image GGUF and a CUDA device"]
     fn gpu_dequantization_matches_the_cpu_reference() {
-        let gguf = env("AI_KIT_ZIMAGE_GGUF");
+        let gguf = env("ZIMAGE_GGUF");
         let gpu =
             crate::backends::common::device_for(crate::backends::common::DevicePreference::Cuda(0))
                 .unwrap()
@@ -1020,7 +1021,7 @@ mod tests {
     #[test]
     #[ignore = "needs the Z-Image weights, a diffusers reference dump and a CUDA device"]
     fn step0_numerics_control() {
-        let native = env("AI_KIT_ZIMAGE_NATIVE");
+        let native = env("ZIMAGE_NATIVE");
         let device =
             crate::backends::common::device_for(crate::backends::common::DevicePreference::Cuda(0))
                 .unwrap()
@@ -1029,7 +1030,7 @@ mod tests {
             .map(|n| format!("{native}/text_encoder/model-{n}-of-00003.safetensors"));
         let mut pipe = ZImagePipeline::new(
             ZImageFiles {
-                gguf: env("AI_KIT_ZIMAGE_GGUF"),
+                gguf: env("ZIMAGE_GGUF"),
                 text_encoder_shards: te.to_vec(),
                 vae: String::new(),
                 tokenizer: String::new(),
@@ -1037,7 +1038,7 @@ mod tests {
             device.clone(),
         );
         let r = candle_core::safetensors::load(
-            format!("{}/ref.safetensors", env("AI_KIT_ZIMAGE_REF")),
+            format!("{}/ref.safetensors", env("ZIMAGE_REF")),
             &Device::Cpu,
         )
         .unwrap();
@@ -1080,7 +1081,7 @@ mod tests {
     #[test]
     #[ignore = "needs the Z-Image weights and a CUDA device with ~9 GB free"]
     fn streaming_matches_candles_full_encoder() {
-        let native = env("AI_KIT_ZIMAGE_NATIVE");
+        let native = env("ZIMAGE_NATIVE");
         let device =
             crate::backends::common::device_for(crate::backends::common::DevicePreference::Cuda(0))
                 .unwrap()
@@ -1109,7 +1110,7 @@ mod tests {
     #[test]
     #[ignore = "needs the Z-Image weights, a diffusers reference dump and a CUDA device"]
     fn tiled_vae_decode_matches_the_single_pass() {
-        let native = env("AI_KIT_ZIMAGE_NATIVE");
+        let native = env("ZIMAGE_NATIVE");
         let device =
             crate::backends::common::device_for(crate::backends::common::DevicePreference::Cuda(0))
                 .unwrap()
@@ -1124,7 +1125,7 @@ mod tests {
             device.clone(),
         );
         let r = candle_core::safetensors::load(
-            format!("{}/ref.safetensors", env("AI_KIT_ZIMAGE_REF")),
+            format!("{}/ref.safetensors", env("ZIMAGE_REF")),
             &Device::Cpu,
         )
         .unwrap();

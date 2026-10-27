@@ -1,25 +1,24 @@
-//! Error types and Result type for AI Kit.
+//! Error types and Result type for Inference Kit.
 //!
 //! # Design Notes
 //!
-//! AI Kit errors map cleanly to Hearth ErrorCode enum for protocol-level errors.
-//! See: https://github.com/slash-builder/message-kit/blob/main/proto/quickring/v1/message.proto
+//! Inference Kit errors map cleanly to Hearth ErrorCode enum for protocol-level errors.
 
 use thiserror::Error;
 
-/// Result type for AI Kit operations.
-pub type Result<T> = std::result::Result<T, AiKitError>;
+/// Result type for Inference Kit operations.
+pub type Result<T> = std::result::Result<T, Error>;
 
-/// AI Kit error types.
+/// Inference Kit error types.
 ///
-/// Maps to `quickring.v1.ErrorCode` enum in Message Kit protocol:
+/// Maps to the `ErrorCode` enum of the Message Kit protocol:
 /// - `MODEL_NOT_FOUND = 20`
 /// - `INFERENCE_TIMEOUT = 21`
 /// - `CACHE_EVICTED = 22`
 /// - `QUANTIZATION_UNSUPPORTED = 23`
 /// - `INFERENCE_OOM = 24`
 #[derive(Debug, Error)]
-pub enum AiKitError {
+pub enum Error {
     /// Model requested but not found in registry or OS image.
     #[error("Model not found: {model_id}")]
     ModelNotFound { model_id: String },
@@ -34,7 +33,7 @@ pub enum AiKitError {
 
     /// Requested quantization variant is not available locally.
     ///
-    /// Per decision memo #7: App must handle fallback explicitly (Message Kit to Cumulus
+    /// The app must handle fallback explicitly (Message Kit to Cumulus
     /// or accept lower quantization). Implicit downgrade violates app's accuracy SLA.
     #[error(
         "Quantization {quantization} not available for model {model_id}; available: {available:?}"
@@ -76,7 +75,7 @@ pub enum AiKitError {
     RequiresShareable { request_kind: String },
 
     /// Nothing configured, credentialed and healthy could serve this request, and the cause is not the content's label (that is
-    /// [`AiKitError::RequiresShareable`]). `reason` names the filters that excluded every provider (for example `Budget, Health`);
+    /// [`Error::RequiresShareable`]). `reason` names the filters that excluded every provider (for example `Budget, Health`);
     /// it never names a provider, a model or any content.
     #[error("No eligible provider for '{request_kind}': {reason}")]
     NoEligibleProvider {
@@ -106,7 +105,7 @@ pub enum AiKitError {
 
     /// RequestKind grant check failed or is missing.
     ///
-    /// Note: Per decision memo #1, AI Kit trusts Hearth's capability check at call boundary.
+    /// Note: Inference Kit trusts Hearth's capability check at call boundary.
     /// This error should only occur if Hearth fails to enforce the check (design violation).
     #[error("Request kind '{request_kind}' is not granted (app '{app_id}', model '{model_id}')")]
     CapabilityDenied {
@@ -120,8 +119,8 @@ pub enum AiKitError {
     /// binding) failed: network/transport failure, a non-2xx HTTP response,
     /// or a response body that didn't match the expected shape.
     ///
-    /// Distinct from [`AiKitError::Internal`] on purpose: this is an
-    /// *external* dependency failing, not an AI Kit bug, and callers
+    /// Distinct from [`Error::Internal`] on purpose: this is an
+    /// *external* dependency failing, not an Inference Kit bug, and callers
     /// (Message Kit transport, dashboards) may want to treat the two
     /// differently (e.g. retry/backoff heuristics for the former only).
     #[error("Remote backend '{backend}' request failed: {reason}")]
@@ -143,6 +142,11 @@ pub enum AiKitError {
     #[error("JSON parse error: {0}")]
     JsonError(#[from] serde_json::Error),
 }
+
+/// The old name of [`enum@Error`], kept for source compatibility with 0.1.x callers.
+/// Will be removed in a later release.
+#[deprecated(since = "0.2.0", note = "renamed to `inference_kit::Error`")]
+pub type AiKitError = Error;
 
 /// Error codes for the inference wire contract (`hearth.inference.v1`), proposed by messaging-architect (2026-10-10).
 ///
@@ -189,7 +193,7 @@ pub enum InferenceErrorCode {
     NoEligibleProvider = 22,
 }
 
-impl AiKitError {
+impl Error {
     /// The wire error code for this error (see [`InferenceErrorCode`]).
     ///
     /// `CapabilityDenied` is a Score Kit grant failure that should be enforced at the Message Kit boundary and never
@@ -197,18 +201,18 @@ impl AiKitError {
     pub fn to_inference_error_code(&self) -> InferenceErrorCode {
         use InferenceErrorCode as C;
         match self {
-            AiKitError::ModelNotFound { .. } => C::ModelNotFound,
-            AiKitError::InferenceTimeout { .. } => C::Timeout,
-            AiKitError::CacheEvicted { .. } => C::CacheEvicted,
-            AiKitError::QuantizationUnsupported { .. } => C::QuantizationUnsupported,
-            AiKitError::InferenceOom { .. } => C::Oom,
-            AiKitError::InvalidParams { .. } => C::InvalidParams,
-            AiKitError::UnsupportedKind { .. } => C::RequestKindUnsupported,
-            AiKitError::RequiresShareable { .. } => C::RequiresShareable,
-            AiKitError::NoEligibleProvider { .. } => C::NoEligibleProvider,
-            AiKitError::RequestTooLarge { .. } => C::RequestTooLarge,
-            AiKitError::RemoteBackendError { .. } => C::RemoteBackendFailed,
-            AiKitError::ModelLoadFailed { .. } | AiKitError::IntegrityCheckFailed { .. } => {
+            Error::ModelNotFound { .. } => C::ModelNotFound,
+            Error::InferenceTimeout { .. } => C::Timeout,
+            Error::CacheEvicted { .. } => C::CacheEvicted,
+            Error::QuantizationUnsupported { .. } => C::QuantizationUnsupported,
+            Error::InferenceOom { .. } => C::Oom,
+            Error::InvalidParams { .. } => C::InvalidParams,
+            Error::UnsupportedKind { .. } => C::RequestKindUnsupported,
+            Error::RequiresShareable { .. } => C::RequiresShareable,
+            Error::NoEligibleProvider { .. } => C::NoEligibleProvider,
+            Error::RequestTooLarge { .. } => C::RequestTooLarge,
+            Error::RemoteBackendError { .. } => C::RemoteBackendFailed,
+            Error::ModelLoadFailed { .. } | Error::IntegrityCheckFailed { .. } => {
                 C::ModelUnavailable
             }
             _ => C::Internal,
@@ -221,16 +225,16 @@ impl AiKitError {
     /// The fabric `ErrorCode` numbers 20-24 are `TOPIC_INVALID`, `TOPIC_UNAUTHORIZED`, `SUBSCRIPTION_NOT_FOUND`,
     /// `PUBLISH_RATE_LIMITED` and `SUBSCRIBE_RATE_LIMITED`; 13 is `ENVELOPE_TOO_LARGE`; 90 is the ops-alert `INTERNAL`. So
     /// a remote peer could trigger an ops alert, and a grant failure looked like an oversized message. Kept only so existing
-    /// callers compile; use [`AiKitError::to_inference_error_code`].
+    /// callers compile; use [`Error::to_inference_error_code`].
     #[deprecated(note = "collides with the fabric ErrorCode space; use to_inference_error_code")]
     pub fn to_error_code(&self) -> i32 {
         match self {
-            AiKitError::ModelNotFound { .. } => 20,
-            AiKitError::InferenceTimeout { .. } => 21,
-            AiKitError::CacheEvicted { .. } => 22,
-            AiKitError::QuantizationUnsupported { .. } => 23,
-            AiKitError::InferenceOom { .. } => 24,
-            AiKitError::CapabilityDenied { .. } => 13,
+            Error::ModelNotFound { .. } => 20,
+            Error::InferenceTimeout { .. } => 21,
+            Error::CacheEvicted { .. } => 22,
+            Error::QuantizationUnsupported { .. } => 23,
+            Error::InferenceOom { .. } => 24,
+            Error::CapabilityDenied { .. } => 13,
             _ => 90,
         }
     }
@@ -245,13 +249,13 @@ mod tests {
         use InferenceErrorCode as C;
         let cases = [
             (
-                AiKitError::ModelNotFound {
+                Error::ModelNotFound {
                     model_id: "m".into(),
                 },
                 C::ModelNotFound,
             ),
             (
-                AiKitError::InferenceOom {
+                Error::InferenceOom {
                     model_id: "m".into(),
                     required_mb: 2,
                     available_mb: 1,
@@ -259,18 +263,18 @@ mod tests {
                 C::Oom,
             ),
             (
-                AiKitError::InvalidParams { reason: "r".into() },
+                Error::InvalidParams { reason: "r".into() },
                 C::InvalidParams,
             ),
             (
-                AiKitError::UnsupportedKind {
+                Error::UnsupportedKind {
                     request_kind: "image_generation".into(),
                     reason: "r".into(),
                 },
                 C::RequestKindUnsupported,
             ),
             (
-                AiKitError::RequestTooLarge {
+                Error::RequestTooLarge {
                     limit_name: "image_pixels".into(),
                     limit: 1,
                     actual: 2,
@@ -278,34 +282,34 @@ mod tests {
                 C::RequestTooLarge,
             ),
             (
-                AiKitError::RequiresShareable {
+                Error::RequiresShareable {
                     request_kind: "image_understanding".into(),
                 },
                 C::RequiresShareable,
             ),
             (
-                AiKitError::RemoteBackendError {
+                Error::RemoteBackendError {
                     backend: "b".into(),
                     reason: "r".into(),
                 },
                 C::RemoteBackendFailed,
             ),
             (
-                AiKitError::ModelLoadFailed {
+                Error::ModelLoadFailed {
                     model_id: "m".into(),
                     reason: "r".into(),
                 },
                 C::ModelUnavailable,
             ),
             (
-                AiKitError::IntegrityCheckFailed {
+                Error::IntegrityCheckFailed {
                     model_id: "m".into(),
                     expected: "a".into(),
                     actual: "b".into(),
                 },
                 C::ModelUnavailable,
             ),
-            (AiKitError::Internal { reason: "r".into() }, C::Internal),
+            (Error::Internal { reason: "r".into() }, C::Internal),
         ];
         for (err, want) in cases {
             assert_eq!(err.to_inference_error_code(), want, "{err}");
@@ -314,7 +318,7 @@ mod tests {
 
     #[test]
     fn a_grant_failure_is_reported_as_internal_not_as_a_permissions_answer() {
-        let e = AiKitError::CapabilityDenied {
+        let e = Error::CapabilityDenied {
             app_id: "a".into(),
             model_id: "m".into(),
             request_kind: "image_generation".into(),
@@ -326,7 +330,7 @@ mod tests {
     #[allow(deprecated)]
     fn the_deprecated_fabric_mapping_is_still_the_old_one() {
         // Documented as wrong; pinned so nobody "fixes" it silently and breaks a caller that already depends on it.
-        let e = AiKitError::CapabilityDenied {
+        let e = Error::CapabilityDenied {
             app_id: "a".into(),
             model_id: "m".into(),
             request_kind: "image_generation".into(),

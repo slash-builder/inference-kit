@@ -1,5 +1,10 @@
 //! An adapter for any OpenAI-compatible server: Ollama, the llama.cpp server, a gateway. **Chat completions and embeddings.**
 //!
+//! # Data egress
+//!
+//! **Enabling the `provider-openai-compat` feature sends your requests to whichever server you configure.** A server on your own machine stays local; a hosted
+//! gateway or SaaS endpoint does not. It is off by default and the egress policy must still allow each request.
+//!
 //! One adapter, three very different places it can point, and the difference is **where the content goes**, so it is declared, not guessed:
 //!
 //! - [`Locality::Device`]: this machine. The base URL **must be a loopback address**; anything else is refused when the adapter is built
@@ -672,7 +677,7 @@ mod tests {
         assert!(mk("http://localhost:11434", Locality::Device).is_none());
         assert!(mk("http://[::1]:11434", Locality::Device).is_none());
         assert!(mk("http://127.0.0.1:1/v1", Locality::Device).is_none());
-        assert!(mk("http://192.168.50.205:11434", Locality::Home).is_none());
+        assert!(mk("http://10.0.0.5:11434", Locality::Home).is_none());
         assert!(mk("http://studio.local:11434", Locality::Home).is_none());
         assert_eq!(
             mk("http://8.8.8.8:11434", Locality::Home),
@@ -891,13 +896,12 @@ mod tests {
         assert!(a.health().await);
     }
 
-    /// Against a REAL local Ollama. `AI_KIT_OLLAMA_MODEL` (default `qwen2.5:7b`) must be installed.
+    /// Against a REAL local Ollama. `INFERENCE_KIT_OLLAMA_MODEL` (default `qwen2.5:7b`) must be installed.
     #[tokio::test]
     #[ignore = "needs a running Ollama with the model installed"]
     async fn a_real_local_ollama_answers_through_the_adapter() {
-        let model = std::env::var("AI_KIT_OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".into());
-        let url =
-            std::env::var("AI_KIT_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+        let model = crate::env::var("OLLAMA_MODEL").unwrap_or_else(|| "qwen2.5:7b".into());
+        let url = crate::env::var("OLLAMA_URL").unwrap_or_else(|| "http://127.0.0.1:11434".into());
         let mut c = OpenAiCompatConfig::ollama(&model);
         c.base_url = url;
         let a = OpenAiCompatAdapter::new(c, None, None).unwrap();
@@ -931,10 +935,10 @@ mod tests {
         use crate::egress::Locality;
         use crate::planner::{Entry, Filter, PlanRequest, ProviderSet};
         use crate::provider::ScriptedProvider;
-        let model = std::env::var("AI_KIT_OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".into());
+        let model = crate::env::var("OLLAMA_MODEL").unwrap_or_else(|| "qwen2.5:7b".into());
         let mut c = OpenAiCompatConfig::ollama(&model);
         c.base_url =
-            std::env::var("AI_KIT_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+            crate::env::var("OLLAMA_URL").unwrap_or_else(|| "http://127.0.0.1:11434".into());
         let ollama = Arc::new(OpenAiCompatAdapter::new(c, None, None).unwrap());
         let mut cards = ollama.discover_models("2026-10-11").await.unwrap();
         let mut card = cards

@@ -40,7 +40,7 @@
 //!   sometimes; callers who know the class should pass it.
 //! - Cloud calls are counted in [`RouteStats`], not priced.
 
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::service::InferenceService;
 use crate::types::{CacheStats, InferenceParams, InferenceResponse, SessionId};
 use async_trait::async_trait;
@@ -592,7 +592,7 @@ impl HybridInferenceService {
         self.stats.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    /// Decide only; run nothing. For `ai-kit-cli route --explain` and for callers that want to
+    /// Decide only; run nothing. For `inference-kit route --explain` and for callers that want to
     /// know whether to delegate before building a prompt.
     pub fn explain(&self, req: &RouteRequest) -> Decision {
         let class = req.class.unwrap_or_else(|| classify(&req.params.prompt));
@@ -686,7 +686,7 @@ impl HybridInferenceService {
         };
         let (first, escalate) = match decision.plan {
             Plan::Delegate { ref request_kind } => {
-                return Err(AiKitError::InvalidParams {
+                return Err(Error::InvalidParams {
                     reason: format!(
                         "this request needs the '{request_kind}' request kind, which InferenceService (text in, text out) does not provide"
                     ),
@@ -741,7 +741,7 @@ impl HybridInferenceService {
                         .last()
                         .and_then(|a| a.error.clone())
                         .unwrap_or_else(|| "inference failed".into());
-                    Err(AiKitError::Internal { reason: err })
+                    Err(Error::Internal { reason: err })
                 }
             };
         }
@@ -769,7 +769,7 @@ impl HybridInferenceService {
                 trace.final_tier = Some(Tier::Local);
                 Ok((local, trace))
             }
-            (None, None) => Err(AiKitError::RemoteBackendError {
+            (None, None) => Err(Error::RemoteBackendError {
                 backend: "cloud".into(),
                 reason: err2.unwrap_or_else(|| "both tiers failed".into()),
             }),
@@ -827,7 +827,7 @@ mod tests {
         }
         fn failing() -> Arc<Self> {
             Arc::new(Self {
-                answer: Err(AiKitError::Internal {
+                answer: Err(Error::Internal {
                     reason: "boom".into(),
                 }),
                 calls: AtomicU32::new(0),
@@ -853,7 +853,7 @@ mod tests {
                     session_id: SessionId::default(),
                     request_id: "r".into(),
                 }),
-                Err(_) => Err(AiKitError::Internal {
+                Err(_) => Err(Error::Internal {
                     reason: "boom".into(),
                 }),
             }
@@ -865,7 +865,7 @@ mod tests {
             Ok(())
         }
         async fn cache_stats(&self) -> Result<CacheStats> {
-            Err(AiKitError::Internal {
+            Err(Error::Internal {
                 reason: "n/a".into(),
             })
         }
@@ -1041,7 +1041,7 @@ mod tests {
         assert!(matches!(s.explain(&r).plan, Plan::Delegate { .. }));
         assert!(matches!(
             s.infer_routed(r).await,
-            Err(AiKitError::InvalidParams { .. })
+            Err(Error::InvalidParams { .. })
         ));
         assert_eq!((l.calls(), c.calls()), (0, 0));
     }

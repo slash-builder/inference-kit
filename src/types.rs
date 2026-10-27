@@ -1,4 +1,4 @@
-//! Core types for AI Kit.
+//! Core types for Inference Kit.
 //!
 //! # Design Notes
 //!
@@ -227,11 +227,11 @@ pub struct ModelMetadataExtended {
 /// - `max_tokens`: Maximum completion length.
 /// - `session_id`: For KV cache locality (never reused cross-app).
 ///
-/// TODO #3 (decision memo): Lazy-load is default (minimize footprint);
+/// TODO: Lazy-load is default (minimize footprint);
 /// pre-load is opt-in via config for Cumulus/always-on appliances.
-/// Once DJ rules, add `prefer_preload: bool` field.
+/// Once decided, add `prefer_preload: bool` field.
 ///
-/// TODO #7 (decision memo): Quantization fallback strategy.
+/// TODO: Quantization fallback strategy.
 /// Add `acceptable_quantizations: Vec<Quantization>` field for app to specify fallback chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceParams {
@@ -279,22 +279,22 @@ fn default_max_tokens() -> u32 {
 impl InferenceParams {
     /// Validate parameters.
     pub fn validate(&self) -> crate::Result<()> {
-        use crate::error::AiKitError;
+        use crate::error::Error;
 
         if self.model_id.is_empty() {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: "model_id cannot be empty".to_string(),
             });
         }
 
         if self.prompt.is_empty() {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: "prompt cannot be empty".to_string(),
             });
         }
 
         if !(0.0..=2.0).contains(&self.temperature) {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: format!(
                     "temperature must be in range [0.0, 2.0], got {}",
                     self.temperature
@@ -303,13 +303,13 @@ impl InferenceParams {
         }
 
         if !(0.0..=1.0).contains(&self.top_p) {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: format!("top_p must be in range [0.0, 1.0], got {}", self.top_p),
             });
         }
 
         if self.max_tokens == 0 {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: "max_tokens must be > 0".to_string(),
             });
         }

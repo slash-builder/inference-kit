@@ -1,10 +1,16 @@
-//! AI Kit — Trait-based local inference orchestration for Hearth household clusters.
+//! Inference Kit — local-first inference orchestration: model registry, routing, egress control and a cost ledger, with optional Candle backends.
 //!
 //! # Overview
 //!
-//! AI Kit is a hybrid tier kit providing inference orchestration across Hearth devices.
-//! Models are immutable OS resources (shipped signed, verified at boot). Inference is
-//! household-scoped with capability gating via Score Kit and observability via Service Kit.
+//! The package is `slashbuilder-inference-kit`; the library is `inference_kit`. The default build is
+//! local-only and compiles in no network code.
+//!
+//! # Cloud features and data egress
+//!
+//! The features `claude-proxy`, `provider-anthropic`, `provider-gemini` and `provider-openai-compat` are
+//! **off by default**. Each one, when enabled and configured with a credential, **sends prompts and model
+//! outputs to a third-party service** (for `provider-openai-compat`, to whichever server you point it at).
+//! See each module's "Data egress" section, and the README, before enabling one.
 //!
 //! # Core Design Principles
 //!
@@ -25,7 +31,7 @@
 //! ├─────────────────────────────────────────────────────────┤
 //! │                                                           │
 //! │  App (Pi5, embedded)                                    │
-//! │  ├─ Trait call: ai_kit::infer("llama2-7b", prompt)  │
+//! │  ├─ Trait call: inference_kit::infer("llama2-7b", prompt)  │
 //! │  └─ In-process, RO mmap, 1–10ms                        │
 //! │                                                           │
 //! │  App (Cumulus, always-on)                              │
@@ -33,7 +39,7 @@
 //! │  └─ Or Message Kit RPC for load distribution           │
 //! │                                                           │
 //! │  ┌────────────────────────────────────────────┐        │
-//! │  │  AI Kit Service (Trait + Message Kit)      │        │
+//! │  │  Inference Kit Service (Trait + Message Kit)      │        │
 //! │  ├────────────────────────────────────────────┤        │
 //! │  │ • Model Registry (catalog.yaml, YAML)      │        │
 //! │  │ • Inference Engine (trait-based)           │        │
@@ -68,6 +74,7 @@ pub mod cache;
 pub mod conformance;
 pub mod credentials;
 pub mod egress;
+pub mod env;
 pub mod error;
 pub mod hybrid;
 pub mod modality;
@@ -98,7 +105,10 @@ pub use backends::CandleInferenceService;
 pub use backends::{describe_cuda_devices, DevicePreference};
 #[cfg(feature = "claude-proxy")]
 pub use backends::{ClaudeProxyConfig, ClaudeProxyInferenceService};
-pub use error::{AiKitError, Result};
+/// Deprecated alias of [`enum@Error`]; see [`error::AiKitError`].
+#[allow(deprecated)]
+pub use error::AiKitError;
+pub use error::{Error, Result};
 pub use hybrid::{
     classify, ClassPolicy, Decision, HybridInferenceService, Plan, Privacy, RoutePolicy,
     RouteRequest, RouteStats, RouteTrace, Router, TaskClass, Tier, Verifier,

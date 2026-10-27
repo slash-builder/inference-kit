@@ -3,7 +3,7 @@
 //! A provider is configured with a *name* (`"anthropic-api-key"`), never a key. The production source reads
 //! `$CREDENTIALS_DIRECTORY/<name>` (systemd `LoadCredential=`), and it **fails closed**: a missing, empty, unreadable or
 //! group/world-accessible file means the provider is `Unconfigured` and is never constructed. There is **no fallback to environment
-//! variables, argv or a config file** (hearth `docs/encryption.md` section 3.5, CLUS-107, QR-259). A secret is a [`Secret`]: it has no
+//! variables, argv or a config file**. A secret is a [`Secret`]: it has no
 //! `Display`, its `Debug` is redacted, and errors here carry the credential's *name*, never its content.
 
 pub mod conformance;

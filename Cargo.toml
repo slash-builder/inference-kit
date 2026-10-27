@@ -1,13 +1,14 @@
 [package]
-name = "ai-kit"
-version = "0.1.0"
-authors = ["Douglas Lockamy <dlockamy@lockamystudios.com>"]
+name = "slashbuilder-inference-kit"
+version = "0.2.0"
 edition = "2021"
-description = "AI Kit — trait-based local inference orchestration for Hearth household clusters. Models are immutable OS resources; inference is household-scoped with capability gating via Score Kit."
-repository = "https://github.com/slash-builder/ai-kit"
+description = "Local-first inference orchestration: model registry, routing, egress control and cost ledger, with optional Candle backends."
+repository = "https://github.com/slash-builder/inference-kit"
+documentation = "https://docs.rs/slashbuilder-inference-kit"
+readme = "README.md"
 license = "Apache-2.0"
-keywords = ["inference", "llm", "household", "hearth", "kit"]
-categories = ["machine-learning", "command-line-utilities"]
+keywords = ["inference", "llm", "local-first", "model-registry", "candle"]
+categories = ["science", "command-line-utilities"]
 
 # Allow-list of what may ever be packaged. With `include` set, anything not matched
 # here stays out of the .crate, so a stray local file (a .cargo/ directory holding
@@ -16,15 +17,24 @@ categories = ["machine-learning", "command-line-utilities"]
 # Review `cargo package --list` (and run `make package-check`) when adding to this list.
 include = ["/src/**", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md"]
 
+# The package is `slashbuilder-inference-kit`; the library is `inference_kit`
+# (`use inference_kit::...`). The name is set explicitly so a rename of the package
+# can never silently rename the library.
 [lib]
+name = "inference_kit"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ai-kit-cli"
+name = "inference-kit"
 path = "src/bin/cli.rs"
 # Always builds. `infer` requires the `candle` feature; without it, it exits
 # with an actionable message instead of failing to compile. `hash`/`cache-stats`
 # work unconditionally.
+
+# docs.rs builds the CPU-only features. `cuda` is left out on purpose: it needs a CUDA
+# toolkit at build time.
+[package.metadata.docs.rs]
+features = ["candle", "claude-proxy", "provider-anthropic", "provider-openai-compat", "provider-gemini", "conformance"]
 
 [dependencies]
 # Core async runtime
@@ -109,26 +119,33 @@ image = ["candle-base", "dep:png"]
 # unchanged without it. See README "GPU (CUDA) — POC".
 cuda = ["candle", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
-# Remote proxy backend binding InferenceService to a third-party cloud API
-# (Claude/Anthropic Messages API first). This is explicitly a v0.2+/
-# experimental feature per decision memos #2 and #9 in
-# `ai-kit-unified-design.md` (remote fallback scope, hub relay auth) — both
-# still open, no DJ ruling yet. Off by default for the same reason `candle`
-# is: keeps CI (Jenkinsfile, no flags) untouched. Even compiled in, this
-# backend is inert without an explicit non-empty API key at construction
-# time — see `src/backends/claude_proxy.rs` module doc.
+# CLOUD FEATURES. Every feature below sends data to a third-party service when it is
+# enabled AND configured. All are off by default (`default = []`), and a cloud call is
+# still refused unless the caller supplies an explicit credential and the egress policy
+# allows it. Enabling one means prompts and outputs leave your machine: read the
+# "Cloud features and data egress" section of the README first.
+
+# Remote proxy backend binding InferenceService to a third-party cloud API (the Claude
+# Messages API first). EGRESS: sends prompts to that provider. Experimental. Even
+# compiled in, it is inert without an explicit non-empty API key at construction time;
+# see the module doc of `src/backends/claude_proxy.rs`.
 claude-proxy = ["dep:reqwest"]
 
-# The Claude Messages API as a ProviderAdapter (see src/providers/anthropic.rs). Off by default; tested against mocks only, no key exists yet.
+# The Claude Messages API as a ProviderAdapter (see src/providers/anthropic.rs).
+# EGRESS: sends prompts and outputs to Anthropic. Tested against mocks only.
 provider-anthropic = ["dep:reqwest"]
 
-# An adapter for any OpenAI-compatible server (Ollama, llama.cpp server, a SaaS gateway): chat completions and embeddings. Off by default.
+# An adapter for any OpenAI-compatible server (Ollama, llama.cpp server, a SaaS gateway):
+# chat completions and embeddings. EGRESS: sends data to whichever server you point it at;
+# a local server stays local, a hosted gateway does not.
 provider-openai-compat = ["dep:reqwest"]
 
-# Google Gemini (generateContent and embedContent) as a ProviderAdapter. Off by default; mocks only, no key exists yet.
+# Google Gemini (generateContent and embedContent) as a ProviderAdapter.
+# EGRESS: sends prompts and outputs to Google. Tested against mocks only.
 provider-gemini = ["dep:reqwest"]
 
-# The provider conformance suite (src/conformance.rs) for adapters written outside this crate. No extra dependencies.
+# The provider conformance suite (src/conformance.rs) for adapters written outside this
+# crate. No extra dependencies, no network.
 conformance = []
 
 [dev-dependencies]

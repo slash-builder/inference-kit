@@ -9,13 +9,13 @@
 
 #![cfg(feature = "candle")]
 
-use ai_kit::{CandleInferenceService, InferenceParams, InferenceService};
+use inference_kit::{CandleInferenceService, InferenceParams, InferenceService};
 
 #[tokio::test]
 #[ignore]
 async fn real_inference_smoke_test() {
-    let catalog_path = std::env::var("AI_KIT_MODEL_DIR")
-        .unwrap_or_else(|_| "./dev-models".to_string())
+    let catalog_path = inference_kit::env::var("MODEL_DIR")
+        .unwrap_or_else(|| "./dev-models".to_string())
         + "/catalog.yaml";
 
     let service = CandleInferenceService::new(&catalog_path)

@@ -1,4 +1,4 @@
-//! `ai-kit-cli` — minimal CLI for local dev/testing.
+//! `inference-kit` — minimal CLI for local dev/testing.
 //!
 //! Hand-rolled flag parsing on purpose: a handful of flags doesn't justify
 //! a new dependency (no `clap` in Cargo.toml's dependency list).
@@ -45,17 +45,17 @@ fn main() -> ExitCode {
 
 fn eprint_usage() {
     eprintln!("Usage:");
-    eprintln!("  ai-kit-cli hash <path>");
+    eprintln!("  inference-kit hash <path>");
     eprintln!(
-        "  ai-kit-cli infer --model <id> --prompt <text> [--temperature F] [--top-p F] [--max-tokens N] [--session-id S] [--device cpu|auto|cuda|cuda:N]"
+        "  inference-kit infer --model <id> --prompt <text> [--temperature F] [--top-p F] [--max-tokens N] [--session-id S] [--device cpu|auto|cuda|cuda:N]"
     );
-    eprintln!("  ai-kit-cli cache-stats [--catalog <path>]");
-    eprintln!("  ai-kit-cli devices");
-    eprintln!("  ai-kit-cli route (--prompt <text> | --prompt-file <path> | --batch <jsonl>) [--explain] [--class C] [--privacy private|shareable]");
+    eprintln!("  inference-kit cache-stats [--catalog <path>]");
+    eprintln!("  inference-kit devices");
+    eprintln!("  inference-kit route (--prompt <text> | --prompt-file <path> | --batch <jsonl>) [--explain] [--class C] [--privacy private|shareable]");
     eprintln!("                   [--verify none|nonempty|json|svg|exec|maxwords:N] [--local-model <id>] [--device D] [--cloud-cmd <shell cmd>] [--policy <yaml>] [--max-tokens N]");
-    eprintln!("  ai-kit-cli imagine --model <id> --prompt <text> --out <file.png> [--width N] [--height N] [--steps N] [--seed N] [--guidance F] [--negative <text>] [--device D]");
-    eprintln!("  ai-kit-cli embed --model <id> (--text <t> ...) [--query <q>] [--device D]");
-    eprintln!("  ai-kit-cli bench --model <id> (--prompt <text> | --prompt-file <path>) [--device D] [--max-tokens N] [--repeat R]");
+    eprintln!("  inference-kit imagine --model <id> --prompt <text> --out <file.png> [--width N] [--height N] [--steps N] [--seed N] [--guidance F] [--negative <text>] [--device D]");
+    eprintln!("  inference-kit embed --model <id> (--text <t> ...) [--query <q>] [--device D]");
+    eprintln!("  inference-kit bench --model <id> (--prompt <text> | --prompt-file <path>) [--device D] [--max-tokens N] [--repeat R]");
 }
 
 fn cmd_hash(args: &[String]) -> ExitCode {
@@ -87,7 +87,8 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
 
 #[cfg(feature = "candle")]
 fn default_catalog_path() -> String {
-    env::var("AI_KIT_MODEL_DIR").unwrap_or_else(|_| "./dev-models".to_string()) + "/catalog.yaml"
+    inference_kit::env::var("MODEL_DIR").unwrap_or_else(|| "./dev-models".to_string())
+        + "/catalog.yaml"
 }
 
 #[cfg(feature = "candle")]
@@ -101,7 +102,9 @@ fn cmd_infer(args: &[String]) -> ExitCode {
 
 #[cfg(feature = "candle")]
 async fn cmd_infer_async(args: &[String]) -> ExitCode {
-    use ai_kit::{CandleInferenceService, DevicePreference, InferenceParams, InferenceService};
+    use inference_kit::{
+        CandleInferenceService, DevicePreference, InferenceParams, InferenceService,
+    };
 
     let Some(model_id) = flag_value(args, "--model") else {
         eprintln!("error: infer requires --model <id>");
@@ -120,10 +123,11 @@ async fn cmd_infer_async(args: &[String]) -> ExitCode {
     let max_tokens = flag_value(args, "--max-tokens")
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
-    let session_id = flag_value(args, "--session-id").map(ai_kit::types::SessionId::from_string);
+    let session_id =
+        flag_value(args, "--session-id").map(inference_kit::types::SessionId::from_string);
     let catalog_path = flag_value(args, "--catalog").unwrap_or_else(default_catalog_path);
     let device = match flag_value(args, "--device")
-        .or_else(|| env::var("AI_KIT_DEVICE").ok())
+        .or_else(|| inference_kit::env::var("DEVICE"))
         .map(|v| v.parse::<DevicePreference>())
         .transpose()
     {
@@ -189,7 +193,7 @@ async fn cmd_infer_async(args: &[String]) -> ExitCode {
 
 #[cfg(not(feature = "candle"))]
 fn cmd_infer(_args: &[String]) -> ExitCode {
-    eprintln!("ai-kit-cli was built without the `candle` feature — `infer` is unavailable.");
+    eprintln!("inference-kit was built without the `candle` feature — `infer` is unavailable.");
     eprintln!("Rebuild with: cargo build --features candle");
     eprintln!("(see README.md \"Local Dev Inference (POC)\")");
     ExitCode::from(2)
@@ -206,7 +210,7 @@ fn cmd_cache_stats(args: &[String]) -> ExitCode {
 
 #[cfg(feature = "candle")]
 async fn cmd_cache_stats_async(args: &[String]) -> ExitCode {
-    use ai_kit::{CandleInferenceService, InferenceService};
+    use inference_kit::{CandleInferenceService, InferenceService};
 
     let catalog_path = flag_value(args, "--catalog").unwrap_or_else(default_catalog_path);
     let service = match CandleInferenceService::new(&catalog_path) {
@@ -230,7 +234,9 @@ async fn cmd_cache_stats_async(args: &[String]) -> ExitCode {
 
 #[cfg(not(feature = "candle"))]
 fn cmd_cache_stats(_args: &[String]) -> ExitCode {
-    eprintln!("ai-kit-cli was built without the `candle` feature — `cache-stats` is unavailable.");
+    eprintln!(
+        "inference-kit was built without the `candle` feature — `cache-stats` is unavailable."
+    );
     eprintln!("Rebuild with: cargo build --features candle");
     ExitCode::from(2)
 }
@@ -238,7 +244,7 @@ fn cmd_cache_stats(_args: &[String]) -> ExitCode {
 #[cfg(feature = "candle")]
 fn cmd_devices() -> ExitCode {
     println!("cpu");
-    for line in ai_kit::describe_cuda_devices() {
+    for line in inference_kit::describe_cuda_devices() {
         println!("{line}");
     }
     ExitCode::SUCCESS
@@ -246,7 +252,7 @@ fn cmd_devices() -> ExitCode {
 
 #[cfg(not(feature = "candle"))]
 fn cmd_devices() -> ExitCode {
-    eprintln!("ai-kit-cli was built without the `candle` feature — `devices` is unavailable.");
+    eprintln!("inference-kit was built without the `candle` feature — `devices` is unavailable.");
     ExitCode::from(2)
 }
 
@@ -265,7 +271,9 @@ fn cmd_bench(args: &[String]) -> ExitCode {
 /// as the extra time an `--max-tokens N` request takes beyond that.
 #[cfg(feature = "candle")]
 async fn cmd_bench_async(args: &[String]) -> ExitCode {
-    use ai_kit::{CandleInferenceService, DevicePreference, InferenceParams, InferenceService};
+    use inference_kit::{
+        CandleInferenceService, DevicePreference, InferenceParams, InferenceService,
+    };
     use std::time::Instant;
 
     let Some(model_id) = flag_value(args, "--model") else {
@@ -297,7 +305,7 @@ async fn cmd_bench_async(args: &[String]) -> ExitCode {
         .unwrap_or(3);
     let catalog_path = flag_value(args, "--catalog").unwrap_or_else(default_catalog_path);
     let device = match flag_value(args, "--device")
-        .or_else(|| env::var("AI_KIT_DEVICE").ok())
+        .or_else(|| inference_kit::env::var("DEVICE"))
         .map(|v| v.parse::<DevicePreference>())
         .transpose()
     {
@@ -381,7 +389,7 @@ async fn cmd_bench_async(args: &[String]) -> ExitCode {
 
 #[cfg(not(feature = "candle"))]
 fn cmd_bench(_args: &[String]) -> ExitCode {
-    eprintln!("ai-kit-cli was built without the `candle` feature — `bench` is unavailable.");
+    eprintln!("inference-kit was built without the `candle` feature — `bench` is unavailable.");
     ExitCode::from(2)
 }
 
@@ -389,7 +397,7 @@ fn cmd_bench(_args: &[String]) -> ExitCode {
 
 #[cfg(not(feature = "candle"))]
 fn cmd_route(_args: &[String]) -> ExitCode {
-    eprintln!("ai-kit-cli was built without the `candle` feature — `route` is unavailable.");
+    eprintln!("inference-kit was built without the `candle` feature — `route` is unavailable.");
     ExitCode::from(2)
 }
 
@@ -412,8 +420,11 @@ struct CommandCloud {
 
 #[cfg(feature = "candle")]
 #[async_trait::async_trait]
-impl ai_kit::InferenceService for CommandCloud {
-    async fn infer(&self, p: ai_kit::InferenceParams) -> ai_kit::Result<ai_kit::InferenceResponse> {
+impl inference_kit::InferenceService for CommandCloud {
+    async fn infer(
+        &self,
+        p: inference_kit::InferenceParams,
+    ) -> inference_kit::Result<inference_kit::InferenceResponse> {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let t = std::time::Instant::now();
@@ -432,7 +443,7 @@ impl ai_kit::InferenceService for CommandCloud {
             .write_all(p.prompt.as_bytes())?;
         let out = child.wait_with_output()?;
         if !out.status.success() {
-            return Err(ai_kit::AiKitError::RemoteBackendError {
+            return Err(inference_kit::Error::RemoteBackendError {
                 backend: "command".into(),
                 reason: format!("cloud command exited with {}", out.status),
             });
@@ -440,7 +451,7 @@ impl ai_kit::InferenceService for CommandCloud {
         let completion = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let pt = (p.prompt.chars().count() / 4) as u32 + 1;
         let ct = (completion.chars().count() / 4) as u32 + 1;
-        Ok(ai_kit::InferenceResponse {
+        Ok(inference_kit::InferenceResponse {
             completion,
             total_tokens: pt + ct,
             prompt_tokens: pt,
@@ -452,18 +463,18 @@ impl ai_kit::InferenceService for CommandCloud {
             request_id: p.request_id.unwrap_or_default(),
         })
     }
-    async fn load_model(&self, _: &str) -> ai_kit::Result<()> {
+    async fn load_model(&self, _: &str) -> inference_kit::Result<()> {
         Ok(())
     }
-    async fn unload_model(&self, _: &str) -> ai_kit::Result<()> {
+    async fn unload_model(&self, _: &str) -> inference_kit::Result<()> {
         Ok(())
     }
-    async fn cache_stats(&self) -> ai_kit::Result<ai_kit::types::CacheStats> {
-        Err(ai_kit::AiKitError::Internal {
+    async fn cache_stats(&self) -> inference_kit::Result<inference_kit::types::CacheStats> {
+        Err(inference_kit::Error::Internal {
             reason: "n/a".into(),
         })
     }
-    async fn end_session(&self, _: &ai_kit::types::SessionId) -> ai_kit::Result<()> {
+    async fn end_session(&self, _: &inference_kit::types::SessionId) -> inference_kit::Result<()> {
         Ok(())
     }
 }
@@ -471,8 +482,8 @@ impl ai_kit::InferenceService for CommandCloud {
 /// `exec` verifier: pull the first ```python block (or the whole answer) out of a completion,
 /// append `tests`, and run it with python3. Passing means exit code 0 within 10 seconds.
 #[cfg(feature = "candle")]
-fn exec_verifier(tests: String) -> ai_kit::Verifier {
-    ai_kit::Verifier::Custom(std::sync::Arc::new(move |out: &str| {
+fn exec_verifier(tests: String) -> inference_kit::Verifier {
+    inference_kit::Verifier::Custom(std::sync::Arc::new(move |out: &str| {
         let code = match out.split("```").nth(1) {
             Some(b) => b.strip_prefix("python").unwrap_or(b).to_string(),
             None => out.to_string(),
@@ -508,31 +519,33 @@ fn exec_verifier(tests: String) -> ai_kit::Verifier {
 }
 
 #[cfg(feature = "candle")]
-fn verifier_from(spec: &str, tests: Option<&str>) -> ai_kit::Verifier {
+fn verifier_from(spec: &str, tests: Option<&str>) -> inference_kit::Verifier {
     // `maxwords:N`: non-empty and at most N whitespace-separated words (a cheap length constraint).
     if let Some(n) = spec
         .strip_prefix("maxwords:")
         .and_then(|n| n.parse::<usize>().ok())
     {
-        return ai_kit::Verifier::Custom(std::sync::Arc::new(move |o: &str| {
+        return inference_kit::Verifier::Custom(std::sync::Arc::new(move |o: &str| {
             let w = o.split_whitespace().count();
             w > 0 && w <= n
         }));
     }
     match spec {
-        "json" => ai_kit::Verifier::Json,
-        "nonempty" => ai_kit::Verifier::NonEmpty,
+        "json" => inference_kit::Verifier::Json,
+        "nonempty" => inference_kit::Verifier::NonEmpty,
         // A standalone vector graphic needs both tags and the SVG namespace; without
         // `xmlns` a browser shows a broken image (the 3B model omitted it every time).
-        "svg" => ai_kit::Verifier::Custom(std::sync::Arc::new(|o: &str| {
+        "svg" => inference_kit::Verifier::Custom(std::sync::Arc::new(|o: &str| {
             let l = o.to_lowercase();
             l.contains("<svg")
                 && l.contains("</svg>")
                 && (l.contains("xmlns=\"http://www.w3.org/2000/svg\"")
                     || l.contains("xmlns='http://www.w3.org/2000/svg'"))
         })),
-        "exec" => tests.map_or(ai_kit::Verifier::None, |t| exec_verifier(t.to_string())),
-        _ => ai_kit::Verifier::None,
+        "exec" => tests.map_or(inference_kit::Verifier::None, |t| {
+            exec_verifier(t.to_string())
+        }),
+        _ => inference_kit::Verifier::None,
     }
 }
 
@@ -540,10 +553,10 @@ fn verifier_from(spec: &str, tests: Option<&str>) -> ai_kit::Verifier {
 #[cfg(feature = "candle")]
 struct RouteJob {
     id: String,
-    kind: ai_kit::RequestKind,
+    kind: inference_kit::RequestKind,
     prompt: String,
-    class: Option<ai_kit::TaskClass>,
-    privacy: ai_kit::Privacy,
+    class: Option<inference_kit::TaskClass>,
+    privacy: inference_kit::Privacy,
     verify: String,
     tests: Option<String>,
     width: u32,
@@ -558,15 +571,15 @@ struct RouteJob {
 /// The output check for a request: text uses the text verifiers; every other kind uses the modality's sanity check
 /// (`verify: "sane"`, or any non-`none` value).
 #[cfg(feature = "candle")]
-fn check_for(job: &RouteJob) -> ai_kit::OutputCheck {
-    use ai_kit::{Output, OutputCheck};
+fn check_for(job: &RouteJob) -> inference_kit::OutputCheck {
+    use inference_kit::{Output, OutputCheck};
     // `sane` means the modality's sanity check, whatever the request is: free text that gets re-typed as an
     // image request must be checked as an image.
     if job.verify == "sane" {
         OutputCheck::Sane
-    } else if job.kind == ai_kit::RequestKind::TextGeneration {
+    } else if job.kind == inference_kit::RequestKind::TextGeneration {
         match verifier_from(&job.verify, job.tests.as_deref()) {
-            ai_kit::Verifier::None => OutputCheck::None,
+            inference_kit::Verifier::None => OutputCheck::None,
             v => OutputCheck::Custom(std::sync::Arc::new(move |o: &Output| match o {
                 Output::Text(t) => v.check(&t.completion).unwrap_or(true),
                 _ => true,
@@ -580,25 +593,25 @@ fn check_for(job: &RouteJob) -> ai_kit::OutputCheck {
 }
 
 #[cfg(feature = "candle")]
-fn parse_privacy(s: &str) -> ai_kit::Privacy {
+fn parse_privacy(s: &str) -> inference_kit::Privacy {
     if s == "shareable" {
-        ai_kit::Privacy::Shareable
+        inference_kit::Privacy::Shareable
     } else {
-        ai_kit::Privacy::Private
+        inference_kit::Privacy::Private
     }
 }
 
 #[cfg(feature = "candle")]
-fn device_flag(args: &[String]) -> ai_kit::DevicePreference {
+fn device_flag(args: &[String]) -> inference_kit::DevicePreference {
     flag_value(args, "--device")
-        .or_else(|| env::var("AI_KIT_DEVICE").ok())
+        .or_else(|| inference_kit::env::var("DEVICE"))
         .and_then(|v| v.parse().ok())
         .unwrap_or_default()
 }
 
 #[cfg(feature = "candle")]
-fn job_request(job: &RouteJob) -> Result<ai_kit::Request, String> {
-    use ai_kit::{
+fn job_request(job: &RouteJob) -> Result<inference_kit::Request, String> {
+    use inference_kit::{
         AudioFormat, EmbeddingParams, ImageGenParams, ImageUnderstandingParams, InferenceParams,
         Request, SpeechParams,
     };
@@ -607,7 +620,7 @@ fn job_request(job: &RouteJob) -> Result<ai_kit::Request, String> {
         std::fs::read(f).map_err(|e| format!("cannot read {f}: {e}"))
     };
     Ok(match job.kind {
-        ai_kit::RequestKind::ImageGeneration => {
+        inference_kit::RequestKind::ImageGeneration => {
             let mut p = ImageGenParams::new(String::new(), job.prompt.clone());
             p.width = job.width;
             p.height = job.height;
@@ -615,14 +628,14 @@ fn job_request(job: &RouteJob) -> Result<ai_kit::Request, String> {
             p.seed = job.seed;
             Request::ImageGeneration(p)
         }
-        ai_kit::RequestKind::Embedding => Request::Embedding(EmbeddingParams {
+        inference_kit::RequestKind::Embedding => Request::Embedding(EmbeddingParams {
             model_id: String::new(),
             inputs: job.inputs.clone(),
             normalize: true,
             session_id: None,
             request_id: None,
         }),
-        ai_kit::RequestKind::ImageUnderstanding => {
+        inference_kit::RequestKind::ImageUnderstanding => {
             let mime = match job.file.as_deref().and_then(|f| f.rsplit('.').next()) {
                 Some("jpg" | "jpeg") => "image/jpeg",
                 Some("webp") => "image/webp",
@@ -638,7 +651,7 @@ fn job_request(job: &RouteJob) -> Result<ai_kit::Request, String> {
                 request_id: None,
             })
         }
-        ai_kit::RequestKind::SpeechToText => Request::SpeechToText(SpeechParams {
+        inference_kit::RequestKind::SpeechToText => Request::SpeechToText(SpeechParams {
             model_id: String::new(),
             audio: bytes()?,
             format: AudioFormat::Wav,
@@ -646,7 +659,7 @@ fn job_request(job: &RouteJob) -> Result<ai_kit::Request, String> {
             session_id: None,
             request_id: None,
         }),
-        ai_kit::RequestKind::TextGeneration => Request::Text(InferenceParams {
+        inference_kit::RequestKind::TextGeneration => Request::Text(InferenceParams {
             model_id: String::new(),
             prompt: job.prompt.clone(),
             temperature: 0.0,
@@ -668,8 +681,8 @@ fn job_request(job: &RouteJob) -> Result<ai_kit::Request, String> {
 
 #[cfg(feature = "candle")]
 async fn cmd_route_async(args: &[String]) -> ExitCode {
-    use ai_kit::routed::TierBackend;
-    use ai_kit::{
+    use inference_kit::routed::TierBackend;
+    use inference_kit::{
         CandleEmbeddingService, CandleImageService, CandleInferenceService, InferenceService,
         MultiHybridService, Output, RequestKind, RoutePolicy, RoutedRequest, TaskClass,
         TextService,
@@ -680,7 +693,7 @@ async fn cmd_route_async(args: &[String]) -> ExitCode {
     let explain = args.iter().any(|a| a == "--explain");
     let policy = match flag_value(args, "--policy") {
         Some(f) => match std::fs::read_to_string(&f)
-            .map_err(ai_kit::AiKitError::from)
+            .map_err(inference_kit::Error::from)
             .and_then(|s| RoutePolicy::from_yaml(&s))
         {
             Ok(p) => p,
@@ -905,12 +918,12 @@ async fn cmd_route_async(args: &[String]) -> ExitCode {
 
 #[cfg(not(feature = "candle"))]
 fn cmd_imagine(_args: &[String]) -> ExitCode {
-    eprintln!("ai-kit-cli was built without the `candle` feature, so `imagine` is unavailable.");
+    eprintln!("inference-kit was built without the `candle` feature, so `imagine` is unavailable.");
     ExitCode::from(2)
 }
 #[cfg(not(feature = "candle"))]
 fn cmd_embed(_args: &[String]) -> ExitCode {
-    eprintln!("ai-kit-cli was built without the `candle` feature, so `embed` is unavailable.");
+    eprintln!("inference-kit was built without the `candle` feature, so `embed` is unavailable.");
     ExitCode::from(2)
 }
 
@@ -919,14 +932,14 @@ fn cmd_embed(_args: &[String]) -> ExitCode {
 #[cfg(feature = "candle")]
 fn resolve_model(
     given: Option<String>,
-    kind: ai_kit::RequestKind,
+    kind: inference_kit::RequestKind,
     catalog_path: &str,
     args: &[String],
 ) -> Result<String, String> {
     if let Some(id) = given.filter(|g| g != "default") {
         return Ok(id);
     }
-    let reg = ai_kit::registry::ModelRegistry::load_from_file(catalog_path)
+    let reg = inference_kit::registry::ModelRegistry::load_from_file(catalog_path)
         .map_err(|e| format!("failed to load catalog {catalog_path}: {e}"))?;
     let allow = args.iter().any(|a| a == "--allow-noncommercial");
     reg.default_for(kind, allow).map(|m| m.id.clone()).ok_or_else(|| {
@@ -939,7 +952,7 @@ fn resolve_model(
 
 #[cfg(feature = "candle")]
 fn cmd_imagine(args: &[String]) -> ExitCode {
-    use ai_kit::{CandleImageService, ImageGenParams, Output, Request, RequestService};
+    use inference_kit::{CandleImageService, ImageGenParams, Output, Request, RequestService};
     let (Some(prompt), Some(out)) = (flag_value(args, "--prompt"), flag_value(args, "--out"))
     else {
         eprintln!(
@@ -950,7 +963,7 @@ fn cmd_imagine(args: &[String]) -> ExitCode {
     let catalog_path = flag_value(args, "--catalog").unwrap_or_else(default_catalog_path);
     let model = match resolve_model(
         flag_value(args, "--model"),
-        ai_kit::RequestKind::ImageGeneration,
+        inference_kit::RequestKind::ImageGeneration,
         &catalog_path,
         args,
     ) {
@@ -1005,7 +1018,7 @@ fn cmd_imagine(args: &[String]) -> ExitCode {
 
 #[cfg(feature = "candle")]
 fn cmd_embed(args: &[String]) -> ExitCode {
-    use ai_kit::{CandleEmbeddingService, EmbeddingParams, Output, Request, RequestService};
+    use inference_kit::{CandleEmbeddingService, EmbeddingParams, Output, Request, RequestService};
     let Some(model) = flag_value(args, "--model") else {
         eprintln!("error: embed needs --model and one or more --text");
         return ExitCode::from(2);

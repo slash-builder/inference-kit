@@ -27,7 +27,7 @@
 
 use crate::backends::common::{check_vram, device_for, verify_model_files, DevicePreference};
 use crate::backends::zimage::{ZImageFiles, ZImagePipeline};
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::modality::{
     unsupported, GeneratedImage, ImageGenParams, Output, Request, RequestKind, RequestService,
 };
@@ -106,11 +106,11 @@ impl CandleImageService {
             .registry
             .get(id)
             .cloned()
-            .ok_or_else(|| AiKitError::ModelNotFound {
+            .ok_or_else(|| Error::ModelNotFound {
                 model_id: id.to_string(),
             })?;
         if m.kind() != RequestKind::ImageGeneration {
-            return Err(AiKitError::ModelLoadFailed {
+            return Err(Error::ModelLoadFailed {
                 model_id: id.to_string(),
                 reason: format!(
                     "'{id}' is a {} model, not an image-generation model",
@@ -127,7 +127,7 @@ impl CandleImageService {
             return Ok(());
         }
         let model = self.model_meta(id)?;
-        let fail = |reason: String| AiKitError::ModelLoadFailed {
+        let fail = |reason: String| Error::ModelLoadFailed {
             model_id: id.to_string(),
             reason,
         };
@@ -168,7 +168,7 @@ impl CandleImageService {
             };
             self.loaded
                 .write()
-                .map_err(|_| AiKitError::Internal {
+                .map_err(|_| Error::Internal {
                     reason: "loaded-model lock poisoned".into(),
                 })?
                 .insert(
@@ -203,7 +203,7 @@ impl CandleImageService {
             Tokenizer::from_file(&tok_path).map_err(|e| fail(format!("tokenizer: {e}")))?;
         self.loaded
             .write()
-            .map_err(|_| AiKitError::Internal {
+            .map_err(|_| Error::Internal {
                 reason: "loaded-model lock poisoned".into(),
             })?
             .insert(
@@ -242,15 +242,15 @@ impl CandleImageService {
         let model = self
             .loaded
             .read()
-            .map_err(|_| AiKitError::Internal {
+            .map_err(|_| Error::Internal {
                 reason: "loaded-model lock poisoned".into(),
             })?
             .get(&p.model_id)
             .cloned()
-            .ok_or_else(|| AiKitError::ModelNotFound {
+            .ok_or_else(|| Error::ModelNotFound {
                 model_id: p.model_id.clone(),
             })?;
-        let loaded = model.lock().map_err(|_| AiKitError::Internal {
+        let loaded = model.lock().map_err(|_| Error::Internal {
             reason: "image model lock poisoned".into(),
         })?;
         let started = std::time::Instant::now();
@@ -265,11 +265,11 @@ impl CandleImageService {
         // The Euler-ancestral sampler draws fresh noise on every step but the last, from Candle's own RNG. That RNG can only be
         // seeded on CUDA, so seed it there (on the CPU only `steps = 1`, which draws none, is reproducible).
         if m.device.is_cuda() {
-            m.device.set_seed(seed).map_err(|e| AiKitError::Internal {
+            m.device.set_seed(seed).map_err(|e| Error::Internal {
                 reason: format!("seeding the GPU RNG: {e}"),
             })?;
         }
-        let internal = |what: &str, e: candle_core::Error| AiKitError::Internal {
+        let internal = |what: &str, e: candle_core::Error| Error::Internal {
             reason: format!("{what}: {e}"),
         };
 
@@ -453,10 +453,10 @@ pub(crate) fn encode_png(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>>
         let mut enc = png::Encoder::new(&mut out, width, height);
         enc.set_color(png::ColorType::Rgb);
         enc.set_depth(png::BitDepth::Eight);
-        let mut w = enc.write_header().map_err(|e| AiKitError::Internal {
+        let mut w = enc.write_header().map_err(|e| Error::Internal {
             reason: format!("png header: {e}"),
         })?;
-        w.write_image_data(rgb).map_err(|e| AiKitError::Internal {
+        w.write_image_data(rgb).map_err(|e| Error::Internal {
             reason: format!("png data: {e}"),
         })?;
     }

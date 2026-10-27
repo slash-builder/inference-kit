@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Fetch a small local dev model for AI Kit's `candle` feature — POC ONLY.
+# Fetch a small local dev model for Inference Kit's `candle` feature — POC ONLY.
 #
 # Production models ship signed in the OS image (invariant #1/#2: no
 # weights over network, models are immutable OS resources). This script is
 # a deliberate, documented exception for local developer-machine testing:
 # it downloads a small quantized GGUF model from Hugging Face so
-# `ai-kit-cli infer` has something real to run against without BenixOS,
+# `inference-kit infer` has something real to run against without BenixOS,
 # Storage Kit, or an OS image. Never used in production, never wired into
 # any boot path.
 #
@@ -69,16 +69,16 @@ fetch() {
   mv "$tmp" "$dest"
 }
 
-echo "AI Kit dev model fetch: $MODEL_NAME"
+echo "Inference Kit dev model fetch: $MODEL_NAME"
 fetch "https://huggingface.co/${HF_REPO}/resolve/main/${GGUF_FILE}" "$MODEL_PATH"
 fetch "https://huggingface.co/${TOKENIZER_REPO}/resolve/main/tokenizer.json" "$TOKENIZER_PATH"
 
 SIZE_BYTES="$(stat -f%z "$MODEL_PATH" 2>/dev/null || stat -c%s "$MODEL_PATH")"
 
-echo "  building ai-kit-cli (hash subcommand only, no candle feature needed)"
-cargo build --bin ai-kit-cli --quiet
+echo "  building inference-kit (hash subcommand only, no candle feature needed)"
+cargo build --bin inference-kit --quiet
 
-HASH="$(./target/debug/ai-kit-cli hash "$MODEL_PATH")"
+HASH="$(./target/debug/inference-kit hash "$MODEL_PATH")"
 
 echo "  writing dev-models/catalog.yaml"
 sed \
@@ -100,10 +100,10 @@ cat <<'BANNER'
 
 POC-ONLY: model fetched over network for local dev inference.
 Production ships models signed in the OS image (invariant #2) — this
-exception is documented in README.md ("Local Dev Inference (POC)") and
-AGENT.md. Never used at runtime on a real device.
+exception is documented in README.md ("Local Dev Inference (POC)").
+Never used at runtime on a real device.
 
 Next: cargo build --features candle
-      cargo run --features candle --bin ai-kit-cli -- infer --model MODEL_NAME_PLACEHOLDER --prompt "Say hello"
+      cargo run --features candle --bin inference-kit -- infer --model MODEL_NAME_PLACEHOLDER --prompt "Say hello"
 BANNER
 echo "(replace MODEL_NAME_PLACEHOLDER above with: $MODEL_NAME)"

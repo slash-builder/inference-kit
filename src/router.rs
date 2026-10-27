@@ -1,4 +1,4 @@
-//! The [`EgressRouter`] (not the older hybrid `Router`): one object a host application (Courier, the gateway glue, the CLI) assembles once and calls.
+//! The [`EgressRouter`] (not the older hybrid `Router`): one object a host application (or the CLI) assembles once and calls.
 //!
 //! It owns the pieces the egress-aware path needs, so a caller cannot get the wiring wrong by assembling them by hand:
 //! the [`ProviderSet`] (adapters, model cards, health and scorecards), the current [`Policy`], the spend [`Ledger`], and the audit
@@ -21,7 +21,7 @@
 
 use crate::budget::Ledger;
 use crate::egress::{AuditSink, EgressRecord, Label, Policy, Purpose};
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::modality::{Request, RequestKind};
 use crate::planner::{Entry, Needs, Plan, PlanRequest, Preference, ProviderSet};
 use crate::provider::ProviderReply;
@@ -140,7 +140,7 @@ impl EgressRouter {
         let kind = call.request.kind();
         if let Some(granted) = call.granted {
             if !granted.contains(&kind) {
-                return Err(AiKitError::CapabilityDenied {
+                return Err(Error::CapabilityDenied {
                     app_id: call.caller.to_string(),
                     model_id: call.request.model_id().to_string(),
                     request_kind: kind.as_str().to_string(),
@@ -211,7 +211,7 @@ impl EgressRouter {
             Err(p) => p.into_inner(),
         };
         if policy.version <= guard.version {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: format!(
                     "policy version {} does not exceed the version in force ({})",
                     policy.version, guard.version
@@ -265,7 +265,7 @@ impl EgressRouterBuilder {
         self
     }
     pub fn build(self) -> Result<EgressRouter> {
-        let sink = self.sink.ok_or_else(|| AiKitError::InvalidParams {
+        let sink = self.sink.ok_or_else(|| Error::InvalidParams {
             reason: "a router needs an audit sink: a record of what left the house is not optional"
                 .into(),
         })?;
@@ -381,7 +381,7 @@ mod tests {
             )
             .await;
         match out.result {
-            Err(AiKitError::CapabilityDenied {
+            Err(Error::CapabilityDenied {
                 app_id,
                 request_kind,
                 ..
@@ -425,10 +425,7 @@ mod tests {
         let out = r
             .run(&Call::new(&rq, &unlabelled, Purpose::Answer, 1000))
             .await;
-        assert!(matches!(
-            out.result,
-            Err(AiKitError::RequiresShareable { .. })
-        ));
+        assert!(matches!(out.result, Err(Error::RequiresShareable { .. })));
         assert_eq!(saas.calls(), 0);
         // a denial is worth keeping
         assert!(out.record.unwrap().is_worth_keeping());
@@ -493,7 +490,7 @@ mod tests {
         // and run says so, with the wire code for "nothing eligible", not "kind unsupported" and not "private content"
         let out = r.run(&Call::new(&rq, &l, Purpose::Answer, 1000)).await;
         match out.result {
-            Err(e @ AiKitError::NoEligibleProvider { .. }) => {
+            Err(e @ Error::NoEligibleProvider { .. }) => {
                 assert_eq!(
                     e.to_inference_error_code(),
                     crate::error::InferenceErrorCode::NoEligibleProvider
@@ -530,7 +527,7 @@ mod tests {
         let none: [RequestKind; 0] = [];
         assert!(matches!(
             r.plan(&Call::new(&rq, &l, Purpose::Answer, 1000).granted(&none)),
-            Err(AiKitError::CapabilityDenied { .. })
+            Err(Error::CapabilityDenied { .. })
         ));
     }
 
@@ -538,7 +535,7 @@ mod tests {
     fn a_router_without_an_audit_sink_cannot_be_built() {
         assert!(matches!(
             EgressRouter::builder().policy(allow_all(1)).build(),
-            Err(AiKitError::InvalidParams { .. })
+            Err(Error::InvalidParams { .. })
         ));
     }
 

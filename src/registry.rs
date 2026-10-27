@@ -89,8 +89,8 @@ impl ModelRegistry {
     ///
     /// # Errors
     ///
-    /// - `AiKitError::Io` if the file can't be read.
-    /// - `AiKitError::YamlError` if the file doesn't parse to the shape above.
+    /// - `Error::Io` if the file can't be read.
+    /// - `Error::YamlError` if the file doesn't parse to the shape above.
     /// - Whatever [`ModelRegistry::validate`] returns, if any parsed model fails validation.
     pub fn load_from_file(path: &str) -> Result<ModelRegistry> {
         let contents = std::fs::read_to_string(path)?;
@@ -178,19 +178,19 @@ impl ModelRegistry {
     pub fn validate(&self) -> Result<()> {
         for model in self.models.values() {
             if model.id.is_empty() {
-                return Err(crate::error::AiKitError::Internal {
+                return Err(crate::error::Error::Internal {
                     reason: "Model ID cannot be empty".to_string(),
                 });
             }
 
             if model.hash.is_empty() {
-                return Err(crate::error::AiKitError::Internal {
+                return Err(crate::error::Error::Internal {
                     reason: format!("Model {} has empty hash", model.id),
                 });
             }
 
             if model.quantization_variants.is_empty() {
-                return Err(crate::error::AiKitError::Internal {
+                return Err(crate::error::Error::Internal {
                     reason: format!("Model {} has no quantization variants", model.id),
                 });
             }
@@ -199,7 +199,7 @@ impl ModelRegistry {
                 .quantization_variants
                 .contains(&model.default_quantization)
             {
-                return Err(crate::error::AiKitError::Internal {
+                return Err(crate::error::Error::Internal {
                     reason: format!(
                         "Model {} default quantization {} not in variants",
                         model.id, model.default_quantization
@@ -209,7 +209,7 @@ impl ModelRegistry {
 
             if let Some(c) = model.metadata.custom.get("kind") {
                 if c.parse::<crate::modality::RequestKind>().is_err() {
-                    return Err(crate::error::AiKitError::Internal {
+                    return Err(crate::error::Error::Internal {
                         reason: format!("Model {} has unknown request kind '{c}'", model.id),
                     });
                 }
@@ -219,7 +219,7 @@ impl ModelRegistry {
                 .iter()
                 .find(|f| f.hash.is_empty() || f.role.is_empty())
             {
-                return Err(crate::error::AiKitError::Internal {
+                return Err(crate::error::Error::Internal {
                     reason: format!(
                         "Model {} has a file ('{}') with no role or no hash",
                         model.id, f.role
@@ -228,7 +228,7 @@ impl ModelRegistry {
             }
 
             if model.metadata.vram_required_mb == 0 {
-                return Err(crate::error::AiKitError::Internal {
+                return Err(crate::error::Error::Internal {
                     reason: format!("Model {} has zero VRAM requirement", model.id),
                 });
             }

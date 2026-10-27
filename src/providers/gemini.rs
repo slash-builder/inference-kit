@@ -1,4 +1,9 @@
-//! Google Gemini (the Developer API: `generateContent` and `batchEmbedContents`) as a [`ProviderAdapter`]. **Tested against mocks only; no key exists yet.**
+//! Google Gemini (the Developer API: `generateContent` and `batchEmbedContents`) as a [`ProviderAdapter`]. **Tested against mocks only.**
+//!
+//! # Data egress
+//!
+//! **Enabling the `provider-gemini` feature and configuring this adapter sends your prompts, embedding inputs and the model outputs to Google.** It is off by
+//! default, is built only when a credential is supplied, and the egress policy must still allow each request. Not affiliated with or endorsed by Google.
 //!
 //! What it does (each point is a wiremock test):
 //! - the key is read from the [`CredentialSource`] **on every call** and sent as `x-goog-api-key`; a missing credential means no adapter;

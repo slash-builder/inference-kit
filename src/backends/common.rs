@@ -4,7 +4,7 @@
 //! These used to live in `candle.rs` and were reached into by the other backends. Moving them here means a new backend
 //! (for example Z-Image) depends on this module, not on the text backend.
 
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::types::ModelMetadata;
 use candle_core::Device;
 use std::str::FromStr;
@@ -88,7 +88,7 @@ pub(crate) fn verify_model_files(model: &ModelMetadata) -> Result<String> {
     for (path, expected) in checks {
         let actual = hash_file(&path)?;
         if actual != expected {
-            return Err(AiKitError::IntegrityCheckFailed {
+            return Err(Error::IntegrityCheckFailed {
                 model_id: model.id.clone(),
                 expected,
                 actual,
@@ -117,7 +117,7 @@ pub(crate) fn cuda_device(ordinal: usize) -> std::result::Result<(Device, String
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn cuda_device(ordinal: usize) -> std::result::Result<(Device, String), String> {
     Err(format!(
-        "CUDA device {ordinal} requested, but this ai-kit was built without the `cuda` \
+        "CUDA device {ordinal} requested, but this inference-kit was built without the `cuda` \
          feature (rebuild with `--features cuda`)"
     ))
 }
@@ -153,19 +153,19 @@ pub(crate) fn check_vram(device: &Device, model: &ModelMetadata) -> Result<()> {
     }
     let ctx = device
         .as_cuda_device()
-        .map_err(|e| AiKitError::Internal {
+        .map_err(|e| Error::Internal {
             reason: e.to_string(),
         })?
         .cuda_stream()
         .context()
         .clone();
-    let (free, _total) = ctx.mem_get_info().map_err(|e| AiKitError::Internal {
+    let (free, _total) = ctx.mem_get_info().map_err(|e| Error::Internal {
         reason: format!("cannot query free GPU memory: {e}"),
     })?;
     let free_mb = (free >> 20) as u64;
     let need_mb = vram_needed_mb(model);
     if need_mb > free_mb {
-        return Err(AiKitError::InferenceOom {
+        return Err(Error::InferenceOom {
             model_id: model.id.clone(),
             required_mb: u32::try_from(need_mb).unwrap_or(u32::MAX),
             available_mb: u32::try_from(free_mb).unwrap_or(u32::MAX),
@@ -180,7 +180,7 @@ pub(crate) fn check_vram(_device: &Device, _model: &ModelMetadata) -> Result<()>
 }
 
 /// One line per usable CUDA device (`cuda:0 NVIDIA GeForce RTX 3060, 11.4/12.0 GB free`),
-/// or a single line saying why there are none. For `ai-kit-cli devices`.
+/// or a single line saying why there are none. For `inference-kit devices`.
 pub fn describe_cuda_devices() -> Vec<String> {
     #[cfg(feature = "cuda")]
     {
@@ -242,9 +242,9 @@ fn free_vram_mb(_device: &Device) -> Option<u64> {
 /// Turn an `Internal` error that is really a GPU out-of-memory into a typed `InferenceOom`, so callers and the wire contract can tell
 /// "does not fit" from "broken". `required_mb` is 0 because the real need is not known at that point; `available_mb` is the free
 /// memory right now when it can be read. Any other error is returned unchanged.
-pub(crate) fn promote_oom(e: AiKitError, model_id: &str, device: Option<&Device>) -> AiKitError {
+pub(crate) fn promote_oom(e: Error, model_id: &str, device: Option<&Device>) -> Error {
     match e {
-        AiKitError::Internal { ref reason } if looks_like_oom(reason) => AiKitError::InferenceOom {
+        Error::Internal { ref reason } if looks_like_oom(reason) => Error::InferenceOom {
             model_id: model_id.to_string(),
             required_mb: 0,
             available_mb: device
@@ -298,27 +298,27 @@ mod tests {
 
     #[test]
     fn a_gpu_out_of_memory_message_becomes_a_typed_error_and_nothing_else_does() {
-        let oom = AiKitError::Internal {
+        let oom = Error::Internal {
             reason: "z_image vae decode: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
                 .into(),
         };
         assert!(matches!(
             promote_oom(oom, "m", None),
-            AiKitError::InferenceOom { .. }
+            Error::InferenceOom { .. }
         ));
-        let other = AiKitError::Internal {
+        let other = Error::Internal {
             reason: "shape mismatch".into(),
         };
         assert!(matches!(
             promote_oom(other, "m", None),
-            AiKitError::Internal { .. }
+            Error::Internal { .. }
         ));
-        let typed = AiKitError::ModelNotFound {
+        let typed = Error::ModelNotFound {
             model_id: "m".into(),
         };
         assert!(matches!(
             promote_oom(typed, "m", None),
-            AiKitError::ModelNotFound { .. }
+            Error::ModelNotFound { .. }
         ));
     }
 

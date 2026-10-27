@@ -9,11 +9,11 @@
 //!
 //! # RequestKind Gating (Decision Memo #1)
 //!
-//! Per decision memo #1, AI Kit trusts Hearth's capability check at call boundary.
+//! Inference Kit trusts Hearth's capability check at call boundary.
 //! When an app calls `infer()`, the Hearth runtime has already verified the capability grant.
-//! AI Kit does NOT call Score Kit directly; it trusts the transport layer.
+//! Inference Kit does NOT call Score Kit directly; it trusts the transport layer.
 //!
-//! TODO: Once DJ rules, confirm whether AI Kit should add redundant local gating
+//! TODO: Once decided, confirm whether Inference Kit should add redundant local gating
 //! (unlikely, but security audit may require it).
 
 use crate::error::Result;
@@ -28,8 +28,8 @@ use async_trait::async_trait;
 /// # Examples
 ///
 /// ```no_run
-/// # use ai_kit::InferenceService;
-/// # use ai_kit::types::{InferenceParams, SessionId};
+/// # use inference_kit::InferenceService;
+/// # use inference_kit::types::{InferenceParams, SessionId};
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// # let service: Box<dyn InferenceService> = todo!();
 /// let params = InferenceParams {
@@ -67,7 +67,7 @@ pub trait InferenceService: Send + Sync {
     /// # Errors
     ///
     /// - `ModelNotFound`: model_id not in registry.
-    /// - `QuantizationUnsupported`: requested quantization unavailable (per decision memo #7).
+    /// - `QuantizationUnsupported`: requested quantization unavailable.
     /// - `InferenceTimeout`: took longer than SLA (from Score Kit grant).
     /// - `InferenceOom`: model too large for device.
     /// - `InvalidParams`: validation failed.
@@ -75,9 +75,9 @@ pub trait InferenceService: Send + Sync {
     ///
     /// # TODO: Open Questions
     ///
-    /// - Decision memo #2 (remote fallback scope): Should fallback include Quickring cloud hub
-    ///   or only Cumulus? MVP is Cumulus-only; cloud is v0.2+.
-    /// - Decision memo #7 (quantization fallback): Auto-downgrade, fail, or fallback?
+    /// - Remote fallback scope: should fallback include a cloud tier, or only a peer on the same
+    ///   network? The default is local-only; cloud tiers are opt-in features.
+    /// - Quantization fallback: auto-downgrade, fail, or fall back?
     ///   Current design: fail hard (force explicit fallback).
     async fn infer(&self, params: InferenceParams) -> Result<InferenceResponse>;
 
@@ -100,7 +100,7 @@ pub trait InferenceService: Send + Sync {
     /// # TODO: Decision Memo #3 (pre-load strategy)
     ///
     /// Default is lazy-load (minimize footprint). Pre-load is opt-in via config.
-    /// Once DJ rules, may add `preload_all()` method for Cumulus always-on mode.
+    /// Once decided, may add `preload_all()` method for Cumulus always-on mode.
     async fn load_model(&self, model_id: &str) -> Result<()>;
 
     /// Unload a model from memory (eager).
@@ -154,32 +154,32 @@ pub struct DefaultInferenceService;
 impl InferenceService for DefaultInferenceService {
     async fn infer(&self, params: InferenceParams) -> Result<InferenceResponse> {
         params.validate()?;
-        Err(crate::error::AiKitError::Internal {
+        Err(crate::error::Error::Internal {
             reason: "DefaultInferenceService is a stub; implement with Candle or TFLite bindings."
                 .to_string(),
         })
     }
 
     async fn load_model(&self, _model_id: &str) -> Result<()> {
-        Err(crate::error::AiKitError::Internal {
+        Err(crate::error::Error::Internal {
             reason: "DefaultInferenceService is a stub.".to_string(),
         })
     }
 
     async fn unload_model(&self, _model_id: &str) -> Result<()> {
-        Err(crate::error::AiKitError::Internal {
+        Err(crate::error::Error::Internal {
             reason: "DefaultInferenceService is a stub.".to_string(),
         })
     }
 
     async fn cache_stats(&self) -> Result<CacheStats> {
-        Err(crate::error::AiKitError::Internal {
+        Err(crate::error::Error::Internal {
             reason: "DefaultInferenceService is a stub.".to_string(),
         })
     }
 
     async fn end_session(&self, _session_id: &SessionId) -> Result<()> {
-        Err(crate::error::AiKitError::Internal {
+        Err(crate::error::Error::Internal {
             reason: "DefaultInferenceService is a stub.".to_string(),
         })
     }

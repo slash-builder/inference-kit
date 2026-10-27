@@ -1,21 +1,29 @@
-# AI Kit
+# Inference Kit
 
-**Trait-based local inference orchestration for Hearth household clusters.**
+**Local-first inference orchestration: model registry, routing, egress control and a cost ledger, with optional Candle backends.**
 
-AI Kit provides a framework-agnostic inference API for Hearth devices. Models are immutable OS resources (shipped signed, verified at boot). Inference is household-scoped with capability gating via Score Kit and observability via Service Kit.
+Inference Kit gives an application one inference API over local models and, only when you opt in, cloud providers. The default build is local-only and sends nothing anywhere. Models are immutable, hash-verified resources; every request that could leave the machine passes an explicit privacy gate first.
+
+## Package and library names
+
+| What | Name |
+|---|---|
+| Cargo package | `slashbuilder-inference-kit` |
+| Library (`use ...`) | `inference_kit` |
+| Command-line binary | `inference-kit` |
+| Environment variables | `INFERENCE_KIT_*` |
+
+Version 0.2.0 is the first release under these names. It replaces the earlier names (package `ai-kit`, library `ai_kit`, binary `ai-kit-cli`, `AiKitError`, `AI_KIT_*`), which remain as **deprecated** aliases for source and environment compatibility: `AiKitError` is a deprecated alias of `Error`, and each `AI_KIT_*` variable is still read when its `INFERENCE_KIT_*` counterpart is unset (a warning is logged). The aliases will be removed in a later release.
 
 ## Status
 
-**MVP (v0.1)** — Design complete, implementation in progress.
+**Pre-1.0.** The API is still moving; read `CHANGELOG.md` before upgrading.
 
-- ✅ Unified design doc (`context/projects/ai-kit-unified-design.md`)
-- ✅ Decision memos for DJ ruling (`context/ai-kit-decision-memos.md`)
-- ✅ Core trait definition (this repo)
-- ✅ Model registry (real YAML catalog loading)
-- ✅ Candle integration — **local dev POC** (see "Local Dev Inference (POC)" below); not the full MVP integration (no Storage Kit, Device Kit hints, or Score Kit wiring yet)
-- ✅ NVIDIA GPU (CUDA) support for the Candle backend — opt-in `cuda` feature, **POC** (see "GPU (CUDA) — POC" below)
-- ⏳ Message Kit transport (blocked on proto finalization)
-- ⏳ Storage Kit integration (blocked on storage-kit v2)
+- Core trait definition and model registry (YAML catalog loading)
+- Candle integration, **local dev POC** (see "Local Dev Inference (POC)" below)
+- NVIDIA GPU (CUDA) support for the Candle backend: opt-in `cuda` feature, **POC** (see "GPU (CUDA) — POC" below)
+- Egress router, credential sources, spend ledger and provider adapters: **opt-in cloud features** (see "Cloud features and data egress" below)
+- Not yet: message transport and storage integration
 
 ## Design Principles
 
@@ -31,7 +39,7 @@ AI Kit provides a framework-agnostic inference API for Hearth devices. Models ar
 ## Quick Start
 
 ```rust
-use ai_kit::{InferenceService, InferenceParams};
+use inference_kit::{InferenceService, InferenceParams};
 
 let service: Box<dyn InferenceService> = todo!(); // Bind to Candle/TFLite
 
@@ -64,15 +72,15 @@ machine. That download only ever happens via `make fetch-model`, is gitignored
 ```bash
 make fetch-model                 # downloads TinyLlama-1.1B-Chat (GGUF, ~700MB) into dev-models/
 cargo build --features candle
-cargo run --features candle --bin ai-kit-cli -- infer \
+cargo run --features candle --bin inference-kit -- infer \
     --model tinyllama --prompt "What is the capital of France?"
 ```
 
-Without `--features candle`, `ai-kit-cli infer` still builds and runs — it
+Without `--features candle`, `inference-kit infer` still builds and runs — it
 exits with a message telling you to rebuild with the feature, rather than
-failing to compile. `ai-kit-cli hash <path>` and `cache-stats` work either way.
+failing to compile. `inference-kit hash <path>` and `cache-stats` work either way.
 
-**Known POC limitations** (see `AGENT.md` for the full list): each `infer()`
+**Known POC limitations** (listed in the module docs of `src/backends/candle.rs`): each `infer()`
 call runs a fresh generation — there's no cross-call transformer KV-cache
 reuse at the Candle level (`KvCacheManager` still tracks session bookkeeping/
 TTL, just not real tensor state); CPU-only, no CUDA/Metal; single small model,
@@ -88,12 +96,12 @@ The Candle backend runs on an NVIDIA GPU behind the opt-in `cuda` feature. Nothi
 source ~/.local/cuda-13.2-pip/env.sh           # (skip both lines if `nvcc` is already on your PATH)
 
 cargo build --release --features cuda          # ~6 min first time (compiles Candle's CUDA kernels)
-./target/release/ai-kit-cli devices            # cpu, cuda:0 NVIDIA GeForce RTX 3060, 11.6/12.5 GB free
-./target/release/ai-kit-cli infer --model tinyllama --prompt "Say hello" --device cuda
-./target/release/ai-kit-cli bench --model tinyllama --prompt-file p.txt --device cuda --max-tokens 64
+./target/release/inference-kit devices            # cpu, cuda:0 NVIDIA GeForce RTX 3060, 11.6/12.5 GB free
+./target/release/inference-kit infer --model tinyllama --prompt "Say hello" --device cuda
+./target/release/inference-kit bench --model tinyllama --prompt-file p.txt --device cuda --max-tokens 64
 ```
 
-`--device` (or `AI_KIT_DEVICE`) takes `cpu` (default), `cuda`, `cuda:N` or `auto`. In code:
+`--device` (or `INFERENCE_KIT_DEVICE`) takes `cpu` (default), `cuda`, `cuda:N` or `auto`. In code:
 `CandleInferenceService::with_device(catalog, DevicePreference::Cuda(0))`; `device_of(model_id)` says where a loaded model is running.
 
 **It fails hard, it does not fall back.** An explicit `cuda`/`cuda:N` that is missing, or not compiled in, makes
@@ -102,7 +110,7 @@ at least 384 MB, and never below the catalog's `vram_required_mb`) returns `Infe
 to the CPU and no smaller quantisation (invariant "fail hard on OOM"). Only `auto` chooses (CUDA 0 if usable, else CPU), and the
 choice stays visible through `device_of`.
 
-**Measured** (RTX 3060 12 GB, Ryzen 5 2400G, Llama-3.2-3B Q4_K_M, greedy, model loaded once and warmed up; `ai-kit-cli bench`):
+**Measured** (RTX 3060 12 GB, Ryzen 5 2400G, Llama-3.2-3B Q4_K_M, greedy, model loaded once and warmed up; `inference-kit bench`):
 
 | | CPU (`--device cpu`) | GPU (`--device cuda`) | llama.cpp on the same GPU (Ollama) |
 |---|---|---|---|
@@ -148,13 +156,13 @@ tier goes first and whether to **cascade**: run locally, check the answer with a
 cloud only if the check fails. The plain `infer()` path has no hints, so it is local-only.
 
 ```bash
-ai-kit-cli route --explain --batch requests.jsonl --cloud-cmd x --policy policy.yaml       # decisions only, loads nothing
-ai-kit-cli route --batch requests.jsonl --device cuda --cloud-cmd 'claude -p --model haiku ...'   # run (cloud = any command reading stdin; dev only)
+inference-kit route --explain --batch requests.jsonl --cloud-cmd x --policy policy.yaml       # decisions only, loads nothing
+inference-kit route --batch requests.jsonl --device cuda --cloud-cmd 'claude -p --model haiku ...'   # run (cloud = any command reading stdin; dev only)
 ```
 
-**What it bought, measured** (76 tasks, real recorded outcomes for three local and three Claude tiers, replayed under each policy; `docs` of the study in the studio vault):
+**What it bought, measured** (76 tasks, real recorded outcomes for three local and three Claude tiers, replayed under each policy):
 
-| local tier | all local | all Claude | Courier tasks private, cascade with cheap verifiers | same, with tests as verifier |
+| local tier | all local | all Claude | tasks private, cascade with cheap verifiers | same, with tests as verifier |
 |---|---|---|---|---|
 | 3B (the only model Candle loads) | 71% | 99% (76 cloud calls) | 84% (10 calls) | 91% (15 calls; 25 with a class table) |
 | 12B | 95% | 99% | **97% (2 calls)** | 99% (3 calls) |
@@ -174,7 +182,7 @@ then by the same privacy, fit and policy rules as the text router. `RequestKind`
 
 "Ready for any kind of request" means: every kind is representable and validated; a request nobody can serve gets a typed `UnsupportedKind` with the reason (never a
 wrong-kind-of-model answer); a request only the cloud could serve, with private content, is `RequiresShareable` rather than leaked; an out-of-memory error stays an `InferenceOom` all the way out
-(`AiKitError::to_inference_error_code()` gives the wire code; the old `to_error_code()` is deprecated because its numbers collide with the fabric error space).
+(`Error::to_inference_error_code()` gives the wire code; the old `to_error_code()` is deprecated because its numbers collide with the fabric error space).
 
 **Grants and re-typing.** `RoutedRequest::with_granted(&[kinds])` carries the verdict the Message Kit boundary reached (Score Kit grants): a kind that was not granted is refused with `CapabilityDenied`
 before anything runs. Treating free text that is really a picture request ("paint me a watercolor of a lighthouse") as an image request is **opt-in** (`MultiHybridService::with_retyping()`), and
@@ -191,9 +199,9 @@ never happens when image generation is not in the granted set, so a text-only ca
 **Cargo features.** `candle` is the umbrella and means what it always did. To leave kinds out: `text`, `image` and `embedding` (each on top of `candle-base`, the shared device/VRAM/verification code); `cuda` implies `candle`.
 
 ```bash
-ai-kit-cli imagine --catalog catalog.yaml --prompt "a watercolor of a misty cottage" --seed 7 --out cottage.png --device cuda   # no --model: the catalog's default
-ai-kit-cli embed   --catalog catalog.yaml --model minilm --query "who is the vet?" --text "Trash is Tuesday" --text "The vet is Dr. Okafor"
-ai-kit-cli route   --catalog catalog.yaml --batch mixed.jsonl --local-model llama32-3b --image-model default --embed-model minilm --device cuda --cloud-cmd '...'
+inference-kit imagine --catalog catalog.yaml --prompt "a watercolor of a misty cottage" --seed 7 --out cottage.png --device cuda   # no --model: the catalog's default
+inference-kit embed   --catalog catalog.yaml --model minilm --query "who is the vet?" --text "Trash is Tuesday" --text "The vet is Dr. Okafor"
+inference-kit route   --catalog catalog.yaml --batch mixed.jsonl --local-model llama32-3b --image-model default --embed-model minilm --device cuda --cloud-cmd '...'
 ```
 `route --batch` lines take `"kind": "text_generation" | "image_generation" | "embedding" | "speech_to_text" | "image_understanding"`. `--explain` shows every decision without loading a model.
 
@@ -208,7 +216,7 @@ A 6B diffusion transformer, a Qwen3-4B text encoder and a 16-channel VAE (Apache
 (1) **streaming the text encoder one layer at a time** (`zimage_text.rs`), (2) keeping the Q4_K_M GGUF's K-quant tensors **quantized on the GPU** and dequantizing **one block at a time**, with the small dense bf16 tensors in host RAM, and (3) a **tiled VAE decode** above 768x768.
 It follows the diffusers `ZImagePipeline` exactly, including that the caption's pad tokens are attended to (Candle's own `forward` masks them, which differs from diffusers by up to 28% per step; this backend has its own forward). A catalog entry has the GGUF as the main file and `text_encoder_0..2` (bf16 safetensors shards), `vae` and `tokenizer` as extra files; width and height must be multiples of 16; `guidance_scale` is ignored (Turbo).
 
-**Measured** (RTX 3060 12 GB, weights loaded per request, 8-9 steps): 512x512 about 22 s with ~4.5 GB peak above idle; 768x448 about 24 s; 1024x1024 about 75 s with ~6.6 GB. Together with the 3B text model the Courier demo peaks at 9.4 GB of 11.6.
+**Measured** (RTX 3060 12 GB, weights loaded per request, 8-9 steps): 512x512 about 22 s with ~4.5 GB peak above idle; 768x448 about 24 s; 1024x1024 about 75 s with ~6.6 GB. Together with the 3B text model the demo peaks at 9.4 GB of 11.6.
 Checked against diffusers on the same GGUF: one step differs by 2-8%, which is bf16 rounding (an f32 control is as far from diffusers as bf16 is). Free-running images from the same noise are the same scene with different details.
 `sd-turbo` for comparison: ~1.4 s per image, much lower quality. The whole sd-turbo stack (3B + `sd-turbo` + MiniLM) peaks about 9.8 GB above idle.
 
@@ -219,29 +227,27 @@ Checked against diffusers on the same GGUF: one step differs by 2-8%, which is b
 - No audio or vision backend yet (the contract and the honest errors are in place). Output sanity checks (`OutputCheck::Sane`) catch blank or wrong-size images and malformed embeddings, not poor quality.
 - The cloud tier for non-text kinds is empty; adding one is a `RequestService` implementation.
 
-## Cloud Proxy Inference — Claude/Anthropic (experimental, not yet ruled on)
+## Cloud features and data egress
 
-**This is explicitly a `v0.2+` feature, off by default, and not yet blessed
-for a real household product.** `ai-kit-unified-design.md`'s decision memos
-#2 ("remote fallback scope — does it include Quickring cloud hub?") and #9
-("hub relay authentication") are both still open — no DJ ruling. Sending
-prompt text (not model weights) to a third-party cloud API is a real
-data-egress decision that needs a security-engineer/DJ privacy ruling before
-this goes beyond a dev POC, exactly the same caveat this repo already
-applies to Candle's network-fetch-at-dev-time exception above.
+**Read this before enabling any feature in this section.** The default build (`default = []`) has no network code compiled in. Each feature below, when enabled **and** configured with a credential, sends the prompt or input and the model output to a third-party service you choose. That data leaves your machine and is governed by that provider's terms and retention, not by this crate. Even then, a call is refused unless the egress policy allows it for that request, and a request marked private never goes to a cloud provider.
+
+| Feature | Sends data to | What is sent |
+|---|---|---|
+| `claude-proxy` | Anthropic (Messages API) | prompt text and the completion |
+| `provider-anthropic` | Anthropic (Messages API) | prompts and outputs |
+| `provider-gemini` | Google (Gemini API) | prompts, embedding inputs and outputs |
+| `provider-openai-compat` | **whichever server you configure** | chat and embedding requests. A server on your own machine stays local; a hosted gateway does not |
+
+No feature is enabled by default, and none can send anything without an explicit, non-empty credential supplied by the caller. Names of providers appear here only to say which service a feature talks to; this project is not affiliated with, endorsed by or partnered with any of them. Each feature's rustdoc repeats this warning.
+
+### Cloud Proxy Inference — Claude/Anthropic (experimental)
+
+**Experimental, off by default.** Sending prompt text (not model weights) to a third-party cloud API is a real data-egress decision: enable it only if you are comfortable with that provider receiving your prompts.
 
 `--features claude-proxy` adds `ClaudeProxyInferenceService`, a second
 `InferenceService` implementation that proxies `infer()` to Anthropic's
 Messages API (`POST /v1/messages`) instead of running local Candle
-inference — same trait, same call site, no change to caller code. This
-mirrors the pattern Apple's Foundation Models framework adopted at WWDC
-2026 (a single `LanguageModelSession`-style call site bindable to on-device,
-Private Cloud Compute, or a third-party provider via a provider/fallback
-parameter) — cited here as precedent for the *shape*, not copied from. See
-`src/backends/claude_proxy.rs`'s module doc for the full caveat, including a
-note that a live web search during this backend's development could not
-independently corroborate the specific Apple/Anthropic/Gemini framework
-claim beyond WWDC 2026 coverage of Gemini-powered Siri.
+inference — same trait, same call site, no change to caller code.
 
 Even with the feature compiled in, this backend is inert without an
 explicit API key — `ClaudeProxyInferenceService::new` fails fast on an empty
@@ -253,7 +259,7 @@ cargo build --features claude-proxy
 ```
 
 ```rust
-use ai_kit::{ClaudeProxyConfig, ClaudeProxyInferenceService, InferenceService};
+use inference_kit::{ClaudeProxyConfig, ClaudeProxyInferenceService, InferenceService};
 
 let service = ClaudeProxyInferenceService::new(ClaudeProxyConfig {
     api_key: std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY not set"),
@@ -275,11 +281,11 @@ since there's no local weight file to quantize.
 ├─────────────────────────────────────────────────────────┤
 │                                                           │
 │  App (Pi5, embedded)                                    │
-│  ├─ Trait call: ai_kit::infer("llama2-7b", prompt)  │
+│  ├─ Trait call: inference_kit::infer("llama2-7b", prompt)  │
 │  └─ In-process, RO mmap, 1–10ms                        │
 │                                                           │
 │  ┌────────────────────────────────────────────┐        │
-│  │  AI Kit Service (Trait + Message Kit)      │        │
+│  │  Inference Kit Service (Trait + Message Kit)      │        │
 │  ├────────────────────────────────────────────┤        │
 │  │ • Model Registry (catalog.yaml, YAML)      │        │
 │  │ • Inference Engine (trait-based)           │        │
@@ -300,27 +306,11 @@ since there's no local weight file to quantize.
 ## Modules
 
 - **`types.rs`**: Core data types (ModelMetadata, InferenceParams, SessionId, etc).
-- **`error.rs`**: Error types (map to Hearth ErrorCode).
+- **`error.rs`**: `Error` and `Result` (`AiKitError` is a deprecated alias).
+- **`env.rs`**: `INFERENCE_KIT_*` environment variables, with the deprecated `AI_KIT_*` fallback.
 - **`service.rs`**: `InferenceService` trait (frozen ABI).
 - **`registry.rs`**: Model discovery from OS catalog.
 - **`cache.rs`**: Model cache (RO mmap) + KV cache (per-session).
-
-## Decision Memos & Open Questions
-
-AI Kit v0.1 has 10 open design questions pending DJ's ruling:
-
-1. **Capability gating**: Direct Score Kit call or trust Hearth boundary?
-2. **Remote fallback scope**: Cumulus-only (MVP) or cloud hub?
-3. **Pre-load strategy**: Lazy-load default or pre-load all?
-4. **Audit backend**: Kernel daemon, Service Kit, or separate DB?
-5. **Model source of truth**: /usr/share/models/ or Storage Kit?
-6. **Fine-tuning lock**: Explicit gate or implicit (no API)?
-7. **Quantization fallback**: Auto-downgrade, fail, or remote?
-8. **TPM attestation**: Skip MVP or require?
-9. **Hub relay auth**: Hearth token or separate credential?
-10. **KV cache key**: app_id+session_id or session_id alone?
-
-See `context/ai-kit-decision-memos.md` for details.
 
 ## Integration Roadmap
 
@@ -364,12 +354,3 @@ cargo clippy -- -D warnings
 ## License
 
 Apache 2.0 (SlashBuilder open infrastructure standard).
-
-## References
-
-- **Unified design**: `context/projects/ai-kit-unified-design.md`
-- **Decision memos**: `context/ai-kit-decision-memos.md`
-- **Tensions & questions**: `context/ai-kit-tensions-and-questions.md`
-- **Locked invariants**: `context/ai-kit-locked-invariants.md`
-- **Kit model reference**: `context/kit-model.md` (in cross-repo-context)
-- **Threat model** (security sketch): `context/projects/ai-kit-threat-model.md`
