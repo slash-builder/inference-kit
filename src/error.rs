@@ -144,7 +144,7 @@ pub enum Error {
     JsonError(#[from] serde_json::Error),
 }
 
-/// The old name of [`Error`], kept for source compatibility with 0.1.x callers.
+/// The old name of [`enum@Error`], kept for source compatibility with 0.1.x callers.
 /// Will be removed in a later release.
 #[deprecated(since = "0.2.0", note = "renamed to `inference_kit::Error`")]
 pub type AiKitError = Error;

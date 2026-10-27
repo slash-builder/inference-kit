@@ -105,7 +105,7 @@ pub use backends::CandleInferenceService;
 pub use backends::{describe_cuda_devices, DevicePreference};
 #[cfg(feature = "claude-proxy")]
 pub use backends::{ClaudeProxyConfig, ClaudeProxyInferenceService};
-/// Deprecated alias of [`Error`]; see [`error::AiKitError`].
+/// Deprecated alias of [`enum@Error`]; see [`error::AiKitError`].
 #[allow(deprecated)]
 pub use error::AiKitError;
 pub use error::{Error, Result};
