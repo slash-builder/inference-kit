@@ -17,7 +17,7 @@
 //! 1. Every kind of request is *representable* and validated here, whether or not a backend
 //!    exists on this device.
 //! 2. A request nobody can serve gets a **typed, honest answer**
-//!    ([`AiKitError::UnsupportedKind`], or a routing [`crate::Plan::Unavailable`]) that
+//!    ([`Error::UnsupportedKind`], or a routing [`crate::Plan::Unavailable`]) that
 //!    says which request kind was missing and why. It is never a silent fallback to the wrong kind
 //!    of model and never a confusing `InvalidParams`.
 //! 3. The router and the hybrid service ([`crate::routed`]) pick a tier from *which tiers have the
@@ -26,7 +26,7 @@
 //! What has real backends today, and what is only a contract, is listed in the README. The
 //! contract is complete for all five request kinds; the backends are not.
 
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::service::InferenceService;
 use crate::types::{InferenceParams, InferenceResponse, SessionId};
 use async_trait::async_trait;
@@ -122,7 +122,7 @@ impl ImageGenParams {
     }
 
     pub fn validate(&self) -> Result<()> {
-        let bad = |reason: String| Err(AiKitError::InvalidParams { reason });
+        let bad = |reason: String| Err(Error::InvalidParams { reason });
         if self.model_id.is_empty() {
             return bad("model_id cannot be empty".into());
         }
@@ -323,7 +323,7 @@ impl Request {
 
     pub fn validate(&self) -> Result<()> {
         let bad = |reason: &str| {
-            Err(AiKitError::InvalidParams {
+            Err(Error::InvalidParams {
                 reason: reason.to_string(),
             })
         };
@@ -427,7 +427,7 @@ impl Request {
 }
 
 /// Per-kind size limits, enforced by [`Request::validate`] **before** routing, so an oversized request is refused with
-/// [`AiKitError::RequestTooLarge`] instead of reaching a backend (DJ ruling 2026-10-11: reject, do not crash).
+/// [`Error::RequestTooLarge`] instead of reaching a backend (a deliberate choice: reject, do not crash).
 ///
 /// These are the kit-wide ceilings; a particular model may allow less (`InferenceOom` still applies for what does not fit).
 /// The figures are proposals from the security review, not benchmarks, and are expected to move.
@@ -452,8 +452,8 @@ pub mod limits {
     pub const AUDIO_MAX_SECONDS: u64 = 600;
 }
 
-fn too_large(limit_name: &str, limit: u64, actual: u64) -> AiKitError {
-    AiKitError::RequestTooLarge {
+fn too_large(limit_name: &str, limit: u64, actual: u64) -> Error {
+    Error::RequestTooLarge {
         limit_name: limit_name.to_string(),
         limit,
         actual,
@@ -578,7 +578,7 @@ pub fn png_dims(b: &[u8]) -> Option<(u32, u32)> {
 /// A backend that can do one or more [`RequestKind`]s.
 ///
 /// Implement `handle` for the request kinds you really have and return
-/// [`AiKitError::UnsupportedKind`] (see [`unsupported`]) for the rest.
+/// [`Error::UnsupportedKind`] (see [`unsupported`]) for the rest.
 #[async_trait]
 pub trait RequestService: Send + Sync {
     fn kinds(&self) -> Vec<RequestKind>;
@@ -586,8 +586,8 @@ pub trait RequestService: Send + Sync {
 }
 
 /// The error for "this service does not do that".
-pub fn unsupported(cap: RequestKind, reason: impl Into<String>) -> AiKitError {
-    AiKitError::UnsupportedKind {
+pub fn unsupported(cap: RequestKind, reason: impl Into<String>) -> Error {
+    Error::UnsupportedKind {
         request_kind: cap.as_str().to_string(),
         reason: reason.into(),
     }
@@ -711,7 +711,7 @@ mod tests {
         });
         assert!(matches!(
             empty_embed.validate(),
-            Err(AiKitError::InvalidParams { .. })
+            Err(Error::InvalidParams { .. })
         ));
         let no_audio = Request::SpeechToText(SpeechParams {
             model_id: "m".into(),
@@ -845,7 +845,7 @@ mod tests {
 
     fn too_large_name(r: Result<()>) -> Option<String> {
         match r {
-            Err(AiKitError::RequestTooLarge { limit_name, .. }) => Some(limit_name),
+            Err(Error::RequestTooLarge { limit_name, .. }) => Some(limit_name),
             _ => None,
         }
     }
@@ -867,7 +867,7 @@ mod tests {
         assert_eq!(too_large_name(p.validate()).as_deref(), Some("steps"));
         p.steps = 0;
         assert!(
-            matches!(p.validate(), Err(AiKitError::InvalidParams { .. })),
+            matches!(p.validate(), Err(Error::InvalidParams { .. })),
             "zero steps is a bad parameter, not an oversize"
         );
     }
@@ -961,7 +961,7 @@ mod tests {
         );
         assert!(matches!(
             mk(b"definitely not a wav file".to_vec()).validate(),
-            Err(AiKitError::InvalidParams { .. })
+            Err(Error::InvalidParams { .. })
         ));
     }
 }

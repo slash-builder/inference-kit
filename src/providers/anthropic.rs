@@ -1,4 +1,9 @@
-//! The Claude Messages API as a [`ProviderAdapter`]. **First slice: text requests, non-streaming. Tested against mocks only; no key exists yet.**
+//! The Claude Messages API as a [`ProviderAdapter`]. **First slice: text requests, non-streaming. Tested against mocks only.**
+//!
+//! # Data egress
+//!
+//! **Enabling the `provider-anthropic` feature and configuring this adapter sends your prompts and the model outputs to Anthropic.** It is off by
+//! default, is built only when a credential is supplied, and the egress policy must still allow each request. Not affiliated with or endorsed by Anthropic.
 //!
 //! What it does (each point is a wiremock test):
 //! - the key is read from the [`CredentialSource`] **on every call** (rotation needs no restart); a missing credential means the adapter is never built;
@@ -350,7 +355,7 @@ mod tests {
     use crate::egress::{
         AgeBand, Label, Policy, ProviderMatch, Purpose, Rule, SourceKind, Subject, VecSink,
     };
-    use crate::error::AiKitError;
+    use crate::error::Error;
     use crate::provider::{run_chain, ChainConfig, ScriptedProvider};
     use crate::types::InferenceParams;
     use std::sync::Mutex;
@@ -618,7 +623,7 @@ mod tests {
         .await
         .unwrap_err();
         let shown = format!("{e} {e:?}");
-        assert!(matches!(e, AiKitError::RemoteBackendError { .. }));
+        assert!(matches!(e, Error::RemoteBackendError { .. }));
         assert!(!shown.contains("SECRET") && !shown.contains(KEY), "{shown}");
     }
 

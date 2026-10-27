@@ -23,7 +23,7 @@
 //!     fn name(&self) -> &'static str { "os-store" }
 //!     fn setup(&self, entries: &[(&str, &str)]) -> Setup { /* build the store holding exactly `entries` */ }
 //! }
-//! #[test] fn my_source_conforms() { ai_kit::credentials::assert_conforms(&MyFixture); }
+//! #[test] fn my_source_conforms() { inference_kit::credentials::assert_conforms(&MyFixture); }
 //! ```
 
 use super::{CredentialError, CredentialSource};

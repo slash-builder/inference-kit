@@ -1,7 +1,7 @@
 .PHONY: build test fmt lint clean help all fetch-model package-check package-check-selftest
 
 help:
-	@echo "AI Kit — Makefile targets"
+	@echo "Inference Kit — Makefile targets"
 	@echo ""
 	@echo "  make build        Build release binary"
 	@echo "  make test         Run all tests"

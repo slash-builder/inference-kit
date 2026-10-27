@@ -1,6 +1,6 @@
-# Contributing to AI Kit
+# Contributing to Inference Kit
 
-Thank you for your interest in contributing to AI Kit! This document provides guidelines for contributions.
+Thank you for your interest in contributing to Inference Kit! This document provides guidelines for contributions.
 
 ## Code of Conduct
 
@@ -8,17 +8,17 @@ Please read and adhere to our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Before You Start
 
-- Familiarize yourself with the [AI Kit unified design](../../../vault/context/projects/ai-kit-unified-design.md).
-- Check the [open questions and decision memos](../../../vault/context/ai-kit-decision-memos.md) to understand constraints.
-- Review the [locked invariants](../../../vault/context/ai-kit-locked-invariants.md) — they are non-negotiable.
+- Read the [README](README.md) and `CHANGELOG.md` to see what the crate does and what is still experimental.
+- Cloud features are opt-in and send data to third parties; a change that widens what can leave the machine needs a clear justification in the pull request.
+- The default build must stay local-only (`default = []`, no network code compiled in).
 
 ## Development Workflow
 
 ### Setup
 
 ```bash
-git clone https://github.com/slash-builder/ai-kit.git
-cd ai-kit
+git clone https://github.com/slash-builder/inference-kit.git
+cd inference-kit
 cargo build
 cargo test
 ```
@@ -35,7 +35,7 @@ cargo clippy -- -D warnings
 - Use present tense ("Add feature" not "Added feature").
 - Use imperative mood ("Move cursor to..." not "Moves cursor to...").
 - Limit the first line to 72 characters or less.
-- Reference issues and decisions (e.g., "Refs: decision memo #3", "Fixes: #42").
+- Reference issues and decisions (e.g., "Refs: #12", "Fixes: #42").
 
 ### Testing
 
@@ -51,19 +51,19 @@ cargo test
 - Update README.md if adding user-facing features.
 - Note any open questions or TODOs related to pending decisions.
 
-## Decision Memo Dependencies
+## Open Design Questions
 
-AI Kit has 10 open design questions. Work that depends on pending decisions should:
+Work that depends on a decision that has not been made yet should:
 
-1. Add a `TODO` comment referencing the decision memo number.
-2. Stub out the feature with a placeholder or error.
-3. Document the dependency in AGENT.md.
+1. Add a `TODO` comment that states the open question in plain words (and links the issue, if there is one).
+2. Stub out the feature with a placeholder or an explicit error.
+3. Say so in the pull request description.
 
 ### Example
 
 ```rust
-// TODO: Decision memo #3 (pre-load strategy).
-// Once DJ rules, may add `preload_all()` method for Cumulus.
+// TODO: pre-load strategy is undecided (see the tracking issue).
+// Once it is decided, a `preload_all()` method may be added.
 async fn load_model(&self, model_id: &str) -> Result<()> {
     // ... lazy-load implementation
 }
@@ -100,7 +100,7 @@ When touching integration surfaces, coordinate with:
 Include:
 
 - Clear title referencing the component (e.g., "registry: handle missing catalog.yaml").
-- Decision memo dependencies (if any).
+- Any open design question the issue depends on (if any).
 - Reproduction steps (if a bug).
 - Links to related issues or specs.
 
@@ -115,7 +115,7 @@ Include:
 
 ## Questions?
 
-Reach out to the AI Kit PM (TBD once project is elevated). Until then, file an issue or PR.
+Reach out to the Inference Kit PM (TBD once project is elevated). Until then, file an issue or PR.
 
 ## License
 

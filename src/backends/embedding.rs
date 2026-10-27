@@ -9,7 +9,7 @@
 //! `config` and `tokenizer` as extra files; every file is BLAKE3-verified on load.
 
 use crate::backends::common::{check_vram, device_for, verify_model_files, DevicePreference};
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::modality::{
     unsupported, EmbeddingParams, EmbeddingResponse, Output, Request, RequestKind, RequestService,
 };
@@ -50,11 +50,11 @@ impl CandleEmbeddingService {
             .registry
             .get(id)
             .cloned()
-            .ok_or_else(|| AiKitError::ModelNotFound {
+            .ok_or_else(|| Error::ModelNotFound {
                 model_id: id.to_string(),
             })?;
         if m.kind() != RequestKind::Embedding {
-            return Err(AiKitError::ModelLoadFailed {
+            return Err(Error::ModelLoadFailed {
                 model_id: id.to_string(),
                 reason: format!(
                     "'{id}' is a {} model, not an embedding model",
@@ -70,7 +70,7 @@ impl CandleEmbeddingService {
             return Ok(());
         }
         let model = self.model_meta(id)?;
-        let fail = |reason: String| AiKitError::ModelLoadFailed {
+        let fail = |reason: String| Error::ModelLoadFailed {
             model_id: id.to_string(),
             reason,
         };
@@ -99,7 +99,7 @@ impl CandleEmbeddingService {
         let bert = BertModel::load(vb, &config).map_err(|e| fail(format!("model: {e}")))?;
         self.loaded
             .write()
-            .map_err(|_| AiKitError::Internal {
+            .map_err(|_| Error::Internal {
                 reason: "loaded-model lock poisoned".into(),
             })?
             .insert(
@@ -120,26 +120,26 @@ impl CandleEmbeddingService {
         let model = self
             .loaded
             .read()
-            .map_err(|_| AiKitError::Internal {
+            .map_err(|_| Error::Internal {
                 reason: "loaded-model lock poisoned".into(),
             })?
             .get(&p.model_id)
             .cloned()
-            .ok_or_else(|| AiKitError::ModelNotFound {
+            .ok_or_else(|| Error::ModelNotFound {
                 model_id: p.model_id.clone(),
             })?;
-        let m = model.lock().map_err(|_| AiKitError::Internal {
+        let m = model.lock().map_err(|_| Error::Internal {
             reason: "embedding model lock poisoned".into(),
         })?;
         let started = std::time::Instant::now();
-        let internal = |what: &str, e: candle_core::Error| AiKitError::Internal {
+        let internal = |what: &str, e: candle_core::Error| Error::Internal {
             reason: format!("{what}: {e}"),
         };
 
         let enc = m
             .tokenizer
             .encode_batch(p.inputs.clone(), true)
-            .map_err(|e| AiKitError::Internal {
+            .map_err(|e| Error::Internal {
                 reason: format!("tokenize: {e}"),
             })?;
         let prompt_tokens: u32 = enc

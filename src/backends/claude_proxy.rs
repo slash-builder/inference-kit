@@ -1,56 +1,26 @@
-//! Claude (Anthropic) cloud proxy backend — **experimental, not yet ruled
-//! on, off by default**.
+//! Claude (Anthropic) cloud proxy backend — **experimental, off by default,
+//! sends prompts to a third party when enabled**.
 //!
 //! Implements [`InferenceService`] for real by proxying `infer()` to
 //! Anthropic's public Messages API (`POST /v1/messages`) over HTTPS. No
 //! model weights transit the network — only prompt/completion text — but
-//! that text *is* real user data leaving the household boundary to a
-//! third-party cloud service, which is exactly the scope
-//! `ai-kit-unified-design.md`'s decision memos #2 ("remote fallback scope
-//! ... does it include Quickring cloud hub?") and #9 ("hub relay
-//! authentication") leave open. **Neither memo has a DJ ruling yet.**
+//! that text *is* real user data leaving your machine to a
+//! third-party cloud service. **Enabling this feature sends prompts and
+//! completions to that provider; it is off by default and experimental.**
 //!
-//! # Why build this now, if it's unruled
+//! # Data egress
 //!
-//! Apple's Foundation Models framework (as of its WWDC 2026 update) adopts
-//! the same shape this backend follows: a single `LanguageModelSession`-style
-//! call site that can be bound to the on-device model, Apple's own Private
-//! Cloud Compute, or a third-party cloud provider, via a
-//! provider/fallback parameter — with no change to call-site logic. That is
-//! genuinely validating precedent *for the pattern* (trait-based backend
-//! swap, uniform call site) and is why this backend is implemented as "just
-//! another `InferenceService` impl" rather than a special case. It is cited
-//! here as precedent for the *shape*, not copied from — Apple's framework is
-//! Swift/on-device-first and shares no code or wire format with this crate.
+//! Sending prompt text to a third-party API is a real data-egress decision, and this is an
+//! experimental feature. Concretely:
 //!
-//! Caveat on that citation: a live web search run as part of building this
-//! backend could not independently corroborate the specific claim that
-//! Apple's Foundation Models framework exposes a documented
-//! provider/fallback parameter naming Anthropic Claude or Google Gemini as
-//! bindable third-party providers (searches surfaced WWDC 2026 coverage of
-//! Apple licensing Google's Gemini model specifically to power Siri, a
-//! narrower and different integration than a general developer-facing
-//! multi-provider framework parameter). Treat the precedent above as the
-//! task's premise, not as independently verified by this implementation —
-//! flagged here rather than silently presented as confirmed fact.
-//!
-//! # Not yet ruled on — do not ship beyond a dev POC without sign-off
-//!
-//! Sending household prompt text to a third-party API is a real data-egress
-//! decision. This is explicitly a `v0.2+`/experimental feature, exactly like
-//! `candle.rs`'s own POC exception to invariant #2 is scoped and flagged.
-//! **A real household-product ship needs a security-engineer/DJ privacy
-//! ruling first** — this backend does not imply that ruling has happened.
-//! Concretely:
-//!
-//! - Off by default: gated behind the `claude-proxy` feature, so default
-//!   `cargo build`/`cargo test`/`cargo clippy` (what Jenkins runs) never
-//!   touch it.
+//! - Off by default: gated behind the `claude-proxy` feature, so a default
+//!   `cargo build`/`cargo test`/`cargo clippy` never touches it.
 //! - Inert even when compiled in: [`ClaudeProxyInferenceService::new`]
 //!   fails fast on an empty `api_key`, so simply enabling the feature does
 //!   not cause any prompt to leave the device.
-//! - No audit-trail wiring here (invariant #5 territory) — a real ship needs
-//!   that decided and implemented at the integration layer, not assumed.
+//! - No audit-trail wiring here: an application that needs one must add it at its own
+//!   integration layer.
+//! - This project is not affiliated with, endorsed by or partnered with the provider.
 //!
 //! # Known limitations (single-shot only, by design)
 //!
@@ -62,7 +32,7 @@
 //! threaded across calls). Extending the trait to cover any of those is a
 //! separate, larger design conversation, out of scope here.
 
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::service::InferenceService;
 use crate::types::{CacheStats, InferenceParams, InferenceResponse};
 
@@ -111,27 +81,26 @@ pub struct ClaudeProxyInferenceService {
 impl ClaudeProxyInferenceService {
     /// Construct a new proxy backend.
     ///
-    /// Fails fast with [`AiKitError::InvalidParams`] if `api_key` is empty —
+    /// Fails fast with [`Error::InvalidParams`] if `api_key` is empty —
     /// this is the "inert even with the feature compiled in" gate described
     /// in the module doc: enabling `--features claude-proxy` alone cannot
     /// cause any prompt to leave the device, an explicit key is also
     /// required.
     pub fn new(config: ClaudeProxyConfig) -> Result<Self> {
         if config.api_key.trim().is_empty() {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: "ClaudeProxyConfig.api_key must not be empty (this backend is inert \
                          without an explicit key, even when the claude-proxy feature is compiled in)"
                     .to_string(),
             });
         }
 
-        let client =
-            reqwest::Client::builder()
-                .build()
-                .map_err(|e| AiKitError::RemoteBackendError {
-                    backend: "claude".to_string(),
-                    reason: format!("failed to build HTTP client: {e}"),
-                })?;
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| Error::RemoteBackendError {
+                backend: "claude".to_string(),
+                reason: format!("failed to build HTTP client: {e}"),
+            })?;
 
         Ok(Self {
             api_key: config.api_key,
@@ -236,7 +205,7 @@ impl InferenceService for ClaudeProxyInferenceService {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AiKitError::RemoteBackendError {
+            .map_err(|e| Error::RemoteBackendError {
                 backend: "claude".to_string(),
                 reason: format!("HTTP request to {url} failed: {e}"),
             })?;
@@ -246,7 +215,7 @@ impl InferenceService for ClaudeProxyInferenceService {
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| AiKitError::RemoteBackendError {
+            .map_err(|e| Error::RemoteBackendError {
                 backend: "claude".to_string(),
                 reason: format!("failed to read response body: {e}"),
             })?;
@@ -259,14 +228,14 @@ impl InferenceService for ClaudeProxyInferenceService {
                 ),
                 Err(_) => format!("HTTP {status}: {}", String::from_utf8_lossy(&bytes)),
             };
-            return Err(AiKitError::RemoteBackendError {
+            return Err(Error::RemoteBackendError {
                 backend: "claude".to_string(),
                 reason,
             });
         }
 
         let parsed: MessagesResponse =
-            serde_json::from_slice(&bytes).map_err(|e| AiKitError::RemoteBackendError {
+            serde_json::from_slice(&bytes).map_err(|e| Error::RemoteBackendError {
                 backend: "claude".to_string(),
                 reason: format!("response did not match expected Messages API shape: {e}"),
             })?;
@@ -280,7 +249,7 @@ impl InferenceService for ClaudeProxyInferenceService {
             .collect::<Vec<_>>()
             .join("");
 
-        let usage = parsed.usage.ok_or_else(|| AiKitError::RemoteBackendError {
+        let usage = parsed.usage.ok_or_else(|| Error::RemoteBackendError {
             backend: "claude".to_string(),
             reason: "response missing usage object".to_string(),
         })?;
@@ -320,7 +289,7 @@ impl InferenceService for ClaudeProxyInferenceService {
         // is the source of truth for whether a model_id is valid — an
         // invalid one surfaces as a `RemoteBackendError` from `infer()`.
         if model_id.trim().is_empty() {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: "model_id cannot be empty".to_string(),
             });
         }
@@ -389,7 +358,7 @@ mod tests {
             api_key: String::new(),
             base_url: None,
         });
-        assert!(matches!(result, Err(AiKitError::InvalidParams { .. })));
+        assert!(matches!(result, Err(Error::InvalidParams { .. })));
     }
 
     #[test]
@@ -398,7 +367,7 @@ mod tests {
             api_key: "   ".to_string(),
             base_url: None,
         });
-        assert!(matches!(result, Err(AiKitError::InvalidParams { .. })));
+        assert!(matches!(result, Err(Error::InvalidParams { .. })));
     }
 
     #[test]
@@ -505,7 +474,7 @@ mod tests {
             .expect_err("non-2xx should error");
 
         match err {
-            AiKitError::RemoteBackendError { backend, reason } => {
+            Error::RemoteBackendError { backend, reason } => {
                 assert_eq!(backend, "claude");
                 assert!(reason.contains("authentication_error"));
                 assert!(reason.contains("invalid x-api-key"));
@@ -531,7 +500,7 @@ mod tests {
             .await
             .expect_err("malformed body should error");
 
-        assert!(matches!(err, AiKitError::RemoteBackendError { .. }));
+        assert!(matches!(err, Error::RemoteBackendError { .. }));
     }
 
     #[tokio::test]
@@ -554,7 +523,7 @@ mod tests {
             .expect_err("missing usage should error");
 
         match err {
-            AiKitError::RemoteBackendError { reason, .. } => {
+            Error::RemoteBackendError { reason, .. } => {
                 assert!(reason.contains("usage"));
             }
             other => panic!("expected RemoteBackendError, got {other:?}"),
@@ -569,7 +538,7 @@ mod tests {
         assert!(service.load_model("claude-sonnet-4-5").await.is_ok());
         assert!(matches!(
             service.load_model("").await,
-            Err(AiKitError::InvalidParams { .. })
+            Err(Error::InvalidParams { .. })
         ));
     }
 

@@ -7,7 +7,7 @@
 //! 2. **Run when a CUDA device is present** (`cargo test --features cuda`): the
 //!    VRAM pre-check. Skipped (with a message) on a box without a GPU.
 //! 3. **`#[ignore]`d, need weights** (`make fetch-model`, or point
-//!    `AI_KIT_MODEL_DIR` / `AI_KIT_TEST_MODEL` at a catalog): the real
+//!    `INFERENCE_KIT_MODEL_DIR` / `INFERENCE_KIT_TEST_MODEL` at a catalog): the real
 //!    smoke tests and the request-isolation check that justifies reusing one
 //!    `ModelWeights` across requests.
 //!
@@ -15,8 +15,8 @@
 
 #![cfg(feature = "candle")]
 
-use ai_kit::{
-    AiKitError, CandleInferenceService, DevicePreference, InferenceParams, InferenceService,
+use inference_kit::{
+    CandleInferenceService, DevicePreference, Error, InferenceParams, InferenceService,
 };
 use std::io::Write;
 
@@ -90,7 +90,7 @@ async fn explicit_cuda_never_falls_back_to_cpu() {
     )
     .unwrap();
     match svc.load_model("dummy").await {
-        Err(AiKitError::ModelLoadFailed { reason, .. }) => {
+        Err(Error::ModelLoadFailed { reason, .. }) => {
             assert!(reason.contains("CUDA"), "unhelpful reason: {reason}");
         }
         other => panic!("expected ModelLoadFailed, got {other:?}"),
@@ -111,7 +111,7 @@ async fn cuda_without_the_feature_says_how_to_fix_it() {
     )
     .unwrap();
     match svc.load_model("dummy").await {
-        Err(AiKitError::ModelLoadFailed { reason, .. }) => {
+        Err(Error::ModelLoadFailed { reason, .. }) => {
             assert!(reason.contains("--features cuda"), "reason: {reason}")
         }
         other => panic!("expected ModelLoadFailed, got {other:?}"),
@@ -129,7 +129,7 @@ async fn auto_without_a_gpu_is_visible_not_hidden() {
     // It gets past device selection and fails reading the missing file: an Io error.
     assert!(matches!(
         svc.load_model("dummy").await,
-        Err(AiKitError::Io(_)) | Err(AiKitError::InferenceOom { .. })
+        Err(Error::Io(_)) | Err(Error::InferenceOom { .. })
     ));
 }
 
@@ -151,7 +151,7 @@ async fn vram_precheck_fails_hard_before_reading_the_file() {
     )
     .unwrap();
     match svc.load_model("dummy").await {
-        Err(AiKitError::InferenceOom {
+        Err(Error::InferenceOom {
             required_mb,
             available_mb,
             ..
@@ -163,7 +163,7 @@ async fn vram_precheck_fails_hard_before_reading_the_file() {
 #[cfg(feature = "cuda")]
 #[test]
 fn describe_cuda_devices_lists_the_gpu() {
-    let lines = ai_kit::describe_cuda_devices();
+    let lines = inference_kit::describe_cuda_devices();
     assert!(!lines.is_empty());
     if candle_core::utils::cuda_is_available() {
         assert!(lines[0].starts_with("cuda:0 "), "got {lines:?}");
@@ -173,10 +173,10 @@ fn describe_cuda_devices_lists_the_gpu() {
 // ---------------------------------------------------------------- group 3
 
 fn real_service(device: DevicePreference) -> (CandleInferenceService, String) {
-    let dir = std::env::var("AI_KIT_MODEL_DIR").unwrap_or_else(|_| "./dev-models".to_string());
-    let model = std::env::var("AI_KIT_TEST_MODEL").unwrap_or_else(|_| "tinyllama".to_string());
+    let dir = inference_kit::env::var("MODEL_DIR").unwrap_or_else(|| "./dev-models".to_string());
+    let model = inference_kit::env::var("TEST_MODEL").unwrap_or_else(|| "tinyllama".to_string());
     let svc = CandleInferenceService::with_device(&format!("{dir}/catalog.yaml"), device)
-        .expect("catalog missing: run `make fetch-model` or set AI_KIT_MODEL_DIR");
+        .expect("catalog missing: run `make fetch-model` or set INFERENCE_KIT_MODEL_DIR");
     (svc, model)
 }
 

@@ -5,19 +5,18 @@
 //! 1. **Always run** (`cargo test --features candle`): the honest-failure paths. No weights needed. A model of the
 //!    wrong kind, a file that does not match its catalog hash, bad parameters and the wrong request kind must each give a
 //!    specific, typed error and never touch a backend.
-//! 2. **`#[ignore]`d, need weights**: real images and real embeddings. Point `AI_KIT_MM_CATALOG` at a catalog with an
-//!    `sd-turbo` (image) and a `minilm` (embedding) entry (see `make_multimodal_catalog.py` in the studio vault):
+//! 2. **`#[ignore]`d, need weights**: real images and real embeddings. Point `INFERENCE_KIT_MM_CATALOG` at a catalog with an
+//!    `sd-turbo` (image) and a `minilm` (embedding) entry:
 //!
-//!      AI_KIT_MM_CATALOG=/tmp/ak-models-mm/catalog.yaml cargo test --release --features cuda --test multimodal -- --ignored --test-threads=1
+//!      INFERENCE_KIT_MM_CATALOG=/tmp/ak-models-mm/catalog.yaml cargo test --release --features cuda --test multimodal -- --ignored --test-threads=1
 
 #![cfg(feature = "candle")]
 
-use ai_kit::routed::TierBackend;
-use ai_kit::{
-    AiKitError, CandleEmbeddingService, CandleImageService, CandleInferenceService,
-    DevicePreference, EmbeddingParams, ImageGenParams, InferenceParams, InferenceService,
-    MultiHybridService, Output, OutputCheck, Request, RequestKind, RequestService, RoutePolicy,
-    RoutedRequest,
+use inference_kit::routed::TierBackend;
+use inference_kit::{
+    CandleEmbeddingService, CandleImageService, CandleInferenceService, DevicePreference,
+    EmbeddingParams, Error, ImageGenParams, InferenceParams, InferenceService, MultiHybridService,
+    Output, OutputCheck, Request, RequestKind, RequestService, RoutePolicy, RoutedRequest,
 };
 use std::io::Write;
 use std::sync::Arc;
@@ -92,14 +91,14 @@ async fn image_backend_refuses_a_model_of_the_wrong_kind_and_an_unknown_one() {
     let dir = tempfile::tempdir().unwrap();
     let svc = CandleImageService::new(&junk_catalog(&dir, true), DevicePreference::Cpu).unwrap();
     match svc.handle(image_req("txt", 512)).await {
-        Err(AiKitError::ModelLoadFailed { reason, .. }) => {
+        Err(Error::ModelLoadFailed { reason, .. }) => {
             assert!(reason.contains("not an image-generation model"), "{reason}")
         }
         other => panic!("{other:?}"),
     }
     assert!(matches!(
         svc.handle(image_req("nope", 512)).await,
-        Err(AiKitError::ModelNotFound { .. })
+        Err(Error::ModelNotFound { .. })
     ));
 }
 
@@ -109,7 +108,7 @@ async fn bad_parameters_are_rejected_before_any_model_is_loaded() {
     let svc = CandleImageService::new(&junk_catalog(&dir, true), DevicePreference::Cpu).unwrap();
     assert!(matches!(
         svc.handle(image_req("img", 500)).await,
-        Err(AiKitError::InvalidParams { .. })
+        Err(Error::InvalidParams { .. })
     ));
     assert!(!svc.is_loaded("img"));
 }
@@ -121,7 +120,7 @@ async fn a_file_that_does_not_match_its_catalog_hash_is_never_loaded() {
     let img = CandleImageService::new(&cat, DevicePreference::Cpu).unwrap();
     assert!(matches!(
         img.handle(image_req("img", 512)).await,
-        Err(AiKitError::IntegrityCheckFailed { .. })
+        Err(Error::IntegrityCheckFailed { .. })
     ));
     let emb = CandleEmbeddingService::new(&cat, DevicePreference::Cpu).unwrap();
     let r = Request::Embedding(EmbeddingParams {
@@ -133,7 +132,7 @@ async fn a_file_that_does_not_match_its_catalog_hash_is_never_loaded() {
     });
     assert!(matches!(
         emb.handle(r).await,
-        Err(AiKitError::IntegrityCheckFailed { .. })
+        Err(Error::IntegrityCheckFailed { .. })
     ));
 }
 
@@ -156,14 +155,11 @@ async fn each_backend_says_so_when_asked_for_something_it_does_not_do() {
         request_id: None,
     });
     for r in [img.handle(text.clone()).await, emb.handle(text).await] {
-        assert!(
-            matches!(r, Err(AiKitError::UnsupportedKind { .. })),
-            "{r:?}"
-        );
+        assert!(matches!(r, Err(Error::UnsupportedKind { .. })), "{r:?}");
     }
     assert!(matches!(
         emb.handle(image_req("img", 512)).await,
-        Err(AiKitError::UnsupportedKind { .. })
+        Err(Error::UnsupportedKind { .. })
     ));
 }
 
@@ -172,7 +168,7 @@ async fn the_text_backend_refuses_an_image_model() {
     let dir = tempfile::tempdir().unwrap();
     let svc = CandleInferenceService::new(&junk_catalog(&dir, true)).unwrap();
     match svc.load_model("img").await {
-        Err(AiKitError::ModelLoadFailed { reason, .. }) => assert!(
+        Err(Error::ModelLoadFailed { reason, .. }) => assert!(
             reason.contains("image_generation model, not a text-generation"),
             "{reason}"
         ),
@@ -186,7 +182,7 @@ async fn an_explicit_cuda_device_that_is_missing_fails_for_every_backend() {
     let cat = junk_catalog(&dir, true);
     let img = CandleImageService::new(&cat, DevicePreference::Cuda(63)).unwrap();
     match img.handle(image_req("img", 512)).await {
-        Err(AiKitError::ModelLoadFailed { reason, .. }) => {
+        Err(Error::ModelLoadFailed { reason, .. }) => {
             assert!(reason.contains("CUDA"), "{reason}")
         }
         other => panic!("{other:?}"),
@@ -196,12 +192,11 @@ async fn an_explicit_cuda_device_that_is_missing_fails_for_every_backend() {
 // ------------------------------------------------------------ group 2
 
 fn real_catalog() -> String {
-    std::env::var("AI_KIT_MM_CATALOG")
-        .expect("set AI_KIT_MM_CATALOG to a catalog with sd-turbo and minilm")
+    inference_kit::env::var("MM_CATALOG")
+        .expect("set INFERENCE_KIT_MM_CATALOG to a catalog with sd-turbo and minilm")
 }
 fn device() -> DevicePreference {
-    std::env::var("AI_KIT_DEVICE")
-        .ok()
+    inference_kit::env::var("DEVICE")
         .and_then(|d| d.parse().ok())
         .unwrap_or(DevicePreference::Cpu)
 }
@@ -221,7 +216,7 @@ async fn a_real_image_is_a_real_png_of_the_requested_size_and_is_reproducible() 
         other => panic!("{other:?}"),
     };
     let a = get(svc.handle(mk(11)).await.unwrap());
-    assert_eq!(ai_kit::modality::png_dims(&a.png), Some((512, 512)));
+    assert_eq!(inference_kit::modality::png_dims(&a.png), Some((512, 512)));
     assert!(a.pixel_stddev > 10.0, "flat image: {}", a.pixel_stddev);
     assert!(OutputCheck::Sane
         .check(&mk(11), &Output::Image(a.clone()))
@@ -339,7 +334,7 @@ async fn one_service_routes_every_kind_of_request_and_is_honest_about_the_rest()
         .await
         .unwrap_err();
     assert!(
-        matches!(e, AiKitError::UnsupportedKind { .. }),
+        matches!(e, Error::UnsupportedKind { .. }),
         "no text backend is configured: {e:?}"
     );
 }
@@ -363,7 +358,7 @@ async fn z_image_turbo_makes_a_real_reproducible_image_through_the_service() {
         other => panic!("{other:?}"),
     };
     let a = get(svc.handle(mk(21)).await.unwrap());
-    assert_eq!(ai_kit::modality::png_dims(&a.png), Some((512, 512)));
+    assert_eq!(inference_kit::modality::png_dims(&a.png), Some((512, 512)));
     assert!(a.pixel_stddev > 20.0, "flat image: {}", a.pixel_stddev);
     assert!(OutputCheck::Sane
         .check(&mk(21), &Output::Image(a.clone()))

@@ -27,7 +27,7 @@
 
 use crate::backends::common::{check_vram, device_for, DevicePreference};
 use crate::cache::{KvCacheManager, LoadedModel, ModelCache};
-use crate::error::{AiKitError, Result};
+use crate::error::{Error, Result};
 use crate::registry::ModelRegistry;
 use crate::service::InferenceService;
 use crate::types::{CacheStats, InferenceParams, InferenceResponse, ModelMetadata, SessionId};
@@ -115,7 +115,7 @@ impl CandleInferenceService {
     /// Turn the configured [`DevicePreference`] into a concrete device and a
     /// label for it. Fails hard (no silent CPU fallback) unless `Auto`.
     fn resolve_device(&self, model_id: &str) -> Result<(Device, String)> {
-        let fail = |reason: String| AiKitError::ModelLoadFailed {
+        let fail = |reason: String| Error::ModelLoadFailed {
             model_id: model_id.to_string(),
             reason,
         };
@@ -126,7 +126,7 @@ impl CandleInferenceService {
         self.registry
             .get(model_id)
             .cloned()
-            .ok_or_else(|| AiKitError::ModelNotFound {
+            .ok_or_else(|| Error::ModelNotFound {
                 model_id: model_id.to_string(),
             })
     }
@@ -137,7 +137,7 @@ impl CandleInferenceService {
             .custom
             .get("tokenizer_path")
             .cloned()
-            .ok_or_else(|| AiKitError::ModelLoadFailed {
+            .ok_or_else(|| Error::ModelLoadFailed {
                 model_id: model.id.clone(),
                 reason: "catalog entry missing metadata.custom.tokenizer_path".to_string(),
             })
@@ -153,15 +153,13 @@ impl CandleInferenceService {
     ) -> Result<ModelWeights> {
         let mut cursor = Cursor::new(gguf_bytes);
         let content =
-            gguf_file::Content::read(&mut cursor).map_err(|e| AiKitError::ModelLoadFailed {
+            gguf_file::Content::read(&mut cursor).map_err(|e| Error::ModelLoadFailed {
                 model_id: model_id.to_string(),
                 reason: format!("gguf parse failed: {e}"),
             })?;
-        ModelWeights::from_gguf(content, &mut cursor, device).map_err(|e| {
-            AiKitError::ModelLoadFailed {
-                model_id: model_id.to_string(),
-                reason: format!("candle model build failed: {e}"),
-            }
+        ModelWeights::from_gguf(content, &mut cursor, device).map_err(|e| Error::ModelLoadFailed {
+            model_id: model_id.to_string(),
+            reason: format!("candle model build failed: {e}"),
         })
     }
 }
@@ -172,12 +170,12 @@ impl InferenceService for CandleInferenceService {
         params.validate()?;
 
         let loaded = {
-            let guard = self.loaded.read().map_err(|_| AiKitError::Internal {
+            let guard = self.loaded.read().map_err(|_| Error::Internal {
                 reason: "loaded-model lock poisoned".to_string(),
             })?;
             guard.get(&params.model_id).cloned()
         }
-        .ok_or_else(|| AiKitError::ModelNotFound {
+        .ok_or_else(|| Error::ModelNotFound {
             model_id: params.model_id.clone(),
         })?;
 
@@ -186,7 +184,7 @@ impl InferenceService for CandleInferenceService {
         // One loaded model serves one request at a time. The first forward pass
         // below starts at `index_pos == 0`, which makes Candle drop whatever
         // KV cache the previous request left (see `LoadedCandleModel`).
-        let mut weights = loaded.weights.lock().map_err(|_| AiKitError::Internal {
+        let mut weights = loaded.weights.lock().map_err(|_| Error::Internal {
             reason: "model weights lock poisoned".to_string(),
         })?;
 
@@ -221,12 +219,12 @@ impl InferenceService for CandleInferenceService {
         let encoding = loaded
             .tokenizer
             .encode(formatted_prompt.as_str(), true)
-            .map_err(|e| AiKitError::Internal {
+            .map_err(|e| Error::Internal {
                 reason: format!("tokenizer encode failed: {e}"),
             })?;
         let prompt_tokens = encoding.get_ids().to_vec();
         if prompt_tokens.is_empty() {
-            return Err(AiKitError::InvalidParams {
+            return Err(Error::InvalidParams {
                 reason: "prompt encoded to zero tokens".to_string(),
             });
         }
@@ -246,21 +244,20 @@ impl InferenceService for CandleInferenceService {
         let input = tensor_1x_n(&prompt_tokens, &loaded.device)?;
         let mut logits = weights
             .forward(&input, index_pos)
-            .map_err(|e| AiKitError::Internal {
+            .map_err(|e| Error::Internal {
                 reason: format!("forward failed: {e}"),
             })?;
         index_pos += prompt_tokens.len();
 
         for _ in 0..params.max_tokens {
-            let logits_1d = logits.squeeze(0).map_err(|e| AiKitError::Internal {
+            let logits_1d = logits.squeeze(0).map_err(|e| Error::Internal {
                 reason: e.to_string(),
             })?;
-            let next_token =
-                logits_processor
-                    .sample(&logits_1d)
-                    .map_err(|e| AiKitError::Internal {
-                        reason: e.to_string(),
-                    })?;
+            let next_token = logits_processor
+                .sample(&logits_1d)
+                .map_err(|e| Error::Internal {
+                    reason: e.to_string(),
+                })?;
 
             if loaded.eos_token_ids.contains(&next_token) {
                 break;
@@ -270,7 +267,7 @@ impl InferenceService for CandleInferenceService {
             let next_input = tensor_1x_n(&[next_token], &loaded.device)?;
             logits = weights
                 .forward(&next_input, index_pos)
-                .map_err(|e| AiKitError::Internal {
+                .map_err(|e| Error::Internal {
                     reason: format!("forward failed: {e}"),
                 })?;
             index_pos += 1;
@@ -280,7 +277,7 @@ impl InferenceService for CandleInferenceService {
             loaded
                 .tokenizer
                 .decode(&generated, true)
-                .map_err(|e| AiKitError::Internal {
+                .map_err(|e| Error::Internal {
                     reason: format!("tokenizer decode failed: {e}"),
                 })?;
 
@@ -292,7 +289,7 @@ impl InferenceService for CandleInferenceService {
         // (KvCacheManager is keyed by SessionId alone, not app_id+session_id),
         // out of scope for this POC. See cache.rs module doc + AGENT.md.
         {
-            let mut kv = self.kv_cache.lock().map_err(|_| AiKitError::Internal {
+            let mut kv = self.kv_cache.lock().map_err(|_| Error::Internal {
                 reason: "kv-cache lock poisoned".to_string(),
             })?;
             kv.get_or_create(
@@ -330,7 +327,7 @@ impl InferenceService for CandleInferenceService {
         if self
             .loaded
             .read()
-            .map_err(|_| AiKitError::Internal {
+            .map_err(|_| Error::Internal {
                 reason: "loaded-model lock poisoned".to_string(),
             })?
             .contains_key(model_id)
@@ -339,7 +336,7 @@ impl InferenceService for CandleInferenceService {
         }
 
         if model.kind() != crate::modality::RequestKind::TextGeneration {
-            return Err(AiKitError::ModelLoadFailed {
+            return Err(Error::ModelLoadFailed {
                 model_id: model_id.to_string(),
                 reason: format!(
                     "'{model_id}' is a {} model, not a text-generation model",
@@ -361,7 +358,7 @@ impl InferenceService for CandleInferenceService {
         // no separate re-read between "verified" and "loaded" (no TOCTOU gap).
         let actual_hash = blake3::hash(&bytes).to_hex().to_string();
         if actual_hash != model.hash {
-            return Err(AiKitError::IntegrityCheckFailed {
+            return Err(Error::IntegrityCheckFailed {
                 model_id: model_id.to_string(),
                 expected: model.hash.clone(),
                 actual: actual_hash,
@@ -374,13 +371,13 @@ impl InferenceService for CandleInferenceService {
 
         let tokenizer_path = Self::tokenizer_path_for(&model)?;
         let tokenizer =
-            Tokenizer::from_file(&tokenizer_path).map_err(|e| AiKitError::ModelLoadFailed {
+            Tokenizer::from_file(&tokenizer_path).map_err(|e| Error::ModelLoadFailed {
                 model_id: model_id.to_string(),
                 reason: format!("tokenizer load failed: {e}"),
             })?;
         let eos_token_ids = end_token_ids(&tokenizer);
         if eos_token_ids.is_empty() {
-            return Err(AiKitError::ModelLoadFailed {
+            return Err(Error::ModelLoadFailed {
                 model_id: model_id.to_string(),
                 reason: "tokenizer has none of the known end-of-reply tokens, so generation could not stop"
                     .to_string(),
@@ -390,7 +387,7 @@ impl InferenceService for CandleInferenceService {
         // The raw bytes now only back `cache.rs`'s bookkeeping, so hand them over
         // instead of cloning (the weights above already own the tensors).
         {
-            let mut cache = self.model_cache.lock().map_err(|_| AiKitError::Internal {
+            let mut cache = self.model_cache.lock().map_err(|_| Error::Internal {
                 reason: "model-cache lock poisoned".to_string(),
             })?;
             cache.insert(LoadedModel::new(actual_hash, bytes));
@@ -405,7 +402,7 @@ impl InferenceService for CandleInferenceService {
         };
         self.loaded
             .write()
-            .map_err(|_| AiKitError::Internal {
+            .map_err(|_| Error::Internal {
                 reason: "loaded-model lock poisoned".to_string(),
             })?
             .insert(model_id.to_string(), Arc::new(loaded));
@@ -416,12 +413,12 @@ impl InferenceService for CandleInferenceService {
     async fn unload_model(&self, model_id: &str) -> Result<()> {
         self.loaded
             .write()
-            .map_err(|_| AiKitError::Internal {
+            .map_err(|_| Error::Internal {
                 reason: "loaded-model lock poisoned".to_string(),
             })?
             .remove(model_id);
         if let Ok(model) = self.model_meta(model_id) {
-            let mut cache = self.model_cache.lock().map_err(|_| AiKitError::Internal {
+            let mut cache = self.model_cache.lock().map_err(|_| Error::Internal {
                 reason: "model-cache lock poisoned".to_string(),
             })?;
             cache.remove(&model.hash);
@@ -430,10 +427,10 @@ impl InferenceService for CandleInferenceService {
     }
 
     async fn cache_stats(&self) -> Result<CacheStats> {
-        let model_cache = self.model_cache.lock().map_err(|_| AiKitError::Internal {
+        let model_cache = self.model_cache.lock().map_err(|_| Error::Internal {
             reason: "model-cache lock poisoned".to_string(),
         })?;
-        let kv_cache = self.kv_cache.lock().map_err(|_| AiKitError::Internal {
+        let kv_cache = self.kv_cache.lock().map_err(|_| Error::Internal {
             reason: "kv-cache lock poisoned".to_string(),
         })?;
         Ok(CacheStats {
@@ -449,7 +446,7 @@ impl InferenceService for CandleInferenceService {
     async fn end_session(&self, session_id: &SessionId) -> Result<()> {
         self.kv_cache
             .lock()
-            .map_err(|_| AiKitError::Internal {
+            .map_err(|_| Error::Internal {
                 reason: "kv-cache lock poisoned".to_string(),
             })?
             .remove(session_id);
@@ -462,7 +459,7 @@ fn tensor_1x_n(tokens: &[u32], device: &Device) -> Result<Tensor> {
     Tensor::new(tokens, device)
         .and_then(|t| t.unsqueeze(0))
         .and_then(|t| t.to_dtype(DType::U32))
-        .map_err(|e| AiKitError::Internal {
+        .map_err(|e| Error::Internal {
             reason: format!("tensor build failed: {e}"),
         })
 }

@@ -18,7 +18,7 @@ use crate::egress::{
     Attempt, AuditSink, DenyReason, EgressRecord, Label, Locality, Outcome, Policy, ProviderInfo,
     Purpose, Verdict,
 };
-use crate::error::AiKitError;
+use crate::error::Error;
 use crate::modality::{Output, Request, RequestKind};
 use crate::types::InferenceResponse;
 use async_trait::async_trait;
@@ -134,8 +134,8 @@ impl ChainConfig {
 /// Walk `chain` in order; every hop gets a fresh egress decision. Returns the first reply that ends the chain (a normal answer or a
 /// refusal), or an error if nothing could serve it.
 ///
-/// Errors: [`AiKitError::UnsupportedKind`] if no provider in the chain handles the kind; [`AiKitError::RequiresShareable`] if the only
-/// providers that could were blocked by the egress policy; otherwise [`AiKitError::RemoteBackendError`] with the last error class.
+/// Errors: [`Error::UnsupportedKind`] if no provider in the chain handles the kind; [`Error::RequiresShareable`] if the only
+/// providers that could were blocked by the egress policy; otherwise [`Error::RemoteBackendError`] with the last error class.
 pub async fn run_chain(
     chain: &[Arc<dyn ProviderAdapter>],
     policy: &Policy,
@@ -143,7 +143,7 @@ pub async fn run_chain(
     req: &Request,
     cfg: &ChainConfig,
     sink: &dyn AuditSink,
-) -> Result<(ProviderReply, EgressRecord), AiKitError> {
+) -> Result<(ProviderReply, EgressRecord), Error> {
     let (result, record) = run_chain_recorded(chain, policy, label, req, cfg, sink).await;
     result.map(|reply| (reply, record))
 }
@@ -157,7 +157,7 @@ pub async fn run_chain_recorded(
     req: &Request,
     cfg: &ChainConfig,
     sink: &dyn AuditSink,
-) -> (Result<ProviderReply, AiKitError>, EgressRecord) {
+) -> (Result<ProviderReply, Error>, EgressRecord) {
     let kind = req.kind();
     let mut attempts: Vec<Attempt> = Vec::new();
     let mut remote_hops = 0u32;
@@ -270,14 +270,14 @@ pub async fn run_chain_recorded(
     }
     let outcome = match result {
         Some(reply) => Ok(reply),
-        None if !any_capable => Err(AiKitError::UnsupportedKind {
+        None if !any_capable => Err(Error::UnsupportedKind {
             request_kind: kind.as_str().to_string(),
             reason: "no provider in the chain handles this kind".into(),
         }),
-        None if last_error.is_none() && blocked_by_policy => Err(AiKitError::RequiresShareable {
+        None if last_error.is_none() && blocked_by_policy => Err(Error::RequiresShareable {
             request_kind: kind.as_str().to_string(),
         }),
-        None => Err(AiKitError::RemoteBackendError {
+        None => Err(Error::RemoteBackendError {
             backend: "chain".into(),
             reason: last_error.map_or("no hop could be tried".to_string(), |e| {
                 e.class().to_string()
@@ -422,7 +422,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(e, AiKitError::RequiresShareable { .. }), "{e:?}");
+        assert!(matches!(e, Error::RequiresShareable { .. }), "{e:?}");
         assert_eq!(claude.calls(), 0, "a denied provider must never be called");
         let rec = sink.0.lock().unwrap();
         assert_eq!(rec.len(), 1, "a denial is audited");
@@ -468,7 +468,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(claude2.calls(), 0);
         assert!(
-            matches!(e, AiKitError::RemoteBackendError { .. }),
+            matches!(e, Error::RemoteBackendError { .. }),
             "the local error is the last real failure: {e:?}"
         );
     }
@@ -518,7 +518,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(e, AiKitError::RemoteBackendError { .. }));
+        assert!(matches!(e, Error::RemoteBackendError { .. }));
         assert_eq!(
             (a.calls(), b.calls(), c.calls()),
             (1, 1, 0),
@@ -540,7 +540,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(e, AiKitError::UnsupportedKind { .. }), "{e:?}");
+        assert!(matches!(e, Error::UnsupportedKind { .. }), "{e:?}");
         assert_eq!(embed_only.calls(), 0);
     }
 

@@ -5,7 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] (to be released as 0.2.0)
+
+First release under the new names. Version 0.2.0 marks the break: the release tag must equal `version` in `Cargo.toml`.
+
+### Identity and rename (breaking, with deprecated aliases)
+- **Package renamed** from `ai-kit` to `slashbuilder-inference-kit`; the library is now `inference_kit` (`use inference_kit::...`), set explicitly in `[lib]`. The repository is `slash-builder/inference-kit`.
+- **`AiKitError` is now `Error`** (`inference_kit::Error`). `AiKitError` remains as a `#[deprecated]` type alias for the 0.2.x series.
+- **The binary is now `inference-kit`** (was `ai-kit-cli`).
+- **Environment variables are now `INFERENCE_KIT_*`** (`INFERENCE_KIT_DEVICE`, `INFERENCE_KIT_MODEL_DIR`, ...). The old `AI_KIT_*` names are still read when the new one is unset, with a deprecation warning, and will stop being read in a later release. See `inference_kit::env`.
+- The `authors` field is removed from the manifest; description, keywords and categories are updated; `repository` points at the current repository.
+- Release process: `Cargo.toml` is the version source of truth and the tag equals it; a merge that does not change `version` publishes nothing.
+
+### Cloud features and environment
+- Each opt-in cloud feature (`claude-proxy`, `provider-anthropic`, `provider-gemini`, `provider-openai-compat`) now carries a data-egress warning in the README, the crate docs and its module docs. All remain off by default (`default = []`).
+- `inference_kit::env`, the single place `INFERENCE_KIT_*` variables are read.
+
+### Removed
+- `AGENT.md` and links to private planning documents from the README and CONTRIBUTING.
 
 ### Changed
 - Packaging: the published crate is now built from an `include` allow-list (sources, manifest, README, LICENSE, CHANGELOG), local cargo configuration is excluded, and `make package-check` / CI fail if the package list would contain anything else.
