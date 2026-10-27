@@ -1,7 +1,7 @@
 //! Text embeddings on Candle (a BERT-family sentence encoder such as all-MiniLM-L6-v2). **POC.**
 //!
 //! [`CandleEmbeddingService`] implements [`RequestService`] for [`RequestKind::Embedding`]: the
-//! "semantic search over Courier files" use the Inference Kit design names. It mean-pools the last hidden state under the
+//! "semantic search over a user's files" use the Inference Kit design names. It mean-pools the last hidden state under the
 //! attention mask and, if asked, scales each vector to unit length (so a dot product is cosine similarity).
 //!
 //! Embeddings of household files are about as private as data gets, so the router's default (`Private`: never leaves the

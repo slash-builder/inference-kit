@@ -1,7 +1,7 @@
 //! The contract every [`CredentialSource`] must keep, as a reusable check. **No network, no dependencies.**
 //!
 //! The kit's own sources ([`DirCredentialSource`](super::DirCredentialSource), [`InMemoryCredentials`](super::InMemoryCredentials))
-//! run it, and so should any source a host application writes (an OS credential store backed one in Courier, for example). A source that
+//! run it, and so should any source a host application writes (an OS credential store, for example). A source that
 //! passes has these properties, which is what lets an adapter treat "no credential" as "not configured" and never fall back:
 //!
 //! 1. **It returns what was stored**, trimmed of surrounding whitespace, and re-reads it on every call (a rotated secret is picked up

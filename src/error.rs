@@ -3,7 +3,6 @@
 //! # Design Notes
 //!
 //! Inference Kit errors map cleanly to Hearth ErrorCode enum for protocol-level errors.
-//! See: https://github.com/slash-builder/message-kit/blob/main/proto/quickring/v1/message.proto
 
 use thiserror::Error;
 
@@ -12,7 +11,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Inference Kit error types.
 ///
-/// Maps to `quickring.v1.ErrorCode` enum in Message Kit protocol:
+/// Maps to the `ErrorCode` enum of the Message Kit protocol:
 /// - `MODEL_NOT_FOUND = 20`
 /// - `INFERENCE_TIMEOUT = 21`
 /// - `CACHE_EVICTED = 22`

@@ -2,7 +2,7 @@
 //!
 //! This is the library half of "what may leave the house" (DJ, 2026-10-11): household resources are managed by the house owners
 //! and per-user resources by the user, for both the data that may be shared with a remote provider and the credentials used for it.
-//! The kit does **not** store rules, assign labels or show UI (the gateway / Courier / Score Kit do). It receives a label (set where
+//! The kit does **not** store rules, assign labels or show UI (the host application does). It receives a label (set where
 //! the content entered, never by a model) and a [`Policy`] snapshot and answers one question: *may this content go to this provider
 //! for this purpose?* The answer is evaluated **fresh at every hop** by [`crate::provider::run_chain`].
 //!

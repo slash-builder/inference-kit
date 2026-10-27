@@ -1,4 +1,4 @@
-//! The [`EgressRouter`] (not the older hybrid `Router`): one object a host application (Courier, the gateway glue, the CLI) assembles once and calls.
+//! The [`EgressRouter`] (not the older hybrid `Router`): one object a host application (or the CLI) assembles once and calls.
 //!
 //! It owns the pieces the egress-aware path needs, so a caller cannot get the wiring wrong by assembling them by hand:
 //! the [`ProviderSet`] (adapters, model cards, health and scorecards), the current [`Policy`], the spend [`Ledger`], and the audit
