@@ -9,6 +9,13 @@ license = "Apache-2.0"
 keywords = ["inference", "llm", "household", "hearth", "kit"]
 categories = ["machine-learning", "command-line-utilities"]
 
+# Allow-list of what may ever be packaged. With `include` set, anything not matched
+# here stays out of the .crate, so a stray local file (a .cargo/ directory holding
+# registry credentials, an .env, build output) can never ship by accident. Cargo
+# ignores `exclude` when `include` is set, so there is deliberately no `exclude`.
+# Review `cargo package --list` (and run `make package-check`) when adding to this list.
+include = ["/src/**", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+
 [lib]
 path = "src/lib.rs"
 

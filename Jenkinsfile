@@ -86,6 +86,10 @@ pipeline {
               cargo clippy --all-targets -- -D warnings
               cargo test
               cargo build --release
+              # Package gate: the published crate must contain only the allow-listed
+              # files. Runs on every build so a regression is caught in the PR,
+              # not at publish time.
+              ./scripts/check-package.sh
             '''
           }
         }
@@ -238,7 +242,13 @@ pipeline {
             fi
 
             # Cargo registry auth.
-            mkdir -p "$CARGO_HOME"
+            # Registry auth lives in a throwaway CARGO_HOME OUTSIDE the workspace
+            # (the container's own filesystem, gone with the container), so it can
+            # never be part of the packaged tree. The workspace-relative CARGO_HOME
+            # set in `environment` above is for the build stages only.
+            CARGO_HOME="$(mktemp -d)"
+            export CARGO_HOME
+            trap 'rm -rf "$CARGO_HOME"' EXIT
             cat >> "$CARGO_HOME/config.toml" <<EOF
 [registries.lockamy]
 index = "sparse+${NEXUS_URL}/repository/cargo-group/"
@@ -255,6 +265,17 @@ EOF
             printf '[registries.lockamy]\ntoken = "%s"\n[registries.lockamy-hosted]\ntoken = "%s"\n' \
               "${BASIC}" "${BASIC}" >> "$CARGO_HOME/credentials.toml"
             chmod 0600 "$CARGO_HOME/credentials.toml"
+
+            # --allow-dirty stays only because the version bump above edits Cargo.toml
+            # (and the build creates Cargo.lock). Refuse to publish if anything else is
+            # dirty or untracked, then run the package gate. Names only are printed.
+            unexpected=$(git status --porcelain --untracked-files=all | grep -v -E '^( M|[?][?]) Cargo[.](toml|lock)$' || true)
+            if [ -n "$unexpected" ]; then
+              echo "Refusing to publish: unexpected files in the workspace:"
+              printf '%s\n' "$unexpected" | cut -c4-
+              exit 1
+            fi
+            ./scripts/check-package.sh
 
             # Publish (allow-dirty: the version was just set in-tree).
             # Idempotent: a version already present on Nexus is treated as success,

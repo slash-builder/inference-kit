@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Packaging: the published crate is now built from an `include` allow-list (sources, manifest, README, LICENSE, CHANGELOG), local cargo configuration is excluded, and `make package-check` / CI fail if the package list would contain anything else.
 - Candle 0.9.2 -> **0.11** (verified: KV isolation A/B/A on CPU and CUDA, real-weights multimodal tests).
 - `AiKitError::to_error_code()` is **deprecated**: its numbers (20-24, 13, 90) collide with the fabric `ErrorCode` space (a remote peer could trigger an ops alert). Use `to_inference_error_code()`.
 - The router keeps the original typed error when a call fails (an out-of-memory error used to become `Internal`).

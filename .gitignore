@@ -1,5 +1,9 @@
 target/
+target-*/
 Cargo.lock
+
+# Local cargo configuration and registry credentials must never be committed or packaged.
+/.cargo/
 
 # POC-only: model weights fetched by scripts/fetch-model.sh for local dev
 # inference (see README "Local Dev Inference (POC)"). Never committed —
