@@ -100,8 +100,8 @@ cat <<'BANNER'
 
 POC-ONLY: model fetched over network for local dev inference.
 Production ships models signed in the OS image (invariant #2) — this
-exception is documented in README.md ("Local Dev Inference (POC)") and
-AGENT.md. Never used at runtime on a real device.
+exception is documented in README.md ("Local Dev Inference (POC)").
+Never used at runtime on a real device.
 
 Next: cargo build --features candle
       cargo run --features candle --bin inference-kit -- infer --model MODEL_NAME_PLACEHOLDER --prompt "Say hello"

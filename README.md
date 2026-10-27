@@ -80,7 +80,7 @@ Without `--features candle`, `inference-kit infer` still builds and runs — it
 exits with a message telling you to rebuild with the feature, rather than
 failing to compile. `inference-kit hash <path>` and `cache-stats` work either way.
 
-**Known POC limitations** (see `AGENT.md` for the full list): each `infer()`
+**Known POC limitations** (listed in the module docs of `src/backends/candle.rs`): each `infer()`
 call runs a fresh generation — there's no cross-call transformer KV-cache
 reuse at the Candle level (`KvCacheManager` still tracks session bookkeeping/
 TTL, just not real tensor state); CPU-only, no CUDA/Metal; single small model,

@@ -109,7 +109,7 @@ Include:
 1. Fork and create a feature branch.
 2. Commit with clear messages.
 3. Ensure all tests pass (`cargo test` + `cargo clippy`).
-4. Update documentation and AGENT.md if needed.
+4. Update the documentation (README, CHANGELOG, doc comments) if needed.
 5. Open a PR with a clear description.
 6. Wait for review from maintainers.
 

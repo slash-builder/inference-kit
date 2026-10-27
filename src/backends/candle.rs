@@ -15,7 +15,7 @@
 //! a production backend reading `/usr/share/models/` would. The network
 //! fetch is a dev-setup-time concern, not a runtime one.
 //!
-//! # Known POC limitations (see `AGENT.md` for the full list)
+//! # Known POC limitations (the full list)
 //!
 //! - CPU by default. NVIDIA GPU via the opt-in `cuda` feature and
 //!   [`DevicePreference`] (see below); no Metal.
@@ -60,7 +60,7 @@ use tokenizers::Tokenizer;
 /// weights now live in a `Mutex` and requests for one model are serialised.
 /// A finished request's key/value tensors stay in memory (VRAM on a GPU) until
 /// the next request overwrites them; that residue is the one thing a
-/// security review should look at (see AGENT.md).
+/// security review should look at (see the README).
 struct LoadedCandleModel {
     weights: Mutex<ModelWeights>,
     tokenizer: Tokenizer,
@@ -287,7 +287,7 @@ impl InferenceService for CandleInferenceService {
         // Bookkeeping only (session TTL/lookup) — not real per-app privacy
         // isolation. That's a known, pre-existing gap in cache.rs
         // (KvCacheManager is keyed by SessionId alone, not app_id+session_id),
-        // out of scope for this POC. See cache.rs module doc + AGENT.md.
+        // out of scope for this POC. See the cache.rs module doc.
         {
             let mut kv = self.kv_cache.lock().map_err(|_| Error::Internal {
                 reason: "kv-cache lock poisoned".to_string(),
