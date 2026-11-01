@@ -185,6 +185,7 @@ never happens when image generation is not in the granted set, so a text-only ca
 | text generation | yes | Candle, plain-Llama GGUF (CPU/CUDA) | Claude (dev adapter; proxy unruled) |
 | **image generation** | yes | **Candle: `z_image` (Z-Image-Turbo, Apache-2.0, the default) and `sd_turbo` (development only)** | none (Claude cannot make raster images) |
 | **embeddings** | yes | **Candle BERT, e.g. all-MiniLM-L6-v2 (384-d)** | none, by design (household files are private) |
+| chat (proposal) | yes | none | Claude (system prompt and messages; schema requests refused until verified) |
 | image understanding | yes | none | none wired (a Claude backend could declare it) |
 | speech-to-text | yes | none | none |
 
