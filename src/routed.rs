@@ -166,6 +166,8 @@ impl MultiHybridService {
     fn effective(&self, r: &RoutedRequest) -> (Request, TaskClass) {
         let class = r.class.unwrap_or_else(|| match &r.request {
             Request::Text(p) => classify(&p.prompt),
+            // the legacy router has no chat backend; classify by the newest message so it fails honestly
+            Request::Chat(p) => classify(p.messages.last().map_or("", |m| m.content.as_str())),
             Request::ImageGeneration(_) => TaskClass::ImageRaster,
             Request::ImageUnderstanding(_) => TaskClass::ImageUnderstanding,
             Request::Embedding(_) => TaskClass::Embedding,

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The router keeps the original typed error when a call fails (an out-of-memory error used to become `Internal`).
 
 ### Added
+- **Proposal, not ruled:** a `Chat` request kind (`docs/proposals/chat-request.md`): a system prompt, role-tagged messages and an optional response schema. A schema request needs a model whose card says `structured_outputs: yes`, whatever the caller remembered to say. The Anthropic adapter serves chat; it refuses a schema request until structured output is verified against a live key.
 - Any kind of request: a general `Request`/`Output` contract for five request kinds (`RequestKind`: text, image generation, image understanding, embeddings, speech-to-text), `RequestService`, `TextService`,
   `OutputCheck`, and `AiKitError::UnsupportedKind`. `MultiHybridService` routes any of them by which tier has the kind (then the usual privacy/fit/policy rules) and counts bytes sent to the cloud
   (`RouteStats::cloud_payload_bytes`). `Plan::Unavailable { needs_shareable }`; new `TaskClass` values; `RequestKind`, `Request`, `Output` and `TaskClass` are `#[non_exhaustive]`.

@@ -49,15 +49,19 @@ pub enum RequestKind {
     Embedding,
     /// Audio in, a transcript out.
     SpeechToText,
+    /// A system prompt and a list of role-tagged messages in, the next assistant message out. May ask for
+    /// output that fits a JSON schema; only a model whose card says `structured_outputs: yes` is given that.
+    Chat,
 }
 
 impl RequestKind {
-    pub const ALL: [RequestKind; 5] = [
+    pub const ALL: [RequestKind; 6] = [
         RequestKind::TextGeneration,
         RequestKind::ImageGeneration,
         RequestKind::ImageUnderstanding,
         RequestKind::Embedding,
         RequestKind::SpeechToText,
+        RequestKind::Chat,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -67,6 +71,7 @@ impl RequestKind {
             RequestKind::ImageUnderstanding => "image_understanding",
             RequestKind::Embedding => "embedding",
             RequestKind::SpeechToText => "speech_to_text",
+            RequestKind::Chat => "chat",
         }
     }
 }
@@ -253,6 +258,144 @@ pub struct TranscriptResponse {
     pub request_id: String,
 }
 
+/// Who wrote a chat message. The system prompt is not a message: it is [`ChatParams::system`], so it can never be
+/// forged by a message list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRole {
+    /// The person or program asking.
+    User,
+    /// The model, in an earlier turn.
+    Assistant,
+}
+
+/// One message in a chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::User,
+            content: content.into(),
+        }
+    }
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: content.into(),
+        }
+    }
+}
+
+/// A chat request: standing instructions, the conversation so far, and optionally a shape the answer must have.
+///
+/// The answer comes back as [`Output::Text`]. When `response_schema` is set the text is a JSON document the provider
+/// constrained to the schema. **The kit does not promise the schema was met**: the caller parses and checks, because a
+/// refusal or a length stop can still return text that is not JSON.
+#[derive(Debug, Clone)]
+pub struct ChatParams {
+    pub model_id: String,
+    /// Standing instructions (a persona, rules). Optional.
+    pub system: Option<String>,
+    /// The conversation so far. Non-empty; the last message is from the user.
+    pub messages: Vec<ChatMessage>,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    /// A JSON Schema the answer must fit. Only a model whose card says `structured_outputs: yes` is chosen for it;
+    /// with none, the request is refused as [`AiKitError::UnsupportedKind`], never quietly run unconstrained.
+    pub response_schema: Option<serde_json::Value>,
+    pub session_id: Option<SessionId>,
+    pub request_id: Option<String>,
+}
+
+impl ChatParams {
+    pub fn new(model_id: impl Into<String>, messages: Vec<ChatMessage>) -> Self {
+        Self {
+            model_id: model_id.into(),
+            system: None,
+            messages,
+            temperature: 0.7,
+            max_tokens: 1024,
+            response_schema: None,
+            session_id: None,
+            request_id: None,
+        }
+    }
+
+    /// Everything the request carries, in characters (system, messages, schema).
+    fn total_chars(&self) -> usize {
+        self.system.as_ref().map_or(0, |s| s.chars().count())
+            + self
+                .messages
+                .iter()
+                .map(|m| m.content.chars().count())
+                .sum::<usize>()
+            + self
+                .response_schema
+                .as_ref()
+                .map_or(0, |v| v.to_string().chars().count())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let bad = |reason: &str| {
+            Err(AiKitError::InvalidParams {
+                reason: reason.to_string(),
+            })
+        };
+        if self.model_id.is_empty() {
+            return bad("model_id cannot be empty");
+        }
+        let Some(last) = self.messages.last() else {
+            return bad("chat needs at least one message");
+        };
+        if last.role != ChatRole::User {
+            return bad("the last chat message must be from the user");
+        }
+        if self.messages.len() > limits::CHAT_MAX_MESSAGES {
+            return Err(too_large(
+                "chat_messages",
+                limits::CHAT_MAX_MESSAGES as u64,
+                self.messages.len() as u64,
+            ));
+        }
+        if self.messages.iter().any(|m| m.content.trim().is_empty()) {
+            return bad("chat messages cannot be empty");
+        }
+        if !(0.0..=2.0).contains(&self.temperature) {
+            return bad("temperature must be in [0, 2]");
+        }
+        if self.max_tokens == 0 {
+            return bad("max_tokens must be at least 1");
+        }
+        if let Some(schema) = &self.response_schema {
+            if !schema.is_object() {
+                return bad("response_schema must be a JSON object");
+            }
+            let n = schema.to_string().len();
+            if n > limits::CHAT_SCHEMA_MAX_BYTES {
+                return Err(too_large(
+                    "chat_schema_bytes",
+                    limits::CHAT_SCHEMA_MAX_BYTES as u64,
+                    n as u64,
+                ));
+            }
+        }
+        let total = self.total_chars();
+        if total > limits::CHAT_MAX_CHARS {
+            return Err(too_large(
+                "chat_chars",
+                limits::CHAT_MAX_CHARS as u64,
+                total as u64,
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Any request the kit can be asked.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -262,6 +405,7 @@ pub enum Request {
     ImageUnderstanding(ImageUnderstandingParams),
     Embedding(EmbeddingParams),
     SpeechToText(SpeechParams),
+    Chat(ChatParams),
 }
 
 impl Request {
@@ -272,6 +416,7 @@ impl Request {
             Request::ImageUnderstanding(_) => RequestKind::ImageUnderstanding,
             Request::Embedding(_) => RequestKind::Embedding,
             Request::SpeechToText(_) => RequestKind::SpeechToText,
+            Request::Chat(_) => RequestKind::Chat,
         }
     }
 
@@ -282,6 +427,7 @@ impl Request {
             Request::ImageUnderstanding(p) => &p.model_id,
             Request::Embedding(p) => &p.model_id,
             Request::SpeechToText(p) => &p.model_id,
+            Request::Chat(p) => &p.model_id,
         }
     }
 
@@ -293,6 +439,7 @@ impl Request {
             Request::ImageUnderstanding(p) => p.model_id = id.to_string(),
             Request::Embedding(p) => p.model_id = id.to_string(),
             Request::SpeechToText(p) => p.model_id = id.to_string(),
+            Request::Chat(p) => p.model_id = id.to_string(),
         }
         self
     }
@@ -303,6 +450,9 @@ impl Request {
             Request::Text(p) => Some(&p.prompt),
             Request::ImageGeneration(p) => Some(&p.prompt),
             Request::ImageUnderstanding(p) => Some(&p.prompt),
+            // the newest message only: a classifier reading one string cannot see the rest, so callers that
+            // need the whole conversation must use `payload_bytes`/the label, not this
+            Request::Chat(p) => p.messages.last().map(|m| m.content.as_str()),
             Request::Embedding(_) | Request::SpeechToText(_) => None,
         }
     }
@@ -318,6 +468,13 @@ impl Request {
             Request::ImageUnderstanding(p) => p.image.len() + p.prompt.len(),
             Request::Embedding(p) => p.inputs.iter().map(String::len).sum(),
             Request::SpeechToText(p) => p.audio.len(),
+            Request::Chat(p) => {
+                p.system.as_ref().map_or(0, String::len)
+                    + p.messages.iter().map(|m| m.content.len()).sum::<usize>()
+                    + p.response_schema
+                        .as_ref()
+                        .map_or(0, |v| v.to_string().len())
+            }
         }
     }
 
@@ -330,6 +487,7 @@ impl Request {
         match self {
             Request::Text(p) => p.validate(),
             Request::ImageGeneration(p) => p.validate(),
+            Request::Chat(p) => p.validate(),
             Request::ImageUnderstanding(p) => {
                 if p.image.is_empty() {
                     return bad("image_understanding needs an image");
@@ -450,6 +608,13 @@ pub mod limits {
     pub const AUDIO_MAX_BYTES: usize = 50 << 20;
     /// Longest audio input, in seconds (read from the WAV header).
     pub const AUDIO_MAX_SECONDS: u64 = 600;
+    /// Most messages in one chat request.
+    pub const CHAT_MAX_MESSAGES: usize = 256;
+    /// Most characters a chat request may carry in total (system prompt, messages and schema). Larger than
+    /// [`PROMPT_MAX_CHARS`] on purpose: a chat carries standing instructions and history. Proposal figure.
+    pub const CHAT_MAX_CHARS: usize = 120_000;
+    /// Largest response schema, in bytes.
+    pub const CHAT_SCHEMA_MAX_BYTES: usize = 16 << 10;
 }
 
 fn too_large(limit_name: &str, limit: u64, actual: u64) -> AiKitError {
@@ -691,6 +856,7 @@ mod tests {
                 session_id: None,
                 request_id: None,
             }),
+            Request::Chat(ChatParams::new("m", vec![ChatMessage::user("hi")])),
         ];
         let caps: Vec<RequestKind> = reqs.iter().map(Request::kind).collect();
         assert_eq!(caps, RequestKind::ALL.to_vec());
@@ -962,6 +1128,79 @@ mod tests {
         assert!(matches!(
             mk(b"definitely not a wav file".to_vec()).validate(),
             Err(AiKitError::InvalidParams { .. })
+        ));
+    }
+
+    fn chat(messages: Vec<ChatMessage>) -> ChatParams {
+        ChatParams::new("m", messages)
+    }
+
+    #[test]
+    fn a_chat_is_its_own_kind_and_carries_its_system_prompt_and_schema_in_the_size() {
+        let mut p = chat(vec![ChatMessage::user("hi")]);
+        p.system = Some("be brief".into());
+        p.response_schema = Some(serde_json::json!({"type": "object"}));
+        let r = Request::Chat(p);
+        assert_eq!(r.kind(), RequestKind::Chat);
+        assert!(r.payload_bytes() > "hi".len() + "be brief".len());
+        assert_eq!(r.prompt_text(), Some("hi"));
+        assert!(r.validate().is_ok());
+        assert_eq!(r.with_model_id("other").model_id(), "other");
+    }
+
+    #[test]
+    fn a_chat_must_be_non_empty_end_with_the_user_and_have_no_blank_messages() {
+        let bad = |p: ChatParams| matches!(p.validate(), Err(AiKitError::InvalidParams { .. }));
+        assert!(bad(chat(vec![])));
+        assert!(bad(chat(vec![
+            ChatMessage::user("a"),
+            ChatMessage::assistant("b")
+        ])));
+        assert!(bad(chat(vec![ChatMessage::user("  ")])));
+        let mut p = chat(vec![ChatMessage::user("a")]);
+        p.max_tokens = 0;
+        assert!(bad(p));
+        let mut p = chat(vec![ChatMessage::user("a")]);
+        p.temperature = 3.0;
+        assert!(bad(p));
+        let mut p = chat(vec![ChatMessage::user("a")]);
+        p.response_schema = Some(serde_json::json!("not an object"));
+        assert!(bad(p));
+        assert!(chat(vec![
+            ChatMessage::user("a"),
+            ChatMessage::assistant("b"),
+            ChatMessage::user("c")
+        ])
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn an_oversized_chat_is_refused_by_size_not_run() {
+        let big = "x".repeat(limits::CHAT_MAX_CHARS + 1);
+        assert!(matches!(
+            chat(vec![ChatMessage::user(big)]).validate(),
+            Err(AiKitError::RequestTooLarge { .. })
+        ));
+        let many = (0..=limits::CHAT_MAX_MESSAGES)
+            .map(|i| {
+                if i % 2 == 0 {
+                    ChatMessage::user("a")
+                } else {
+                    ChatMessage::assistant("b")
+                }
+            })
+            .collect();
+        assert!(matches!(
+            chat(many).validate(),
+            Err(AiKitError::RequestTooLarge { .. })
+        ));
+        let mut p = chat(vec![ChatMessage::user("a")]);
+        p.response_schema =
+            Some(serde_json::json!({"description": "y".repeat(limits::CHAT_SCHEMA_MAX_BYTES)}));
+        assert!(matches!(
+            p.validate(),
+            Err(AiKitError::RequestTooLarge { .. })
         ));
     }
 }

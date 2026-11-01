@@ -110,14 +110,16 @@ pub struct RouteOutcome {
 /// Audio and image bytes are not token-priced, so they count as zero here.
 fn estimate_tokens(req: &Request) -> (u64, u64) {
     let input = match req {
-        Request::Text(_) | Request::ImageGeneration(_) | Request::Embedding(_) => {
-            (req.payload_bytes() as u64).div_ceil(3)
-        }
+        Request::Text(_)
+        | Request::ImageGeneration(_)
+        | Request::Embedding(_)
+        | Request::Chat(_) => (req.payload_bytes() as u64).div_ceil(3),
         Request::ImageUnderstanding(p) => (p.prompt.len() as u64).div_ceil(3),
         Request::SpeechToText(_) => 0,
     };
     let output = match req {
         Request::Text(p) => u64::from(p.max_tokens),
+        Request::Chat(p) => u64::from(p.max_tokens),
         _ => 0,
     };
     (input, output)
@@ -164,6 +166,11 @@ impl EgressRouter {
         pr.input_tokens = input;
         pr.max_output_tokens = output;
         pr.needs = call.needs;
+        // A schema request needs a model that honours schemas, whatever the caller remembered to say: running it on one
+        // that does not would return unconstrained text the caller believes was checked.
+        if matches!(call.request, Request::Chat(p) if p.response_schema.is_some()) {
+            pr.needs.structured_outputs = true;
+        }
         pr.local_only = call.local_only;
         pr.interactive = call.interactive;
         pr.allowed_regions = call.allowed_regions.map(<[String]>::to_vec);
@@ -554,5 +561,68 @@ mod tests {
         assert!(out.result.is_ok());
         assert_eq!((a.calls(), b.calls()), (1, 1));
         assert_eq!(out.record.unwrap().attempts.len(), 2);
+    }
+
+    fn chat_entry(id: &str, structured: Cap) -> (Arc<ScriptedProvider>, Entry) {
+        let p = ScriptedProvider::new(id, Locality::Saas, &[RequestKind::Chat]);
+        let card = ModelCard {
+            provider_id: id.into(),
+            model_id: format!("{id}-model"),
+            kinds: vec![RequestKind::Chat],
+            max_input_tokens: Some(100_000),
+            max_output_tokens: None,
+            retires_at: None,
+            image_input: Cap::Unknown,
+            structured_outputs: structured,
+            tool_use: Cap::Unknown,
+            source: CardSource::Declared,
+        };
+        (p.clone(), Entry::new(p, card))
+    }
+    fn chat_req(schema: Option<serde_json::Value>) -> Request {
+        let mut p =
+            crate::modality::ChatParams::new("m", vec![crate::modality::ChatMessage::user("hi")]);
+        p.response_schema = schema;
+        Request::Chat(p)
+    }
+
+    #[tokio::test]
+    async fn a_chat_runs_on_a_provider_that_serves_chat_and_not_on_a_text_only_one() {
+        let (text_only, e1) = entry("ollama", Locality::Saas);
+        let (chat, e2) = chat_entry("claude", Cap::Unknown);
+        let (r, _) = router(vec![e1, e2], allow_all(1));
+        let (rq, l) = (chat_req(None), label());
+        let out = r.run(&Call::new(&rq, &l, Purpose::Answer, 1000)).await;
+        assert!(out.result.is_ok());
+        assert_eq!((text_only.calls(), chat.calls()), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn a_schema_request_is_never_run_on_a_model_that_does_not_report_schema_support() {
+        // the caller did NOT set `needs.structured_outputs`; the request itself implies it
+        let (unknown, e1) = chat_entry("a", Cap::Unknown);
+        let (denied, e2) = chat_entry("b", Cap::No);
+        let (r, _) = router(vec![e1, e2], allow_all(1));
+        let (rq, l) = (
+            chat_req(Some(serde_json::json!({"type": "object"}))),
+            label(),
+        );
+        let out = r.run(&Call::new(&rq, &l, Purpose::Answer, 1000)).await;
+        assert!(out.result.is_err(), "{:?}", out.result);
+        assert_eq!((unknown.calls(), denied.calls()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_schema_request_runs_on_a_model_whose_card_says_yes() {
+        let (no, e1) = chat_entry("a", Cap::Unknown);
+        let (yes, e2) = chat_entry("b", Cap::Yes);
+        let (r, _) = router(vec![e1, e2], allow_all(1));
+        let (rq, l) = (
+            chat_req(Some(serde_json::json!({"type": "object"}))),
+            label(),
+        );
+        let out = r.run(&Call::new(&rq, &l, Purpose::Answer, 1000)).await;
+        assert!(out.result.is_ok(), "{:?}", out.result);
+        assert_eq!((no.calls(), yes.calls()), (0, 1));
     }
 }

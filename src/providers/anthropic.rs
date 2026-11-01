@@ -92,7 +92,7 @@ impl AnthropicAdapter {
             info: ProviderInfo {
                 provider_id: cfg.provider_id.clone(),
                 locality: Locality::Saas,
-                kinds: vec![RequestKind::TextGeneration],
+                kinds: vec![RequestKind::TextGeneration, RequestKind::Chat],
             },
             cfg,
             creds,
@@ -150,7 +150,7 @@ pub(crate) fn parse_models(provider_id: &str, body: &Value, today: &str) -> Vec<
                     Some(ModelCard {
                         provider_id: provider_id.to_string(),
                         model_id: id,
-                        kinds: vec![RequestKind::TextGeneration],
+                        kinds: vec![RequestKind::TextGeneration, RequestKind::Chat],
                         max_input_tokens: m.get("max_input_tokens").and_then(Value::as_u64),
                         max_output_tokens: m.get("max_tokens").and_then(Value::as_u64),
                         retires_at: m
@@ -237,31 +237,56 @@ impl ProviderAdapter for AnthropicAdapter {
     }
 
     async fn call(&self, req: &Request) -> Result<ProviderReply, ProviderError> {
-        let Request::Text(p) = req else {
-            return Err(ProviderError::Other);
+        // What goes on the wire, whichever kind it is. A chat keeps its system prompt apart from the messages.
+        let (system, messages, prompt_bytes, req_max_tokens, temperature) = match req {
+            Request::Text(p) => (
+                None,
+                json!([{"role": "user", "content": p.prompt}]),
+                p.prompt.len() as u64,
+                p.max_tokens,
+                p.temperature,
+            ),
+            Request::Chat(p) => {
+                // Structured output is NOT wired here: the request shape is unverified against a live key, and running
+                // a schema request unconstrained would hand the caller text it believes was checked. Refuse instead.
+                if p.response_schema.is_some() {
+                    return Err(ProviderError::Other);
+                }
+                (
+                    p.system.clone().filter(|s| !s.trim().is_empty()),
+                    serde_json::to_value(&p.messages).map_err(|_| ProviderError::Other)?,
+                    req.payload_bytes() as u64,
+                    p.max_tokens,
+                    p.temperature,
+                )
+            }
+            _ => return Err(ProviderError::Other),
         };
         let key = self
             .creds
             .get(&self.cfg.credential_name)
             .map_err(|_| ProviderError::Auth)?;
-        let max_tokens = if p.max_tokens == 0 {
+        let max_tokens = if req_max_tokens == 0 {
             self.cfg.default_max_tokens
         } else {
-            p.max_tokens
+            req_max_tokens
         };
         // worst case: ~1 token per 3 bytes of prompt (conservative), and the whole output allowance
         let worst = self
             .cfg
             .pricing
-            .worst_case(p.prompt.len() as u64 / 3 + 1, u64::from(max_tokens));
+            .worst_case(prompt_bytes / 3 + 1, u64::from(max_tokens));
         let reservation = self.ledger.reserve(worst)?;
 
-        let body = json!({
+        let mut body = json!({
             "model": self.cfg.model,
             "max_tokens": max_tokens,
-            "temperature": p.temperature,
-            "messages": [{"role": "user", "content": p.prompt}],
+            "temperature": temperature,
+            "messages": messages,
         });
+        if let Some(system) = system {
+            body["system"] = Value::String(system);
+        }
         let bytes = serde_json::to_vec(&body).map_err(|_| ProviderError::Other)?;
         let bytes_sent = bytes.len() as u64;
         let sent = self
@@ -719,7 +744,10 @@ mod tests {
             ledger,
         )
         .unwrap();
-        assert_eq!(a.info().kinds, vec![RequestKind::TextGeneration]);
+        assert_eq!(
+            a.info().kinds,
+            vec![RequestKind::TextGeneration, RequestKind::Chat]
+        );
         assert_eq!(a.info().locality, Locality::Saas);
         assert!(!format!("{a:?}").contains("TEST-ONLY"));
     }
@@ -758,5 +786,70 @@ mod tests {
             !cards[1].image_input.is_yes() && !cards[1].fits_input(1),
             "a card with no facts claims nothing"
         );
+    }
+
+    fn chat_req(schema: Option<Value>) -> Request {
+        let mut p = crate::modality::ChatParams::new(
+            "m",
+            vec![
+                crate::modality::ChatMessage::user("first"),
+                crate::modality::ChatMessage::assistant("second"),
+                crate::modality::ChatMessage::user("third"),
+            ],
+        );
+        p.system = Some("you are Wren".into());
+        p.max_tokens = 64;
+        p.response_schema = schema;
+        Request::Chat(p)
+    }
+
+    #[tokio::test]
+    async fn a_chat_sends_the_system_prompt_apart_from_the_messages_and_settles_the_cost() {
+        let s = MockServer::start().await;
+        serve(&s, 200, ok_body("end_turn", "answer")).await;
+        let (a, ledger) = adapter(&s, 1_000_000_000);
+        let reply = a.call(&chat_req(None)).await.unwrap();
+        assert_eq!(text_of(&reply), "answer");
+        let seen = s.received_requests().await.unwrap();
+        let sent: Value = serde_json::from_slice(&seen[0].body).unwrap();
+        assert_eq!(sent["system"], "you are Wren");
+        let roles: Vec<&str> = sent["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        assert_eq!(sent["messages"][2]["content"], "third");
+        assert_eq!(sent["max_tokens"], 64);
+        assert!(ledger.available() < 1_000_000_000, "the 200 was billed");
+    }
+
+    #[tokio::test]
+    async fn a_chat_without_a_system_prompt_sends_no_system_field() {
+        let s = MockServer::start().await;
+        serve(&s, 200, ok_body("end_turn", "ok")).await;
+        let (a, _) = adapter(&s, 1_000_000_000);
+        let mut p =
+            crate::modality::ChatParams::new("m", vec![crate::modality::ChatMessage::user("hi")]);
+        p.system = Some("   ".into());
+        a.call(&Request::Chat(p)).await.unwrap();
+        let seen = s.received_requests().await.unwrap();
+        let sent: Value = serde_json::from_slice(&seen[0].body).unwrap();
+        assert!(sent.get("system").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_schema_request_is_refused_before_anything_is_sent_or_reserved() {
+        let s = MockServer::start().await;
+        serve(&s, 200, ok_body("end_turn", "{}")).await;
+        let (a, ledger) = adapter(&s, 1_000_000_000);
+        let err = a
+            .call(&chat_req(Some(json!({"type": "object"}))))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ProviderError::Other);
+        assert!(s.received_requests().await.unwrap().is_empty());
+        assert_eq!(ledger.available(), 1_000_000_000);
     }
 }
