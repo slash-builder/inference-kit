@@ -120,3 +120,20 @@ Reach out to the AI Kit PM (TBD once project is elevated). Until then, file an i
 ## License
 
 By contributing, you agree that your contributions will be licensed under the Apache 2.0 License.
+
+## Sign your commits (DCO)
+
+This project uses the [Developer Certificate of Origin 1.1](https://developercertificate.org/).
+By adding a `Signed-off-by` line you certify that you wrote the change or have the right to submit it
+under the project's licence (Apache-2.0).
+
+```sh
+git commit -s -m "your message"      # adds: Signed-off-by: Your Name <you@example.com>
+git rebase --signoff main            # add the line to commits you already made
+```
+
+Use your real name and a working email address. A check on every pull request fails if any
+non-merge commit is missing the line.
+
+Under section 5 of the Apache License 2.0, a contribution you submit is licensed under the same
+terms as the project unless you state otherwise. There is no separate contributor agreement.

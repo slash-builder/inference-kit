@@ -1,0 +1,72 @@
+# CI for the Inference Kit on GitHub Actions (public repository: hosted runners are free, so Linux x86-64, Linux arm64
+# and macOS all run). Mirrors the Jenkins gates (fmt, clippy -D warnings, test) and adds cargo-deny, the hygiene gate
+# and a DCO check (dco.yml). Default features only: the `cuda` feature needs a CUDA toolkit and a GPU.
+# Nothing here publishes. No semver check: the crate name is not final (the plain name belongs to another crate).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1"   # weekly: catches new advisories and toolchain changes
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test
+      - run: cargo build --release
+
+  supply-chain:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  hygiene:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No internal references, private submodules or agent context in a public repo
+        run: |
+          set -eu
+          if git ls-files | grep -E '(^|/)(AGENT\.md|CLAUDE\.md|\.gitmodules)$|^\.claude/'; then echo "forbidden file tracked"; exit 1; fi
+          if git grep -n -I -E 'softsurve\.com|192\.168\.[0-9]+\.[0-9]+|\bjbot\b|dlockamy/(vault|agents|skills|context)|lockamy-studios/' -- . ':!deny.toml' ':!.github/workflows/ci.yml'; then echo "internal reference found"; exit 1; fi
