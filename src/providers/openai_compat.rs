@@ -46,6 +46,14 @@ pub struct OpenAiCompatConfig {
     pub credential_name: Option<String>,
     pub default_max_tokens: u32,
     pub timeout: Duration,
+    /// The context, in tokens per request, that the server was started with, if known. When set, a reply whose reported prompt length is
+    /// about half of it is refused as `ContextOverflow` (see [`looks_cut_to_half`]). **When `None` the adapter cannot tell a cut prompt
+    /// from a short one**, so a server that truncates silently (Ollama does, at a default of 4,096 tokens) is unguarded: set this for
+    /// any such server. Seen with Ollama 0.35.1 and 0.40.13 on Linux, Windows and macOS.
+    ///
+    /// **API note:** adding this public field breaks code that builds `OpenAiCompatConfig` with a struct literal. Start from
+    /// `OpenAiCompatConfig::ollama(..)` and assign the fields you need.
+    pub context_tokens: Option<u32>,
 }
 
 impl OpenAiCompatConfig {
@@ -60,6 +68,7 @@ impl OpenAiCompatConfig {
             credential_name: None,
             default_max_tokens: 1024,
             timeout: Duration::from_secs(300),
+            context_tokens: None,
         }
     }
 }
@@ -99,6 +108,23 @@ fn host_of(url: &str) -> Option<String> {
         authority.split(':').next()?
     };
     (!host.is_empty()).then(|| host.to_string())
+}
+
+/// More bytes per token than any ordinary text has. A prompt with fewer bytes than `reported_tokens * this` could honestly have been that
+/// many tokens; one with more could not have been that short.
+const MAX_PLAUSIBLE_BYTES_PER_TOKEN: u64 = 8;
+
+/// True if a reported prompt length is the signature of a prompt silently cut to about half the context: Ollama's llama.cpp runner runs
+/// with context shift on, keeps roughly `ctx / 2` tokens (2,050 for 4,096) and answers normally. Seen on Linux, Windows and macOS with
+/// Ollama 0.35.1 and 0.40.13. Two conditions must both hold, so an honest prompt is not refused just because its length happens to be
+/// near half the context: the reported length is within a narrow window of `ctx / 2`, **and** the prompt that was sent is too long, in
+/// bytes, to have honestly been that short. A cut that lands outside the window is not caught, which is why the field that enables this
+/// is documented as a partial guard, not a proof.
+fn looks_cut_to_half(prompt_tokens: u64, context_tokens: u32, prompt_bytes: u64) -> bool {
+    let half = u64::from(context_tokens) / 2;
+    prompt_tokens >= 256
+        && prompt_tokens.abs_diff(half) <= 16
+        && prompt_bytes / MAX_PLAUSIBLE_BYTES_PER_TOKEN > prompt_tokens
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -329,6 +355,12 @@ impl OpenAiCompatAdapter {
             } else {
                 // no usage in a billed reply: charge the worst case, never zero
                 b.ledger.settle_reserved(r);
+            }
+        }
+        // A server that cuts an over-long prompt and answers anyway (Ollama) reports the CUT length. Refuse, after any spend is settled above.
+        if let Some(ctx) = self.cfg.context_tokens {
+            if looks_cut_to_half(usage.input_tokens, ctx, p.prompt.len() as u64) {
+                return Err(ProviderError::ContextOverflow);
             }
         }
         let choice = &resp["choices"][0];
@@ -564,6 +596,76 @@ mod tests {
             Output::Text(t) => t.completion.clone(),
             o => panic!("{o:?}"),
         }
+    }
+
+    fn chat_reporting(prompt_tokens: u64) -> Value {
+        json!({"id":"c1","model":"test-model:served","choices":[{"index":0,"message":{"role":"assistant","content":"an answer"},"finish_reason":"stop"}],
+               "usage":{"prompt_tokens":prompt_tokens,"completion_tokens":3}})
+    }
+
+    /// About 32 KB: too long, in bytes, to honestly be only about 2,050 tokens.
+    fn long_prompt() -> String {
+        "The household notes were filed under their own heading. ".repeat(600)
+    }
+
+    /// An honest prompt whose real length happens to be about half the context must still be answered: it is short in bytes, so it could
+    /// honestly have been that many tokens.
+    #[tokio::test]
+    async fn an_honest_prompt_that_is_about_half_the_context_is_an_answer() {
+        let s = MockServer::start().await;
+        serve(&s, 200, chat_reporting(2050)).await;
+        let mut c = cfg(&s);
+        c.context_tokens = Some(4096);
+        let a = OpenAiCompatAdapter::new(c, None, None).unwrap();
+        let honest = "word ".repeat(1600); // 8,000 bytes: could well be 2,050 tokens
+        let r = a
+            .call(&text(&honest))
+            .await
+            .expect("an honest prompt was refused");
+        assert_eq!(out(&r), "an answer");
+    }
+
+    /// Ollama keeps about half the context of an over-long prompt, answers normally (finish "stop") and reports the CUT prompt length:
+    /// 2,050 for a 4,096 context, on every platform and version tried (2026-11-21). The locked rule is that overflow is a hard error.
+    #[tokio::test]
+    async fn a_prompt_cut_to_about_half_the_declared_context_is_an_overflow_not_an_answer() {
+        for reported in [2048u64, 2050, 2040, 2060] {
+            let s = MockServer::start().await;
+            serve(&s, 200, chat_reporting(reported)).await;
+            let mut c = cfg(&s);
+            c.context_tokens = Some(4096);
+            let a = OpenAiCompatAdapter::new(c, None, None).unwrap();
+            let got = a.call(&text(&long_prompt())).await;
+            assert!(
+                matches!(got, Err(ProviderError::ContextOverflow)),
+                "{reported} prompt tokens against a 4096 context must be refused, got {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_prompt_lengths_are_answers_even_with_a_declared_context() {
+        for reported in [7u64, 300, 511, 1500, 1900, 2100, 2500, 3900, 4096] {
+            let s = MockServer::start().await;
+            serve(&s, 200, chat_reporting(reported)).await;
+            let mut c = cfg(&s);
+            c.context_tokens = Some(4096);
+            let a = OpenAiCompatAdapter::new(c, None, None).unwrap();
+            let r = a
+                .call(&text("hi"))
+                .await
+                .unwrap_or_else(|e| panic!("{reported} tokens was refused: {e:?}"));
+            assert_eq!(out(&r), "an answer");
+        }
+    }
+
+    /// The limit stated in the field's documentation, as a test: with no declared context nothing can be told, so nothing is refused.
+    #[tokio::test]
+    async fn without_a_declared_context_a_cut_prompt_cannot_be_told_from_a_short_one() {
+        let s = MockServer::start().await;
+        serve(&s, 200, chat_reporting(2050)).await;
+        let a = OpenAiCompatAdapter::new(cfg(&s), None, None).unwrap();
+        assert!(a.call(&text(&long_prompt())).await.is_ok());
     }
 
     #[tokio::test]
@@ -957,6 +1059,44 @@ mod tests {
             "capacity is not in this endpoint, so it is unknown, not assumed"
         );
         assert!(a.health().await);
+    }
+
+    /// Against a REAL local Ollama started with a 4,096-token context (its default). A prompt of roughly 6,000 tokens is silently cut to
+    /// about 2,050 and answered normally; with the context declared the adapter must refuse it, and a short prompt must still be answered.
+    /// `AI_KIT_OLLAMA_MODEL` (default `qwen2.5:7b`) must be installed; `AI_KIT_OLLAMA_CTX` is the context the server runs with (default 4096).
+    #[tokio::test]
+    #[ignore = "needs a running Ollama with the model installed"]
+    async fn a_real_ollama_cut_prompt_is_refused_when_the_context_is_declared() {
+        let model = std::env::var("AI_KIT_OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".into());
+        let url =
+            std::env::var("AI_KIT_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+        let ctx: u32 = std::env::var("AI_KIT_OLLAMA_CTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let mut c = OpenAiCompatConfig::ollama(&model);
+        c.base_url = url;
+        c.context_tokens = Some(ctx);
+        let a = OpenAiCompatAdapter::new(c, None, None).unwrap();
+        assert!(a.health().await, "Ollama is not answering");
+        let r = a
+            .call(&text("Reply with exactly the single word: pong"))
+            .await
+            .unwrap();
+        println!("short prompt answered: {:?}", out(&r));
+        // about 1.3 tokens per word: enough words to be well over the context
+        let long = "The household notes were filed under their own heading. "
+            .repeat(u64::from(ctx) as usize / 8 * 2);
+        let got = a.call(&text(&long)).await;
+        println!(
+            "long prompt ({} bytes): {:?}",
+            long.len(),
+            got.as_ref().map(out)
+        );
+        assert!(
+            matches!(got, Err(ProviderError::ContextOverflow)),
+            "an over-long prompt must be refused, not answered"
+        );
     }
 
     /// Against a REAL local Ollama. `AI_KIT_OLLAMA_MODEL` (default `qwen2.5:7b`) must be installed.
