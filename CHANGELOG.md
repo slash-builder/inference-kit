@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The `exec` verifier (`ai-kit-cli route --verify exec`, `candle` feature) writes the model's script to a fresh private directory (0700, file 0600, removed on every exit path) instead of a predictable path in the shared temp directory, which a pre-planted symlink could redirect. It still runs model-generated code unsandboxed with the caller's privileges.
 - Candle 0.9.2 -> **0.11** (verified: KV isolation A/B/A on CPU and CUDA, real-weights multimodal tests).
 - `AiKitError::to_error_code()` is **deprecated**: its numbers (20-24, 13, 90) collide with the fabric `ErrorCode` space (a remote peer could trigger an ops alert). Use `to_inference_error_code()`.
 - The router keeps the original typed error when a call fails (an out-of-memory error used to become `Internal`).

@@ -509,6 +509,17 @@ fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     b.create(dir)
 }
 
+/// Removes a scratch directory (and what is in it) when dropped, so no exit path of the verifier can leave it behind.
+#[cfg(feature = "candle")]
+struct ScratchDir(std::path::PathBuf);
+
+#[cfg(feature = "candle")]
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Write `contents` to a new file `name` in `dir`: created exclusively (it must not already exist), mode 0600 on Unix.
 #[cfg(feature = "candle")]
 fn write_private_file(
@@ -543,11 +554,12 @@ fn exec_verifier(tests: String) -> ai_kit::Verifier {
             Some(b) => b.strip_prefix("python").unwrap_or(b).to_string(),
             None => out.to_string(),
         };
-        let Ok(dir) = private_scratch_dir(&std::env::temp_dir()) else {
+        // The guard removes the directory on every exit path: pass, fail, timeout, a failed write or a failed spawn.
+        let Ok(dir) = private_scratch_dir(&std::env::temp_dir()).map(ScratchDir) else {
             return false;
         };
-        let Ok(path) = write_private_file(&dir, "verify.py", &format!("{code}\n{tests}\n")) else {
-            let _ = std::fs::remove_dir_all(&dir);
+        let Ok(path) = write_private_file(&dir.0, "verify.py", &format!("{code}\n{tests}\n"))
+        else {
             return false;
         };
         let Ok(mut child) = std::process::Command::new("python3")
@@ -559,20 +571,21 @@ fn exec_verifier(tests: String) -> ai_kit::Verifier {
             return false;
         };
         let start = std::time::Instant::now();
-        let ok = loop {
+        loop {
             match child.try_wait() {
                 Ok(Some(st)) => break st.success(),
                 Ok(None) if start.elapsed().as_secs() < 10 => {
                     std::thread::sleep(std::time::Duration::from_millis(20))
                 }
                 _ => {
+                    // Kill, then reap so the child is not left as a zombie. Only the direct child is killed: a process it
+                    // started (a shell-out, a fork) is not, and keeps running. Not fixed here; see the PR description.
                     let _ = child.kill();
+                    let _ = child.wait();
                     break false;
                 }
             }
-        };
-        let _ = std::fs::remove_dir_all(&dir);
-        ok
+        }
     }))
 }
 
@@ -1176,14 +1189,158 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
     }
 
-    #[test]
-    fn the_exec_verifier_passes_and_fails_on_the_exit_code() {
-        let v = exec_verifier("assert add(1, 2) == 3".to_string());
-        let ai_kit::Verifier::Custom(f) = v else {
+    /// The tests below change `TMPDIR` and `PATH`, which are process-wide, so every test in this module holds this lock (a test
+    /// that only called `tempfile::tempdir()` while another had `TMPDIR` pointed at its own directory would land inside it).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds the lock, and puts `TMPDIR` / `PATH` back on drop.
+    struct Env {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        tmpdir: Option<std::ffi::OsString>,
+        path: Option<std::ffi::OsString>,
+    }
+
+    impl Env {
+        fn lock() -> Env {
+            Env {
+                _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+                tmpdir: std::env::var_os("TMPDIR"),
+                path: std::env::var_os("PATH"),
+            }
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            for (k, v) in [("TMPDIR", &self.tmpdir), ("PATH", &self.path)] {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn python3_on_path() -> bool {
+        std::process::Command::new("python3")
+            .arg("-c")
+            .arg("pass")
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// True (after saying so) when the test cannot run because there is no `python3`.
+    fn skip_without_python3(test: &str) -> bool {
+        let missing = !python3_on_path();
+        if missing {
+            eprintln!("skipping {test}: python3 is not on PATH");
+        }
+        missing
+    }
+
+    fn run_exec(tests: &str, out: &str) -> bool {
+        let ai_kit::Verifier::Custom(f) = exec_verifier(tests.to_string()) else {
             panic!("exec is a custom verifier")
         };
-        assert!(f("```python\ndef add(a, b):\n    return a + b\n```"));
-        assert!(!f("```python\ndef add(a, b):\n    return a - b\n```"));
+        f(out)
+    }
+
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn the_exec_verifier_passes_and_fails_on_the_exit_code() {
+        let _env = Env::lock();
+        if skip_without_python3("the_exec_verifier_passes_and_fails_on_the_exit_code") {
+            return;
+        }
+        let tests = "assert add(1, 2) == 3";
+        assert!(run_exec(
+            tests,
+            "```python\ndef add(a, b):\n    return a + b\n```"
+        ));
+        assert!(!run_exec(
+            tests,
+            "```python\ndef add(a, b):\n    return a - b\n```"
+        ));
+    }
+
+    /// Goes through `exec_verifier` itself: a symlink planted at the old, predictable script path must not be followed, and the
+    /// run must leave nothing behind in the temp directory.
+    #[test]
+    fn the_exec_verifier_does_not_follow_a_planted_symlink_and_cleans_up() {
+        let env = Env::lock();
+        if skip_without_python3("the_exec_verifier_does_not_follow_a_planted_symlink_and_cleans_up")
+        {
+            return;
+        }
+        let victim_dir = tempfile::tempdir().unwrap();
+        let victim = victim_dir.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // where the previous implementation wrote: `<temp_dir>/ak-verify-<pid>.py`
+        let old_path = tmp
+            .path()
+            .join(format!("ak-verify-{}.py", std::process::id()));
+        symlink(&victim, &old_path).unwrap();
+        std::env::set_var("TMPDIR", tmp.path());
+
+        assert!(run_exec(
+            "assert add(1, 2) == 3",
+            "def add(a, b):\n    return a + b"
+        ));
+
+        drop(env);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        // only the planted link is left: no scratch directory, no script
+        assert_eq!(
+            entries(tmp.path()),
+            vec![old_path.file_name().unwrap().to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn the_scratch_directory_is_removed_when_the_interpreter_cannot_be_spawned() {
+        let env = Env::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_path = tempfile::tempdir().unwrap();
+        std::env::set_var("TMPDIR", tmp.path());
+        std::env::set_var("PATH", empty_path.path());
+
+        // no python3 on this PATH, so the spawn fails; that must be a plain `false` and leave nothing behind
+        assert!(!run_exec("pass", "x = 1"));
+
+        drop(env);
+        assert!(
+            entries(tmp.path()).is_empty(),
+            "left: {:?}",
+            entries(tmp.path())
+        );
+    }
+
+    #[test]
+    fn the_scratch_directory_is_removed_after_a_failing_run() {
+        let env = Env::lock();
+        if skip_without_python3("the_scratch_directory_is_removed_after_a_failing_run") {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("TMPDIR", tmp.path());
+
+        assert!(!run_exec("assert False", "x = 1"));
+
+        drop(env);
+        assert!(
+            entries(tmp.path()).is_empty(),
+            "left: {:?}",
+            entries(tmp.path())
+        );
     }
 
     #[test]
