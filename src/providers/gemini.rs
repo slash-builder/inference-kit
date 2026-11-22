@@ -127,7 +127,7 @@ impl GeminiAdapter {
         let resp = self
             .http
             .get(self.url("/v1beta/models"))
-            .header("x-goog-api-key", key)
+            .header("x-goog-api-key", super::sensitive_header_value(&key)?)
             .send()
             .await
             .map_err(transport_error)?;
@@ -148,7 +148,7 @@ impl GeminiAdapter {
         let resp = self
             .http
             .post(self.url(path))
-            .header("x-goog-api-key", key)
+            .header("x-goog-api-key", super::sensitive_header_value(&key)?)
             .header("content-type", "application/json")
             .body(bytes)
             .send()

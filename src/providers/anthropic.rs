@@ -114,7 +114,7 @@ impl AnthropicAdapter {
         let resp = self
             .http
             .get(self.url("/v1/models"))
-            .header("x-api-key", key.expose())
+            .header("x-api-key", super::sensitive_header_value(key.expose())?)
             .header("anthropic-version", API_VERSION)
             .send()
             .await
@@ -244,6 +244,8 @@ impl ProviderAdapter for AnthropicAdapter {
             .creds
             .get(&self.cfg.credential_name)
             .map_err(|_| ProviderError::Auth)?;
+        // built before the reservation so a key that is not a valid header value leaves nothing reserved
+        let key_header = super::sensitive_header_value(key.expose())?;
         let max_tokens = if p.max_tokens == 0 {
             self.cfg.default_max_tokens
         } else {
@@ -267,7 +269,7 @@ impl ProviderAdapter for AnthropicAdapter {
         let sent = self
             .http
             .post(self.url("/v1/messages"))
-            .header("x-api-key", key.expose())
+            .header("x-api-key", key_header)
             .header("anthropic-version", API_VERSION)
             .header("content-type", "application/json")
             .body(bytes)

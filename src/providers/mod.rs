@@ -51,6 +51,19 @@ pub struct Budget {
     pub pricing: Pricing,
 }
 
+/// An API-key header value marked sensitive, so `{:?}` of the request's header map prints `Sensitive` instead of the key. (reqwest's
+/// `bearer_auth` already does this for `Authorization`; the vendors that use a custom key header need it done by hand.) A key that is
+/// not a valid header value is an authentication failure, and the key is not in the error.
+#[cfg(any(feature = "provider-anthropic", feature = "provider-gemini"))]
+pub(crate) fn sensitive_header_value(
+    secret: &str,
+) -> Result<reqwest::header::HeaderValue, crate::provider::ProviderError> {
+    let mut v = reqwest::header::HeaderValue::from_str(secret)
+        .map_err(|_| crate::provider::ProviderError::Auth)?;
+    v.set_sensitive(true);
+    Ok(v)
+}
+
 #[cfg(feature = "provider-anthropic")]
 pub mod anthropic;
 #[cfg(feature = "provider-gemini")]
@@ -60,3 +73,31 @@ pub mod openai_compat;
 
 #[cfg(test)]
 mod conformance_tests;
+
+#[cfg(all(test, any(feature = "provider-anthropic", feature = "provider-gemini")))]
+mod header_tests {
+    use super::sensitive_header_value;
+
+    #[test]
+    fn an_api_key_header_is_sensitive_and_does_not_show_in_debug_output() {
+        const KEY: &str = "sk-TEST-ONLY-header-key";
+        let req = reqwest::Client::new()
+            .get("http://127.0.0.1:9/")
+            .header("x-api-key", sensitive_header_value(KEY).unwrap())
+            .build()
+            .unwrap();
+        let shown = format!("{:?} {:?}", req.headers(), req);
+        assert!(!shown.contains(KEY), "{shown}");
+        assert!(shown.contains("Sensitive"), "{shown}");
+        // it is still the real value on the wire
+        let v = req.headers().get("x-api-key").unwrap();
+        assert!(v.is_sensitive());
+        assert_eq!(v.to_str().unwrap(), KEY);
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_valid_header_value_is_an_auth_error_without_the_key() {
+        let e = sensitive_header_value("bad\nkey").unwrap_err();
+        assert_eq!(e, crate::provider::ProviderError::Auth);
+    }
+}
