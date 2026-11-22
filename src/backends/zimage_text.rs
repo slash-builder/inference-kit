@@ -106,7 +106,16 @@ pub(crate) fn encode_streaming(
 ) -> Result<Tensor> {
     let cfg = TextEncoderConfig::z_image();
     let l = ids.len();
-    // SAFETY: the shards were BLAKE3-verified immediately before and are not modified while mapped.
+    // Called once per request, long after `load_model` hashed the shards: re-check each is still the file that was hashed.
+    for shard in shards {
+        crate::backends::common::ensure_unchanged(shard)
+            .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+    }
+    // SAFETY: `from_mmaped_safetensors` is unsafe because behaviour is undefined if a mapped file is modified while mapped. The invariants
+    // relied on: (1) each shard is the file `verify_model_files` hashed against the catalog at load; checked by the `ensure_unchanged`
+    // loop above (size, mtime, device and inode), not re-hashed per request; (2) nothing with write access to the model directory
+    // modifies a shard while it is mapped. (2) is not enforced here: models are immutable OS resources and the directory is not
+    // writable by other principals. Both mappings live only for this call.
     let on_cpu = unsafe { VarBuilder::from_mmaped_safetensors(shards, dtype, &Device::Cpu)? };
     let on_dev = unsafe { VarBuilder::from_mmaped_safetensors(shards, dtype, device)? };
 

@@ -94,6 +94,11 @@ impl CandleEmbeddingService {
                 ..Default::default()
             }))
             .map_err(|e| fail(format!("tokenizer: {e}")))?;
+        // SAFETY: `from_mmaped_safetensors` is unsafe because behaviour is undefined if the mapped file is modified while mapped. Relied
+        // on: (1) `weights` is the file `verify_model_files` hashed against the catalog a few lines above, in this same call, and it is
+        // mapped straight away; (2) nothing with write access to the model directory modifies it while the model is loaded. (2) is not
+        // enforced here: models are immutable OS resources and the directory is not writable by other principals. Unlike the Z-Image
+        // path the mapping is kept for the life of the loaded model, so a later swap is not re-checked.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device) }
             .map_err(|e| fail(format!("weights: {e}")))?;
         let bert = BertModel::load(vb, &config).map_err(|e| fail(format!("model: {e}")))?;

@@ -83,6 +83,14 @@ fn internal(what: &str, e: impl std::fmt::Display) -> AiKitError {
 
 impl ZImagePipeline {
     pub(crate) fn new(files: ZImageFiles, device: Device) -> Self {
+        // fixtures point at local reference weights that did not go through a catalog entry: trust their current state
+        #[cfg(test)]
+        for f in std::iter::once(&files.gguf)
+            .chain(&files.text_encoder_shards)
+            .chain(std::iter::once(&files.vae))
+        {
+            crate::backends::common::trust_for_test(f);
+        }
         // bf16 is what the model is trained and distributed in; every CUDA card the kit targets (sm_80+) has it.
         let dtype = if device.is_cuda() {
             DType::BF16
@@ -182,7 +190,8 @@ impl ZImagePipeline {
             .iter()
             .map(String::as_str)
             .collect();
-        // SAFETY: verified before; not modified while mapped.
+        // SAFETY (test only): maps the developer's local reference weights, which nothing modifies during the run. Production code maps
+        // through `encode_streaming` and `decode`, which re-check the file first.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, self.dtype, &self.device) }
             .map_err(|e| internal("text encoder weights", e))?;
         let te = ZImageTextEncoder::new(&TextEncoderConfig::z_image(), vb)
@@ -278,7 +287,14 @@ impl ZImagePipeline {
     // ------------------------------------------------------------------ phase 3: VAE
 
     fn decode(&self, latents: &Tensor) -> Result<Vec<u8>> {
-        // SAFETY: verified immediately before; not modified while mapped.
+        // Called once per request, long after `load_model` hashed the file: re-check it is still that file before mapping it.
+        crate::backends::common::ensure_unchanged(&self.files.vae)?;
+        // SAFETY: `from_mmaped_safetensors` is unsafe because behaviour is undefined if the mapped file is modified while mapped. The
+        // invariants relied on: (1) the file at this path is the one `verify_model_files` hashed against the catalog at load; that is
+        // checked by the `ensure_unchanged` call above (size, mtime, device and inode, so a swap or rewrite since load is refused) and
+        // is NOT re-hashed per request; (2) nothing with write access to the model directory modifies it while it is mapped. (2) is not
+        // enforced here: models are immutable OS resources and the directory is not writable by other principals. The mapping lives only
+        // for this call.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
                 &[self.files.vae.as_str()],
@@ -419,6 +435,8 @@ struct Weights {
 
 impl Weights {
     fn open(gguf: &str, device: &Device, dtype: DType) -> Result<Self> {
+        // re-opened per request (read, not mapped): refuse a file that is not the one hashed at load
+        crate::backends::common::ensure_unchanged(gguf)?;
         let mut file = std::fs::File::open(gguf)?;
         let content =
             gguf_file::Content::read(&mut file).map_err(|e| internal("gguf header", e))?;
@@ -1133,6 +1151,7 @@ mod tests {
             .unwrap()
             .to_dtype(pipe.dtype)
             .unwrap(); // 1x16x64x64
+                       // SAFETY (test only): maps the developer's local reference weights, which nothing modifies during the run.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[pipe.files.vae.as_str()], pipe.dtype, &device)
         }

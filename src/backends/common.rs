@@ -73,6 +73,86 @@ pub(crate) fn hash_file(path: &str) -> Result<String> {
     Ok(h.finalize().to_hex().to_string())
 }
 
+/// What identifies a file on disk without reading it: size, modification time and (on Unix) device and inode. A file replaced by
+/// rename gets a new inode; one rewritten in place changes its size or mtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev_ino: (u64, u64),
+}
+
+fn stamp_of(path: &str) -> std::io::Result<FileStamp> {
+    let m = std::fs::metadata(path)?;
+    Ok(FileStamp {
+        len: m.len(),
+        mtime: m.modified().ok(),
+        #[cfg(unix)]
+        dev_ino: {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        },
+    })
+}
+
+/// The files this process has hashed against the catalog, with the stamp they had while hashed.
+fn verified() -> &'static std::sync::Mutex<std::collections::HashMap<String, FileStamp>> {
+    static V: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, FileStamp>>> =
+        std::sync::OnceLock::new();
+    V.get_or_init(Default::default)
+}
+
+/// BLAKE3 of a file; when it equals `expected`, also record that this is the content that was hashed. Fails if the file changed while it
+/// was being hashed.
+#[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
+fn hash_and_record(path: &str, expected: &str) -> Result<String> {
+    let before = stamp_of(path)?;
+    let actual = hash_file(path)?;
+    if stamp_of(path)? != before {
+        return Err(AiKitError::Internal {
+            reason: format!("model file changed while it was being verified: {path}"),
+        });
+    }
+    if actual == expected {
+        if let Ok(mut v) = verified().lock() {
+            v.insert(path.to_string(), before);
+        }
+    }
+    Ok(actual)
+}
+
+/// Check, immediately before a file is memory-mapped or opened for weights, that it is still the file [`verify_model_files`] hashed:
+/// same size, modification time, device and inode as when it was hashed. A file that was never verified in this process is refused.
+///
+/// What this does and does not give you. It detects a file replaced or rewritten **after** load (the files are re-opened per request),
+/// without re-hashing gigabytes each time. It does not make a mapping safe: a mapped file that is modified while mapped is still
+/// undefined behaviour, and a writer who can also reset the modification time can defeat the stamp. The remaining assumption, stated
+/// at each `unsafe` site, is that nothing with write access to the model directory touches a mapped file; models are immutable OS
+/// resources and the directory is not writable by other principals.
+#[cfg_attr(not(feature = "image"), allow(dead_code))]
+pub(crate) fn ensure_unchanged(path: &str) -> Result<()> {
+    let recorded = verified().lock().ok().and_then(|v| v.get(path).copied());
+    match (recorded, stamp_of(path)) {
+        (Some(was), Ok(now)) if was == now => Ok(()),
+        (Some(_), _) => Err(AiKitError::Internal {
+            reason: format!("model file changed since it was verified: {path}"),
+        }),
+        (None, _) => Err(AiKitError::Internal {
+            reason: format!("model file was never verified in this process: {path}"),
+        }),
+    }
+}
+
+/// Test fixtures point at weights that were not verified through a catalog entry: record their current stamp as the trusted one.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn trust_for_test(path: &str) {
+    if let (Ok(st), Ok(mut v)) = (stamp_of(path), verified().lock()) {
+        v.insert(path.to_string(), st);
+    }
+}
+
 #[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
 /// Verify the main file and every extra file of a model against the catalog's hashes. Returns the main file's path.
 pub(crate) fn verify_model_files(model: &ModelMetadata) -> Result<String> {
@@ -86,7 +166,7 @@ pub(crate) fn verify_model_files(model: &ModelMetadata) -> Result<String> {
             .map(|f| (strip(&f.location), f.hash.clone())),
     );
     for (path, expected) in checks {
-        let actual = hash_file(&path)?;
+        let actual = hash_and_record(&path, &expected)?;
         if actual != expected {
             return Err(AiKitError::IntegrityCheckFailed {
                 model_id: model.id.clone(),
@@ -281,6 +361,56 @@ mod tests {
             },
             files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_file_replaced_after_verification_is_refused_before_it_is_mapped() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("w.safetensors");
+        std::fs::write(&path, b"the weights").unwrap();
+        let p = path.to_str().unwrap();
+        let mut m = model(1, 1);
+        m.location = format!("file://{p}");
+        m.hash = blake3::hash(b"the weights").to_hex().to_string();
+
+        assert!(
+            ensure_unchanged(p).is_err(),
+            "a file nobody verified is not trusted"
+        );
+        verify_model_files(&m).unwrap();
+        ensure_unchanged(p).expect("unchanged since verified");
+
+        // swapped by rename (new inode), same size
+        let other = d.path().join("other");
+        std::fs::write(&other, b"evil weights").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert!(ensure_unchanged(p).is_err(), "replaced file");
+
+        // re-verifying the new content (the catalog would not match, so use its hash) trusts it again
+        m.hash = blake3::hash(b"evil weights").to_hex().to_string();
+        verify_model_files(&m).unwrap();
+        ensure_unchanged(p).unwrap();
+        // rewritten in place, different size
+        std::fs::write(&path, b"longer replacement bytes").unwrap();
+        assert!(ensure_unchanged(p).is_err(), "rewritten file");
+    }
+
+    #[test]
+    fn a_wrong_hash_is_still_an_integrity_failure_and_records_nothing_it_trusts() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("w2.safetensors");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut m = model(1, 1);
+        m.location = format!("file://{}", path.to_str().unwrap());
+        m.hash = "0".into();
+        assert!(matches!(
+            verify_model_files(&m),
+            Err(AiKitError::IntegrityCheckFailed { .. })
+        ));
+        assert!(
+            ensure_unchanged(path.to_str().unwrap()).is_err(),
+            "a file whose hash did not match is never trusted"
+        );
     }
 
     #[test]
