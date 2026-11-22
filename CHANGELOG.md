@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Egress: class names are compared in one canonical form (ASCII-trimmed, lower-cased; letters, digits and `_ - . : /` only) inside `Policy::decide`, so a deny rule for `health` also denies `Health` and `health `. A class name outside that charset is refused, not rewritten, and fails closed (held back from every provider that leaves the home; in a deny rule it matches every class; in an allow rule it covers nothing). Any class with a `credentials` segment (`credentials.wifi`, `credentials/api`, `credentials-`) is held back like `credentials`. **Behaviour change:** a non-ASCII class name such as `santé` can no longer be sent to a remote provider.
+
 ### Changed
 - Candle 0.9.2 -> **0.11** (verified: KV isolation A/B/A on CPU and CUDA, real-weights multimodal tests).
 - `AiKitError::to_error_code()` is **deprecated**: its numbers (20-24, 13, 90) collide with the fabric `ErrorCode` space (a remote peer could trigger an ops alert). Use `to_inference_error_code()`.
