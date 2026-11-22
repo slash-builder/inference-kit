@@ -491,7 +491,12 @@ models:
             "MIT",
             "BSD-3-Clause",
             "ISC",
-            "MPL-2.0",
+            "MIT License",
+            "Apache License 2.0",
+            "BSD 3-Clause License",
+            "Apache-2.0 OR MIT",
+            "CC-BY-3.0",
+            "Apache-2.0-or-later",
             "CC0-1.0",
             "Unlicense",
         ] {
@@ -506,6 +511,13 @@ models:
             Some("proprietary"),
             Some("custom licence v3"),
             Some("see LICENSE file"),
+            // deliberately not recognised as permissive: copyleft, RAIL and community licences are refused by default and a
+            // catalog author vouches for them with `commercial_use: "true"`
+            Some("GPL-3.0"),
+            Some("LGPL-2.1"),
+            Some("MPL-2.0"),
+            Some("openrail++"),
+            Some("CreativeML OpenRAIL-M"),
         ] {
             assert_eq!(with_licence(l).licence_class(), Unknown, "{l:?}");
         }
@@ -514,6 +526,64 @@ models:
             with_licence(Some("Apache-2.0 (Lancaster fork)")).licence_class(),
             crate::types::LicenceClass::NonCommercial
         );
+    }
+
+    #[test]
+    fn a_release_descriptor_does_not_make_a_permissive_licence_non_commercial() {
+        use crate::types::LicenceClass::{Commercial, NonCommercial};
+        assert_eq!(
+            with_licence(Some("Apache-2.0 (research preview)")).licence_class(),
+            Commercial
+        );
+        assert_eq!(
+            with_licence(Some("MIT personal fork")).licence_class(),
+            Commercial
+        );
+        assert_eq!(
+            with_licence(Some("MIT research")).licence_class(),
+            NonCommercial
+        );
+    }
+
+    #[test]
+    fn every_non_commercial_phrasing_fails_closed_even_with_commercial_use_true() {
+        use crate::types::LicenceClass::NonCommercial;
+        for l in [
+            "Not for commercial use",
+            "Commercial use prohibited",
+            "Free for non-profit use",
+            "Nicht kommerziell",
+            "No commercial use",
+            "Not commercial",
+            "non commercial",
+            "Research use only",
+            "CC-BY-NC-4.0",
+            "Apache-2.0 for personal use",
+        ] {
+            let mut m = with_licence(Some(l));
+            assert_eq!(m.licence_class(), NonCommercial, "{l}");
+            m.metadata
+                .custom
+                .insert("commercial_use".into(), "true".into());
+            assert_eq!(
+                m.licence_class(),
+                NonCommercial,
+                "{l}: a contradicting commercial_use must not open it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_licence_is_refused_until_the_catalog_vouches_for_it() {
+        use crate::types::LicenceClass::{Commercial, Unknown};
+        for l in ["GPL-3.0", "openrail++", "CreativeML OpenRAIL-M"] {
+            let mut m = with_licence(Some(l));
+            assert_eq!(m.licence_class(), Unknown, "{l}");
+            m.metadata
+                .custom
+                .insert("commercial_use".into(), "true".into());
+            assert_eq!(m.licence_class(), Commercial, "{l} once vouched for");
+        }
     }
 
     #[test]

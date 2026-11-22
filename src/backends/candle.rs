@@ -435,6 +435,9 @@ impl InferenceService for CandleInferenceService {
                 reason: "loaded-model lock poisoned".to_string(),
             })?
             .remove(model_id);
+        // `model_meta` fails for an id that is not in the catalog and, on a commercial-only service, for a model refused for its licence.
+        // Neither can have been loaded or cached, so there is nothing to evict and the error is deliberately ignored: unloading stays
+        // idempotent and never reports a licence refusal for something that is not there.
         if let Ok(model) = self.model_meta(model_id) {
             let mut cache = self.model_cache.lock().map_err(|_| AiKitError::Internal {
                 reason: "model-cache lock poisoned".to_string(),
@@ -497,4 +500,74 @@ fn end_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
     .iter()
     .filter_map(|t| tokenizer.token_to_id(t))
     .collect()
+}
+
+#[cfg(test)]
+mod licence_tests {
+    use super::*;
+
+    /// A one-model catalog on disk. The file the entry points at does not exist, so any load that gets past the licence check fails
+    /// with something else, which is how these tests tell "refused for the licence" from "got as far as the weights".
+    fn catalog(license: &str) -> (tempfile::TempDir, String) {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("catalog.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"version: "1.0"
+models:
+  - id: "m"
+    version: "1.0.0"
+    os_arch: ["x86_64"]
+    quantization_variants: ["q4"]
+    default_quantization: "q4"
+    hash: "blake3-abcd1234"
+    size_bytes: 1
+    location: "file:///does-not-exist"
+    metadata:
+      parameters: 1
+      context_window: 1
+      vram_required_mb: 1
+      inference_latency_ms: 1
+      custom:
+        license: "{license}"
+"#
+            ),
+        )
+        .unwrap();
+        let p = path.to_str().unwrap().to_string();
+        (d, p)
+    }
+
+    fn refused_for_licence<T: std::fmt::Debug>(r: Result<T>) -> bool {
+        matches!(r, Err(AiKitError::ModelLoadFailed { reason, .. }) if reason.contains("licence"))
+    }
+
+    #[tokio::test]
+    async fn a_commercial_only_service_refuses_a_model_that_is_not_known_to_permit_commercial_use()
+    {
+        for l in ["CC-BY-NC-4.0", "GPL-3.0", ""] {
+            let (_d, path) = catalog(l);
+            let svc = CandleInferenceService::with_device(&path, DevicePreference::Cpu)
+                .unwrap()
+                .with_commercial_only();
+            assert!(refused_for_licence(svc.load_model("m").await), "{l:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_commercial_only_the_licence_does_not_stop_a_load_and_a_permissive_model_passes_it(
+    ) {
+        let (_d, path) = catalog("CC-BY-NC-4.0");
+        let svc = CandleInferenceService::with_device(&path, DevicePreference::Cpu).unwrap();
+        assert!(
+            !refused_for_licence(svc.load_model("m").await),
+            "the library default is unchanged: no licence check"
+        );
+        let (_d, path) = catalog("Apache-2.0");
+        let svc = CandleInferenceService::with_device(&path, DevicePreference::Cpu)
+            .unwrap()
+            .with_commercial_only();
+        assert!(!refused_for_licence(svc.load_model("m").await));
+    }
 }

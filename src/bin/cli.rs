@@ -47,15 +47,15 @@ fn eprint_usage() {
     eprintln!("Usage:");
     eprintln!("  ai-kit-cli hash <path>");
     eprintln!(
-        "  ai-kit-cli infer --model <id> --prompt <text> [--temperature F] [--top-p F] [--max-tokens N] [--session-id S] [--device cpu|auto|cuda|cuda:N]"
+        "  ai-kit-cli infer --model <id> --prompt <text> [--temperature F] [--top-p F] [--max-tokens N] [--session-id S] [--allow-noncommercial] [--device cpu|auto|cuda|cuda:N]"
     );
     eprintln!("  ai-kit-cli cache-stats [--catalog <path>]");
     eprintln!("  ai-kit-cli devices");
     eprintln!("  ai-kit-cli route (--prompt <text> | --prompt-file <path> | --batch <jsonl>) [--explain] [--class C] [--privacy private|shareable]");
-    eprintln!("                   [--verify none|nonempty|json|svg|exec|maxwords:N]  (exec runs model-generated python UNSANDBOXED) [--local-model <id>] [--device D] [--cloud-cmd <shell cmd>] [--policy <yaml>] [--max-tokens N]");
-    eprintln!("  ai-kit-cli imagine --model <id> --prompt <text> --out <file.png> [--width N] [--height N] [--steps N] [--seed N] [--guidance F] [--negative <text>] [--device D]");
-    eprintln!("  ai-kit-cli embed --model <id> (--text <t> ...) [--query <q>] [--device D]");
-    eprintln!("  ai-kit-cli bench --model <id> (--prompt <text> | --prompt-file <path>) [--device D] [--max-tokens N] [--repeat R]");
+    eprintln!("                   [--verify none|nonempty|json|svg|exec|maxwords:N]  (exec runs model-generated python UNSANDBOXED) [--local-model <id>] [--image-model <id>] [--embed-model <id>] [--allow-noncommercial] [--device D] [--cloud-cmd <shell cmd>] [--policy <yaml>] [--max-tokens N]");
+    eprintln!("  ai-kit-cli imagine --model <id> --prompt <text> --out <file.png> [--allow-noncommercial] [--width N] [--height N] [--steps N] [--seed N] [--guidance F] [--negative <text>] [--device D]");
+    eprintln!("  ai-kit-cli embed --model <id> (--text <t> ...) [--query <q>] [--allow-noncommercial] [--device D]");
+    eprintln!("  ai-kit-cli bench --model <id> (--prompt <text> | --prompt-file <path>) [--device D] [--max-tokens N] [--repeat R] [--allow-noncommercial]");
 }
 
 fn cmd_hash(args: &[String]) -> ExitCode {
@@ -143,6 +143,10 @@ async fn cmd_infer_async(args: &[String]) -> ExitCode {
         }
     };
 
+    if let Err(e) = check_named_model(&model_id, &catalog_path, args) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
     if let Err(e) = service.load_model(&model_id).await {
         eprintln!("error: failed to load model '{model_id}': {e}");
         return ExitCode::FAILURE;
@@ -315,6 +319,10 @@ async fn cmd_bench_async(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = check_named_model(&model_id, &catalog_path, args) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
     let t = Instant::now();
     if let Err(e) = service.load_model(&model_id).await {
         eprintln!("error: failed to load model '{model_id}': {e}");
@@ -862,6 +870,11 @@ async fn cmd_route_async(args: &[String]) -> ExitCode {
     if let Some(m) = flag_value(args, "--local-model") {
         match CandleInferenceService::with_device(&catalog_path, device) {
             Ok(svc) => {
+                // checked even under --explain: the licence rule does not depend on whether the model loads now
+                if let Err(e) = check_named_model(&m, &catalog_path, args) {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(2);
+                }
                 if !explain {
                     if let Err(e) = svc.load_model(&m).await {
                         eprintln!("error: failed to load model '{m}': {e}");
@@ -900,10 +913,16 @@ async fn cmd_route_async(args: &[String]) -> ExitCode {
     }
     if let Some(m) = flag_value(args, "--embed-model") {
         match CandleEmbeddingService::new(&catalog_path, device) {
-            Ok(svc) => local.push(TierBackend::new(
-                Arc::new(svc),
-                &[(RequestKind::Embedding, &m)],
-            )),
+            Ok(svc) => {
+                if let Err(e) = check_named_model(&m, &catalog_path, args) {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(2);
+                }
+                local.push(TierBackend::new(
+                    Arc::new(svc),
+                    &[(RequestKind::Embedding, &m)],
+                ))
+            }
             Err(e) => {
                 eprintln!("error: embedding catalog: {e}");
                 return ExitCode::FAILURE;
@@ -996,6 +1015,19 @@ fn cmd_embed(_args: &[String]) -> ExitCode {
     ExitCode::from(2)
 }
 
+/// The licence rule for a model the user names on the command line (`--model`, `--local-model`, `--image-model`, `--embed-model`): refused
+/// unless the catalog says it is known to permit commercial use or `--allow-noncommercial` is given. **Every** path that loads a named
+/// model calls this one function before it loads anything, so the rule cannot be applied to some subcommands and not others. An id that
+/// is not in the catalog passes here; the service reports it as not found.
+#[cfg(feature = "candle")]
+fn check_named_model(id: &str, catalog_path: &str, args: &[String]) -> Result<(), String> {
+    let reg = ai_kit::registry::ModelRegistry::load_from_file(catalog_path)
+        .map_err(|e| format!("failed to load catalog {catalog_path}: {e}"))?;
+    let allow = args.iter().any(|a| a == "--allow-noncommercial");
+    reg.check_licence(id, allow)
+        .map_err(|e| format!("{e} (pass --allow-noncommercial to use it anyway)"))
+}
+
 /// Resolve a model flag: a concrete id is used if the catalog's licence for it allows; `default` (or no flag, where allowed) picks the catalog's default for
 /// `kind` by the registry's rule: never a model that is not known to permit commercial use unless `--allow-noncommercial` is given.
 #[cfg(feature = "candle")]
@@ -1005,15 +1037,13 @@ fn resolve_model(
     catalog_path: &str,
     args: &[String],
 ) -> Result<String, String> {
+    if let Some(id) = given.filter(|g| g != "default") {
+        check_named_model(&id, catalog_path, args)?;
+        return Ok(id);
+    }
     let reg = ai_kit::registry::ModelRegistry::load_from_file(catalog_path)
         .map_err(|e| format!("failed to load catalog {catalog_path}: {e}"))?;
     let allow = args.iter().any(|a| a == "--allow-noncommercial");
-    if let Some(id) = given.filter(|g| g != "default") {
-        // a model named on the command line is held to the same licence rule as the default
-        reg.check_licence(&id, allow)
-            .map_err(|e| format!("{e} (pass --allow-noncommercial to use it anyway)"))?;
-        return Ok(id);
-    }
     reg.default_for(kind, allow).map(|m| m.id.clone()).ok_or_else(|| {
         format!(
             "no commercially usable {} model in {catalog_path} (pass --allow-noncommercial to use a development-only model)",
@@ -1117,6 +1147,10 @@ fn cmd_embed(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = check_named_model(&model, &catalog_path, args) {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

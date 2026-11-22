@@ -151,65 +151,22 @@ pub enum LicenceClass {
     Unknown,
 }
 
-/// The licence name as lowercase alphanumeric words: `"CC-BY-NC-4.0"` becomes `["cc", "by", "nc", "4", "0"]`.
-fn licence_words(licence: &str) -> Vec<String> {
-    licence
-        .to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Names (as hyphen-joined words) of licences known to permit commercial use.
-const PERMISSIVE: &[&str] = &[
-    "apache",
-    "apache-2",
-    "apache-2-0",
-    "apache2",
-    "apache2-0",
-    "mit",
-    "bsd",
-    "bsd-2-clause",
-    "bsd-3-clause",
-    "isc",
-    "mpl-2-0",
-    "cc0",
-    "cc0-1-0",
-    "unlicense",
-    "zlib",
-    "cc-by-4-0",
-    "cc-by-sa-4-0",
-];
-
-fn says_non_commercial(words: &[String]) -> bool {
-    let has = |w: &str| words.iter().any(|x| x == w);
-    has("noncommercial")
-        || has("nc") // the Creative Commons NC family: cc-by-nc-4.0, cc-by-nc-sa, cc-by-nc-nd
-        || has("research")
-        || has("academic")
-        || has("evaluation")
-        || has("personal")
-        // "non-commercial", "not for commercial use", "no commercial use"
-        || words
-            .windows(2)
-            .any(|p| matches!(p[0].as_str(), "non" | "no" | "not") && p[1] == "commercial")
-}
-
 impl ModelMetadata {
     /// Commercial / non-commercial / unknown, from `custom.license` and the optional `custom.commercial_use`.
     ///
     /// A licence name that says non-commercial always wins (a contradicting `commercial_use: "true"` fails closed). Otherwise an explicit
     /// `commercial_use` of `true` or `false` decides; otherwise a recognised permissive name is `Commercial` and anything else, including
-    /// a missing licence, is `Unknown`.
+    /// a missing licence, is `Unknown`. How names are read, and what is deliberately **not** recognised (copyleft, RAIL, community
+    /// licences), is in the `licence` module.
     pub fn licence_class(&self) -> LicenceClass {
-        let words = self
-            .metadata
-            .custom
-            .get("license")
-            .map(|l| licence_words(l))
-            .unwrap_or_default();
-        if says_non_commercial(&words) {
+        use crate::licence::{classify, NameClass};
+        let name = classify(
+            self.metadata
+                .custom
+                .get("license")
+                .map_or("", String::as_str),
+        );
+        if name == NameClass::NonCommercial {
             return LicenceClass::NonCommercial;
         }
         match self
@@ -223,7 +180,7 @@ impl ModelMetadata {
             Some("false" | "no") => return LicenceClass::NonCommercial,
             _ => {}
         }
-        if PERMISSIVE.contains(&words.join("-").as_str()) {
+        if name == NameClass::Permissive {
             LicenceClass::Commercial
         } else {
             LicenceClass::Unknown
