@@ -87,6 +87,10 @@ pub(crate) const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Durat
 /// The HTTP client every adapter starts from. The connect phase has its own, shorter limit so that a host that never answers is
 /// reported as a connection that was never made (the request was not sent, so it is not billed), not as a timeout of a request that may
 /// have been.
+///
+/// **Redirects are never followed.** A redirect from the endpoint a provider was configured and classified for would send the request,
+/// prompt included (a 307 or 308 replays the body), to an origin nobody configured, checked against the egress policy or audited. An API
+/// endpoint that redirects is a misconfiguration, and it surfaces as an error.
 #[cfg(any(
     feature = "provider-anthropic",
     feature = "provider-openai-compat",
@@ -99,6 +103,7 @@ pub(crate) fn http_builder(
     reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(connect_timeout)
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 #[cfg(any(feature = "provider-openai-compat", feature = "provider-gemini"))]
@@ -143,6 +148,32 @@ pub(crate) fn may_have_been_billed(e: &reqwest::Error) -> bool {
 pub(crate) mod test_support {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Two local servers: the first answers every request with `status` and a `Location` pointing at the second, which would answer 200.
+    /// A client that follows the redirect delivers a request to the second; one that does not leaves it untouched.
+    pub(crate) async fn redirector_and_trap(status: u16) -> (MockServer, MockServer) {
+        let trap = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&trap)
+            .await;
+        let redirector = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("location", format!("{}/v1/redirected", trap.uri())),
+            )
+            .mount(&redirector)
+            .await;
+        (redirector, trap)
+    }
+
+    /// How many requests reached the server.
+    pub(crate) async fn received(s: &MockServer) -> usize {
+        s.received_requests().await.map_or(0, |r| r.len())
+    }
 
     /// The `host:port` of an address on which a connection attempt hangs (packets are dropped, nothing refuses), or `None` where that is
     /// not so (no route, a refusal, or something answers). It is probed, not assumed: a test that needs a connect timeout must skip, not

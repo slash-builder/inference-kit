@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Provider adapters never follow an HTTP redirect.** A 3xx answer is an error: a 307 or 308 would otherwise replay the request body (the prompt) to an origin that was never configured, classified or audited. Applies to all three adapters and every locality.
+- **OpenAI-compatible adapter: the base URL is parsed once and classified from that parse.** The locality check uses the same parser that connects (`reqwest::Url`), and requests are built from the parsed URL. `OpenAiCompatAdapter::new` now returns `ConfigError::BadUrl` for a base URL with a scheme other than http(s), user-info, a query or a fragment.
+  A `Device` or `Home` provider bypasses any `HTTP(S)_PROXY` in the environment. `Home` no longer accepts 169.254.0.0/16 (link-local, which includes the cloud metadata address). A trailing dot (`localhost.`, `nas.lan.`) is accepted once.
 - **Breaking (remote provider adapters, `provider-*` features): the spend ledger fails closed.** A call whose cost is unknown is charged its reserved worst case, never zero (a 200 with no usage, or with only part of it;
   a timeout or a broken reply after the request was sent). A connection that was never made, including one that hit the new connect timeout, is released at no charge. Embeddings on a remote OpenAI-compatible
   or Gemini adapter are reserved and capped like chat. API changes:
