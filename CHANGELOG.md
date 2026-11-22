@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking (remote provider adapters, `provider-*` features): the spend ledger fails closed.** A call whose cost is unknown is charged its reserved worst case, never zero (a 200 with no usage, or with only part of it;
+  a timeout or a broken reply after the request was sent). A connection that was never made, including one that hit the new connect timeout, is released at no charge. Embeddings on a remote OpenAI-compatible
+  or Gemini adapter are reserved and capped like chat. API changes:
+  - `OpenAiCompatAdapter::new` and `GeminiAdapter::new` now return `ConfigError::UnpricedProvider` when the adapter leaves the home (for OpenAI-compatible: `Locality::Saas` and `Locality::Unspecified`; Gemini is always remote)
+    and its prices cannot cap every kind of request it offers: text needs an input and an output rate, embeddings (when an embedding model is set) need the input rate. A zero rate is refused, not read as "free".
+    `Device` and `Home` providers are not asked for prices.
+  - `AnthropicAdapter::new` returns `Result<Self, ConfigError>` instead of `Result<Self, CredentialError>` (an unreadable credential is `ConfigError::CredentialUnavailable`) and refuses an input or output rate of zero.
+  - `ConfigError` gains the variant `UnpricedProvider`.
+  - `AnthropicConfig`, `GeminiConfig` and `OpenAiCompatConfig` gain the field `connect_timeout` (default 10 s); `timeout` still limits the whole request. Code that builds these structs with a literal must set it.
+  - Added: `Pricing::can_cap(RequestKind)`.
 - Candle 0.9.2 -> **0.11** (verified: KV isolation A/B/A on CPU and CUDA, real-weights multimodal tests).
 - `AiKitError::to_error_code()` is **deprecated**: its numbers (20-24, 13, 90) collide with the fabric `ErrorCode` space (a remote peer could trigger an ops alert). Use `to_inference_error_code()`.
 - The router keeps the original typed error when a call fails (an out-of-memory error used to become `Internal`).

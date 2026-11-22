@@ -82,9 +82,24 @@ impl Pricing {
     }
 
     /// True when neither the input nor the output rate is declared. Such a price makes every worst case zero, so a ledger could never refuse
-    /// the call: a provider that leaves home must not be run on it.
+    /// the call. This is the all-zero case only; a price with one rate missing is still unable to cap some requests, so a provider that
+    /// leaves home is checked per request kind with [`Pricing::can_cap`] instead.
     pub fn is_unpriced(&self) -> bool {
         self.input_micro_per_mtok == 0 && self.output_micro_per_mtok == 0
+    }
+
+    /// Can a ledger enforce a cap on a request of this kind at these prices? Text needs both an input and an output rate (the worst case
+    /// is the whole prompt plus the whole output allowance); an embedding is reserved at the input rate, so it needs that one. A kind the
+    /// ledger does not price (images, audio) is never capped here, so it answers `false`: fail closed.
+    pub fn can_cap(&self, kind: crate::modality::RequestKind) -> bool {
+        use crate::modality::RequestKind;
+        match kind {
+            RequestKind::TextGeneration => {
+                self.input_micro_per_mtok > 0 && self.output_micro_per_mtok > 0
+            }
+            RequestKind::Embedding => self.input_micro_per_mtok > 0,
+            _ => false,
+        }
     }
 
     /// The most a call could cost: every input token at the highest input rate (a cache write is the dearest) and the full output allowance.
@@ -268,6 +283,30 @@ mod tests {
             Pricing::default().cost(&u),
             0,
             "an unpriced model costs nothing here (the caller must declare prices)"
+        );
+    }
+
+    #[test]
+    fn a_price_can_cap_a_kind_only_when_the_rates_that_kind_is_reserved_at_are_declared() {
+        use crate::modality::RequestKind::{Embedding, ImageGeneration, TextGeneration};
+        let only_output = Pricing {
+            output_micro_per_mtok: 5,
+            ..Pricing::default()
+        };
+        let only_input = Pricing {
+            input_micro_per_mtok: 5,
+            ..Pricing::default()
+        };
+        assert!(P.can_cap(TextGeneration) && P.can_cap(Embedding));
+        // an embedding is reserved at the input rate: a zero input rate reserves nothing
+        assert!(!only_output.can_cap(Embedding));
+        assert!(!only_output.can_cap(TextGeneration));
+        assert!(!only_input.can_cap(TextGeneration), "no output rate");
+        assert!(only_input.can_cap(Embedding));
+        assert!(!Pricing::default().can_cap(TextGeneration));
+        assert!(
+            !P.can_cap(ImageGeneration),
+            "a kind the ledger does not price"
         );
     }
 

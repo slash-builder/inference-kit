@@ -42,7 +42,10 @@ pub struct AnthropicConfig {
     /// Declared prices; Anthropic's prices change, so they are configured, never hard-coded.
     pub pricing: Pricing,
     pub default_max_tokens: u32,
+    /// The limit on the whole request, reply included. A timeout after the request was sent is charged at the reserved worst case.
     pub timeout: Duration,
+    /// The limit on making the connection. A host that does not answer within it is a request that was never sent: released, not charged.
+    pub connect_timeout: Duration,
 }
 
 impl AnthropicConfig {
@@ -55,6 +58,7 @@ impl AnthropicConfig {
             pricing,
             default_max_tokens: 1024,
             timeout: Duration::from_secs(120),
+            connect_timeout: super::DEFAULT_CONNECT_TIMEOUT,
         }
     }
 }
@@ -78,21 +82,28 @@ impl fmt::Debug for AnthropicAdapter {
 }
 
 impl AnthropicAdapter {
-    /// Build the adapter. **Fails closed**: if the credential cannot be loaded now, or the prices are all zero (a ledger could never cap
-    /// them), no adapter exists.
+    /// Build the adapter. **Fails closed**: if the credential cannot be loaded now, or the input or output price is zero (a ledger could
+    /// never cap such a call), no adapter exists.
     pub fn new(
         cfg: AnthropicConfig,
         creds: Arc<dyn CredentialSource>,
         ledger: Arc<Ledger>,
     ) -> Result<Self, ConfigError> {
-        if cfg.pricing.is_unpriced() {
-            return Err(ConfigError::UnpricedProvider);
-        }
+        Self::build(cfg, creds, ledger, |b| b)
+    }
+
+    /// `new`, with a hook on the HTTP client builder (tests use it to keep a proxy in the environment out of the way).
+    fn build(
+        cfg: AnthropicConfig,
+        creds: Arc<dyn CredentialSource>,
+        ledger: Arc<Ledger>,
+        tweak: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    ) -> Result<Self, ConfigError> {
+        super::validate_pricing(&cfg.pricing, &[RequestKind::TextGeneration])?;
         creds
             .get(&cfg.credential_name)
             .map_err(|_| ConfigError::CredentialUnavailable)?;
-        let http = reqwest::Client::builder()
-            .timeout(cfg.timeout)
+        let http = tweak(super::http_builder(cfg.timeout, cfg.connect_timeout))
             .build()
             .map_err(|_| ConfigError::HttpClient)?;
         Ok(Self {
@@ -390,10 +401,11 @@ mod tests {
         let ledger = Arc::new(Ledger::new(budget));
         let mut cfg = AnthropicConfig::new("anthropic-api-key", "claude-test-model", PRICING);
         cfg.base_url = server.uri();
-        let a = AnthropicAdapter::new(
+        let a = AnthropicAdapter::build(
             cfg,
             Arc::new(InMemoryCredentials::with("anthropic-api-key", KEY)),
             ledger.clone(),
+            |b| b.no_proxy(), // a proxy in the environment must not decide these tests
         )
         .unwrap();
         (a, ledger)
@@ -819,10 +831,11 @@ mod tests {
         let mut cfg = AnthropicConfig::new("anthropic-api-key", "claude-test-model", PRICING);
         cfg.base_url = s.uri();
         cfg.timeout = Duration::from_millis(200);
-        let a = AnthropicAdapter::new(
+        let a = AnthropicAdapter::build(
             cfg,
             Arc::new(InMemoryCredentials::with("anthropic-api-key", KEY)),
             ledger.clone(),
+            |b| b.no_proxy(),
         )
         .unwrap();
         assert_eq!(
@@ -842,28 +855,106 @@ mod tests {
         let mut cfg = AnthropicConfig::new("anthropic-api-key", "claude-test-model", PRICING);
         // nothing listens on this loopback port
         cfg.base_url = "http://127.0.0.1:1".into();
-        let a = AnthropicAdapter::new(
+        let a = AnthropicAdapter::build(
             cfg,
             Arc::new(InMemoryCredentials::with("anthropic-api-key", KEY)),
             ledger.clone(),
+            |b| b.no_proxy(),
         )
         .unwrap();
         assert!(a.call(&req("hi")).await.is_err());
         assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
     }
 
-    #[test]
-    fn an_unpriced_adapter_is_refused_because_the_ledger_could_never_cap_it() {
-        let cfg = AnthropicConfig::new("anthropic-api-key", "m", Pricing::default());
-        let r = AnthropicAdapter::new(
-            cfg,
+    fn build_with(pricing: Pricing) -> Result<AnthropicAdapter, ConfigError> {
+        AnthropicAdapter::new(
+            AnthropicConfig::new("anthropic-api-key", "m", pricing),
             Arc::new(InMemoryCredentials::with("anthropic-api-key", KEY)),
             Arc::new(Ledger::new(1_000_000)),
+        )
+    }
+
+    #[test]
+    fn an_adapter_whose_prices_cannot_cap_a_text_call_is_refused() {
+        // all zero, or either rate missing: the worst case of some call would be free
+        let cases = [
+            ("all zero", Pricing::default()),
+            (
+                "no input rate",
+                Pricing {
+                    input_micro_per_mtok: 0,
+                    ..PRICING
+                },
+            ),
+            (
+                "no output rate",
+                Pricing {
+                    output_micro_per_mtok: 0,
+                    ..PRICING
+                },
+            ),
+        ];
+        for (name, pricing) in cases {
+            assert_eq!(
+                build_with(pricing).err(),
+                Some(ConfigError::UnpricedProvider),
+                "{name}"
+            );
+        }
+        assert!(build_with(PRICING).is_ok());
+    }
+
+    #[test]
+    fn a_missing_credential_is_a_config_error() {
+        let r = AnthropicAdapter::new(
+            AnthropicConfig::new("anthropic-api-key", "m", PRICING),
+            Arc::new(InMemoryCredentials::default()),
+            Arc::new(Ledger::new(1_000_000)),
         );
-        assert_eq!(
-            r.err(),
-            Some(ConfigError::UnpricedProvider),
-            "zero prices make every reservation free"
+        assert_eq!(r.err(), Some(ConfigError::CredentialUnavailable));
+    }
+
+    #[tokio::test]
+    async fn a_200_with_only_part_of_the_usage_is_settled_at_the_reserved_worst_case() {
+        for keep in ["input_tokens", "output_tokens"] {
+            let s = MockServer::start().await;
+            let mut b = ok_body("end_turn", "hello");
+            let usage = b["usage"].as_object_mut().unwrap();
+            usage.retain(|k, _| k == keep);
+            serve(&s, 200, b).await;
+            let (a, ledger) = adapter(&s, 10_000_000);
+            a.call(&req("hi")).await.unwrap();
+            assert_eq!(
+                ledger.spent(),
+                worst_for_hi(),
+                "only `{keep}` reported: the rest is unknown, so the worst case is charged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connect_timeout_is_a_request_never_sent_and_is_released_at_no_charge() {
+        let Some(addr) = super::super::test_support::blackholed_addr() else {
+            return;
+        };
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let mut cfg = AnthropicConfig::new("anthropic-api-key", "claude-test-model", PRICING);
+        cfg.base_url = format!("http://{addr}");
+        cfg.timeout = Duration::from_secs(20);
+        cfg.connect_timeout = Duration::from_millis(300);
+        let a = AnthropicAdapter::build(
+            cfg,
+            Arc::new(InMemoryCredentials::with("anthropic-api-key", KEY)),
+            ledger.clone(),
+            |b| b.no_proxy(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert!(a.call(&req("hi")).await.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the connect limit, not the overall one, ended the call"
         );
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
     }
 }
