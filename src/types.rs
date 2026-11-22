@@ -136,35 +136,97 @@ pub struct ModelFile {
     pub size_bytes: u64,
 }
 
-/// What a model's licence allows, from `metadata.custom["license"]`. Only used to keep non-commercial models from becoming a default.
+/// What a model's licence allows, from `metadata.custom["license"]` (and the optional `commercial_use` override). Used to keep a model
+/// that is not known to permit commercial use from becoming a default, and to refuse it by name when a caller asks for that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LicenceClass {
-    /// Permits commercial use (for example Apache-2.0, MIT).
+    /// Known to permit commercial use: a recognised permissive licence (for example Apache-2.0, MIT), or the catalog author said so with
+    /// `commercial_use: "true"`.
     Commercial,
-    /// Development or research only (`non-commercial...`, `research...`).
+    /// Development or research only: the licence name says non-commercial, research, academic, evaluation or personal use (including the
+    /// Creative Commons `NC` family), or the catalog author said `commercial_use: "false"`.
     NonCommercial,
-    /// Not stated. Treated as usable; a catalog author who knows better must say so.
+    /// Not stated, or a name this crate does not recognise. **Not assumed usable**: it is excluded exactly like `NonCommercial` from
+    /// default selection and from a commercial-only check. A catalog author who knows better sets `commercial_use`.
     Unknown,
 }
 
+/// The licence name as lowercase alphanumeric words: `"CC-BY-NC-4.0"` becomes `["cc", "by", "nc", "4", "0"]`.
+fn licence_words(licence: &str) -> Vec<String> {
+    licence
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Names (as hyphen-joined words) of licences known to permit commercial use.
+const PERMISSIVE: &[&str] = &[
+    "apache",
+    "apache-2",
+    "apache-2-0",
+    "apache2",
+    "apache2-0",
+    "mit",
+    "bsd",
+    "bsd-2-clause",
+    "bsd-3-clause",
+    "isc",
+    "mpl-2-0",
+    "cc0",
+    "cc0-1-0",
+    "unlicense",
+    "zlib",
+    "cc-by-4-0",
+    "cc-by-sa-4-0",
+];
+
+fn says_non_commercial(words: &[String]) -> bool {
+    let has = |w: &str| words.iter().any(|x| x == w);
+    has("noncommercial")
+        || has("nc") // the Creative Commons NC family: cc-by-nc-4.0, cc-by-nc-sa, cc-by-nc-nd
+        || has("research")
+        || has("academic")
+        || has("evaluation")
+        || has("personal")
+        // "non-commercial", "not for commercial use", "no commercial use"
+        || words
+            .windows(2)
+            .any(|p| matches!(p[0].as_str(), "non" | "no" | "not") && p[1] == "commercial")
+}
+
 impl ModelMetadata {
-    /// Commercial / non-commercial / unknown, from `custom.license`.
+    /// Commercial / non-commercial / unknown, from `custom.license` and the optional `custom.commercial_use`.
+    ///
+    /// A licence name that says non-commercial always wins (a contradicting `commercial_use: "true"` fails closed). Otherwise an explicit
+    /// `commercial_use` of `true` or `false` decides; otherwise a recognised permissive name is `Commercial` and anything else, including
+    /// a missing licence, is `Unknown`.
     pub fn licence_class(&self) -> LicenceClass {
-        match self
+        let words = self
             .metadata
             .custom
             .get("license")
-            .map(|l| l.trim().to_ascii_lowercase())
+            .map(|l| licence_words(l))
+            .unwrap_or_default();
+        if says_non_commercial(&words) {
+            return LicenceClass::NonCommercial;
+        }
+        match self
+            .metadata
+            .custom
+            .get("commercial_use")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
         {
-            None => LicenceClass::Unknown,
-            Some(l)
-                if l.starts_with("non-commercial")
-                    || l.starts_with("noncommercial")
-                    || l.starts_with("research") =>
-            {
-                LicenceClass::NonCommercial
-            }
-            Some(_) => LicenceClass::Commercial,
+            Some("true" | "yes") => return LicenceClass::Commercial,
+            Some("false" | "no") => return LicenceClass::NonCommercial,
+            _ => {}
+        }
+        if PERMISSIVE.contains(&words.join("-").as_str()) {
+            LicenceClass::Commercial
+        } else {
+            LicenceClass::Unknown
         }
     }
 

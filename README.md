@@ -200,7 +200,7 @@ ai-kit-cli route   --catalog catalog.yaml --batch mixed.jsonl --local-model llam
 **Multi-file models.** An image model is several files, so a catalog entry has a `files:` list and `metadata.custom.kind`; **every file is BLAKE3-verified** on load, and the VRAM check counts all of them (or uses `custom.vram_peak_mb`, the measured peak, for a model that streams its weights).
 
 **The default image model, and the licence guard.** `ModelRegistry::default_for(kind, allow_noncommercial)` picks the model for a kind when the caller names none: a `custom.default: "true"` entry wins, otherwise the first by id.
-A model whose `custom.license` starts `non-commercial` or `research` is **never** chosen unless the caller passes `--allow-noncommercial`, so the development-only `sd-turbo` cannot silently become what a product ships.
+A model that is not known to permit commercial use is **never** chosen unless the caller passes `--allow-noncommercial`, so the development-only `sd-turbo` cannot silently become what a product ships. "Known to permit" means a recognised permissive `custom.license` (Apache-2.0, MIT, BSD, ISC, MPL-2.0, CC0, CC-BY-4.0 and similar) or `custom.commercial_use: "true"`; a licence that says non-commercial, research, academic, evaluation or personal use (including the Creative Commons `NC` family) is non-commercial, and a missing or unrecognised licence is treated the same way. The rule also applies to a model named with `--model`. In the library, `ModelRegistry::check_licence` does the same for a named id, and each Candle service has `with_commercial_only()` to refuse such models at load.
 
 ### Z-Image-Turbo (`architecture: z_image`)
 

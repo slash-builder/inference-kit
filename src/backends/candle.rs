@@ -73,6 +73,7 @@ struct LoadedCandleModel {
 /// Real local inference backend using Candle. See module docs.
 pub struct CandleInferenceService {
     registry: ModelRegistry,
+    commercial_only: bool,
     device_pref: DevicePreference,
     loaded: RwLock<HashMap<String, Arc<LoadedCandleModel>>>,
     model_cache: Mutex<ModelCache>,
@@ -95,6 +96,7 @@ impl CandleInferenceService {
         let registry = ModelRegistry::load_from_file(catalog_path)?;
         Ok(Self {
             registry,
+            commercial_only: false,
             device_pref: device,
             loaded: RwLock::new(HashMap::new()),
             model_cache: Mutex::new(ModelCache::new()),
@@ -122,13 +124,26 @@ impl CandleInferenceService {
         device_for(self.device_pref).map_err(fail)
     }
 
+    /// Refuse to load any model that is not known to permit commercial use ([`crate::types::LicenceClass::Commercial`]). Off by default;
+    /// the default-model rule in the registry does not apply to a model a caller names, so a product that must ship only commercial
+    /// models turns this on.
+    pub fn with_commercial_only(mut self) -> Self {
+        self.commercial_only = true;
+        self
+    }
+
     fn model_meta(&self, model_id: &str) -> Result<ModelMetadata> {
-        self.registry
+        let m = self
+            .registry
             .get(model_id)
             .cloned()
             .ok_or_else(|| AiKitError::ModelNotFound {
                 model_id: model_id.to_string(),
-            })
+            })?;
+        if self.commercial_only {
+            self.registry.check_licence(model_id, false)?;
+        }
+        Ok(m)
     }
 
     fn tokenizer_path_for(model: &ModelMetadata) -> Result<String> {

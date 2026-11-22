@@ -32,14 +32,24 @@ struct LoadedEmbeddingModel {
 
 pub struct CandleEmbeddingService {
     registry: ModelRegistry,
+    commercial_only: bool,
     device_pref: DevicePreference,
     loaded: RwLock<HashMap<String, Arc<Mutex<LoadedEmbeddingModel>>>>,
 }
 
 impl CandleEmbeddingService {
+    /// Refuse to load any model that is not known to permit commercial use ([`crate::types::LicenceClass::Commercial`]). Off by default;
+    /// the default-model rule in the registry does not apply to a model a caller names, so a product that must ship only commercial
+    /// models turns this on.
+    pub fn with_commercial_only(mut self) -> Self {
+        self.commercial_only = true;
+        self
+    }
+
     pub fn new(catalog_path: &str, device: DevicePreference) -> Result<Self> {
         Ok(Self {
             registry: ModelRegistry::load_from_file(catalog_path)?,
+            commercial_only: false,
             device_pref: device,
             loaded: RwLock::new(HashMap::new()),
         })
@@ -53,6 +63,9 @@ impl CandleEmbeddingService {
             .ok_or_else(|| AiKitError::ModelNotFound {
                 model_id: id.to_string(),
             })?;
+        if self.commercial_only {
+            self.registry.check_licence(id, false)?;
+        }
         if m.kind() != RequestKind::Embedding {
             return Err(AiKitError::ModelLoadFailed {
                 model_id: id.to_string(),

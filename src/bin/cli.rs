@@ -983,8 +983,8 @@ fn cmd_embed(_args: &[String]) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// Resolve a model flag: a concrete id is used as is; `default` (or no flag, where allowed) picks the catalog's default for
-/// `kind` by the registry's rule: never a non-commercial model unless `--allow-noncommercial` is given.
+/// Resolve a model flag: a concrete id is used if the catalog's licence for it allows; `default` (or no flag, where allowed) picks the catalog's default for
+/// `kind` by the registry's rule: never a model that is not known to permit commercial use unless `--allow-noncommercial` is given.
 #[cfg(feature = "candle")]
 fn resolve_model(
     given: Option<String>,
@@ -992,12 +992,15 @@ fn resolve_model(
     catalog_path: &str,
     args: &[String],
 ) -> Result<String, String> {
-    if let Some(id) = given.filter(|g| g != "default") {
-        return Ok(id);
-    }
     let reg = ai_kit::registry::ModelRegistry::load_from_file(catalog_path)
         .map_err(|e| format!("failed to load catalog {catalog_path}: {e}"))?;
     let allow = args.iter().any(|a| a == "--allow-noncommercial");
+    if let Some(id) = given.filter(|g| g != "default") {
+        // a model named on the command line is held to the same licence rule as the default
+        reg.check_licence(&id, allow)
+            .map_err(|e| format!("{e} (pass --allow-noncommercial to use it anyway)"))?;
+        return Ok(id);
+    }
     reg.default_for(kind, allow).map(|m| m.id.clone()).ok_or_else(|| {
         format!(
             "no commercially usable {} model in {catalog_path} (pass --allow-noncommercial to use a development-only model)",
@@ -1181,5 +1184,54 @@ mod tests {
         };
         assert!(f("```python\ndef add(a, b):\n    return a + b\n```"));
         assert!(!f("```python\ndef add(a, b):\n    return a - b\n```"));
+    }
+
+    #[test]
+    fn an_explicit_model_id_is_licence_checked_like_the_default() {
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("catalog.yaml");
+        let entry = |id: &str, lic: &str| {
+            format!(
+                r#"  - id: "{id}"
+    version: "1.0.0"
+    os_arch: ["x86_64"]
+    quantization_variants: ["q4"]
+    default_quantization: "q4"
+    hash: "blake3-abcd1234"
+    size_bytes: 1
+    location: "file:///x"
+    metadata:
+      parameters: 1
+      context_window: 1
+      vram_required_mb: 1
+      inference_latency_ms: 1
+      custom:
+        kind: "image_generation"
+        license: "{lic}"
+"#
+            )
+        };
+        std::fs::write(
+            &cat,
+            format!(
+                "version: \"1.0\"\nmodels:\n{}{}",
+                entry("dev-model", "CC-BY-NC-4.0"),
+                entry("ship-model", "Apache-2.0")
+            ),
+        )
+        .unwrap();
+        let cat = cat.to_str().unwrap();
+        let k = ai_kit::RequestKind::ImageGeneration;
+        let none: Vec<String> = vec![];
+        let allow = vec!["--allow-noncommercial".to_string()];
+        assert!(resolve_model(Some("dev-model".into()), k, cat, &none).is_err());
+        assert_eq!(
+            resolve_model(Some("dev-model".into()), k, cat, &allow).unwrap(),
+            "dev-model"
+        );
+        assert_eq!(
+            resolve_model(Some("ship-model".into()), k, cat, &none).unwrap(),
+            "ship-model"
+        );
     }
 }

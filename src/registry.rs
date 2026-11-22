@@ -122,9 +122,11 @@ impl ModelRegistry {
     /// The model to use for `kind` when the caller names none.
     ///
     /// An entry marked `custom.default: "true"` wins; otherwise the first by id (the registry is unordered, so this is made
-    /// deterministic). A model whose licence forbids commercial use (`custom.license` starting `non-commercial` or
-    /// `research`, see [`ModelMetadata::licence_class`]) is **never** chosen unless `allow_noncommercial` is set, so a
+    /// deterministic). A model that is not known to permit commercial use (a non-commercial or research licence **or** one that is not
+    /// stated or not recognised, see [`ModelMetadata::licence_class`]) is **never** chosen unless `allow_noncommercial` is set, so a
     /// development-only model such as `sd-turbo` cannot silently become what a product ships.
+    ///
+    /// This covers the default only. A caller that names a model id bypasses it: use [`ModelRegistry::check_licence`] for that.
     pub fn default_for(
         &self,
         kind: crate::modality::RequestKind,
@@ -135,8 +137,7 @@ impl ModelRegistry {
             .values()
             .filter(|m| m.kind() == kind)
             .filter(|m| {
-                allow_noncommercial
-                    || m.licence_class() != crate::types::LicenceClass::NonCommercial
+                allow_noncommercial || m.licence_class() == crate::types::LicenceClass::Commercial
             })
             .collect();
         ok.sort_by(|a, b| a.id.cmp(&b.id));
@@ -149,6 +150,27 @@ impl ModelRegistry {
             })
             .or(ok.first())
             .copied()
+    }
+
+    /// Refuse a model that is not known to permit commercial use, unless `allow_noncommercial`. For callers that name a model id, which
+    /// [`ModelRegistry::default_for`] never sees. An id that is not in the registry passes: reporting it missing is the service's job.
+    pub fn check_licence(&self, model_id: &str, allow_noncommercial: bool) -> Result<()> {
+        match self.models.get(model_id) {
+            Some(m)
+                if !allow_noncommercial
+                    && m.licence_class() != crate::types::LicenceClass::Commercial =>
+            {
+                Err(crate::error::AiKitError::ModelLoadFailed {
+                    model_id: model_id.to_string(),
+                    reason: format!(
+                        "licence is {:?} (not known to permit commercial use); \
+                         set `commercial_use: \"true\"` in the catalog entry if that is wrong, or opt in to non-commercial models",
+                        m.licence_class()
+                    ),
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Add a model to the registry (for testing or dynamic registration).
@@ -433,5 +455,120 @@ models:
         assert!(r
             .default_for(crate::modality::RequestKind::Embedding, false)
             .is_none());
+    }
+
+    fn with_licence(licence: Option<&str>) -> ModelMetadata {
+        img("m", licence, false)
+    }
+
+    #[test]
+    fn common_non_commercial_licence_names_are_non_commercial() {
+        use crate::types::LicenceClass::NonCommercial;
+        for l in [
+            "non-commercial research",
+            "Non-Commercial",
+            "noncommercial",
+            "research-only",
+            "CC-BY-NC-4.0",
+            "cc-by-nc-sa-4.0",
+            "CC BY-NC-ND 4.0",
+            "cc_by_nc_4.0",
+            "FLUX.1-dev Non-Commercial License",
+            "Stability AI Non Commercial Research Community License",
+            "Academic use only",
+            "evaluation only",
+        ] {
+            assert_eq!(with_licence(Some(l)).licence_class(), NonCommercial, "{l}");
+        }
+    }
+
+    #[test]
+    fn known_permissive_licences_are_commercial_and_anything_else_is_unknown() {
+        use crate::types::LicenceClass::{Commercial, Unknown};
+        for l in [
+            "Apache-2.0",
+            "apache 2.0",
+            "MIT",
+            "BSD-3-Clause",
+            "ISC",
+            "MPL-2.0",
+            "CC0-1.0",
+            "Unlicense",
+        ] {
+            assert_eq!(with_licence(Some(l)).licence_class(), Commercial, "{l}");
+        }
+        // not stated, or a name nobody here has classified: not assumed to be commercial
+        for l in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("other"),
+            Some("proprietary"),
+            Some("custom licence v3"),
+            Some("see LICENSE file"),
+        ] {
+            assert_eq!(with_licence(l).licence_class(), Unknown, "{l:?}");
+        }
+        // "nc" is matched as a word of the name, not as letters inside another word
+        assert_ne!(
+            with_licence(Some("Apache-2.0 (Lancaster fork)")).licence_class(),
+            crate::types::LicenceClass::NonCommercial
+        );
+    }
+
+    #[test]
+    fn an_explicit_commercial_use_field_decides_but_a_non_commercial_name_still_wins() {
+        use crate::types::LicenceClass::{Commercial, NonCommercial};
+        let mut m = with_licence(Some("custom licence v3"));
+        m.metadata
+            .custom
+            .insert("commercial_use".into(), "true".into());
+        assert_eq!(
+            m.licence_class(),
+            Commercial,
+            "the catalog author vouches for it"
+        );
+        m.metadata
+            .custom
+            .insert("commercial_use".into(), "false".into());
+        assert_eq!(m.licence_class(), NonCommercial);
+        let mut nc = with_licence(Some("CC-BY-NC-4.0"));
+        nc.metadata
+            .custom
+            .insert("commercial_use".into(), "true".into());
+        assert_eq!(
+            nc.licence_class(),
+            NonCommercial,
+            "a contradiction fails closed"
+        );
+    }
+
+    #[test]
+    fn a_model_with_no_stated_licence_is_never_the_default_unless_asked_for() {
+        let mut r = ModelRegistry::new("t".into(), "1".into());
+        r.add(img("a-unstated", None, true)); // sorts first and is flagged default
+        r.add(img("b-mit", Some("MIT"), false));
+        let k = crate::modality::RequestKind::ImageGeneration;
+        assert_eq!(r.default_for(k, false).unwrap().id, "b-mit");
+        assert_eq!(r.default_for(k, true).unwrap().id, "a-unstated");
+        let mut only_unknown = ModelRegistry::new("t".into(), "1".into());
+        only_unknown.add(img("x", None, false));
+        assert!(only_unknown.default_for(k, false).is_none());
+    }
+
+    #[test]
+    fn naming_a_model_explicitly_is_checked_against_its_licence() {
+        let mut r = ModelRegistry::new("t".into(), "1".into());
+        r.add(img("nc", Some("CC-BY-NC-4.0"), false));
+        r.add(img("unk", None, false));
+        r.add(img("ok", Some("Apache-2.0"), false));
+        assert!(r.check_licence("ok", false).is_ok());
+        assert!(r.check_licence("nc", false).is_err());
+        assert!(r.check_licence("unk", false).is_err());
+        assert!(r.check_licence("nc", true).is_ok(), "opting in allows it");
+        assert!(
+            r.check_licence("not-in-the-catalog", false).is_ok(),
+            "an unknown id is the service's ModelNotFound to report, not a licence matter"
+        );
     }
 }
