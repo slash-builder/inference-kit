@@ -30,6 +30,20 @@ use std::sync::Mutex;
 /// The data class that can never leave the home.
 pub const CREDENTIALS_CLASS: &str = "credentials";
 
+/// True if the never-leave rule must hold this class name back: it is the credentials class once case and surrounding whitespace are
+/// ignored, **or it cannot be read as plain ASCII text** (invisible, directional and look-alike characters, inner whitespace, control
+/// characters, the empty name). Normalising such names would need a Unicode table and still miss look-alikes, so the rule fails closed
+/// instead: an unreadable name is treated as if it were credentials. Class nouns are plain ASCII words (`photos`, `health`, `location`);
+/// letters, digits and `_ - . : /` are accepted. Only this rule uses the check; every other name still matches policy rules exactly.
+fn is_credentials_or_unreadable(class: &str) -> bool {
+    let name = class.trim_matches(|c: char| c.is_ascii_whitespace());
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/'));
+    !plain || name.eq_ignore_ascii_case(CREDENTIALS_CLASS)
+}
+
 /// Where a provider runs. Zero value (`Unspecified`) is treated as the strictest, [`Locality::Saas`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -295,7 +309,7 @@ pub enum DenyReason {
     RuleDenies,
     /// The label says nothing about class or owner (or the purpose is unspecified).
     Unlabelled,
-    /// The content includes the `credentials` class.
+    /// The content includes the `credentials` class, or a class name that cannot be read as plain ASCII text (held back the same way).
     CredentialsNeverLeave,
 }
 
@@ -325,7 +339,11 @@ impl Policy {
         if !provider.locality.leaves_home() {
             return Verdict::Allow { rules: Vec::new() };
         }
-        if label.classes.contains(CREDENTIALS_CLASS) {
+        if label
+            .classes
+            .iter()
+            .any(|c| is_credentials_or_unreadable(c))
+        {
             return Verdict::Deny {
                 reason: DenyReason::CredentialsNeverLeave,
                 rules: Vec::new(),
@@ -567,6 +585,76 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The never-leave rule used to be an exact, case-sensitive string match, so a differently written class name fell through to the
+    /// ordinary rules, where an allow-everything rule would let it go. A name that is the credentials class once case and edge whitespace
+    /// are ignored, and any name that cannot be read as plain ASCII text at all, is held back from every provider that leaves the home.
+    #[test]
+    fn credentials_never_leave_however_the_class_is_written_or_disguised() {
+        let policy = Policy {
+            version: 1,
+            rules: vec![Rule::allow("all", ProviderMatch::Any, &[]).including_minors()],
+        };
+        for written in [
+            "Credentials",
+            "CREDENTIALS",
+            " credentials",
+            "credentials ",
+            "\tcredentials\n",
+            // invisible, directional and look-alike characters: not readable as plain text, so held back
+            "cred\u{200b}entials",
+            "credentials\u{feff}",
+            "cre\u{00ad}dentials",
+            "\u{202e}credentials",
+            "credentials\u{200e}",
+            "credentials\u{2063}",
+            "\u{ff43}redentials",
+            "cred\u{0435}ntials",
+            "cre dentials",
+            "",
+            "   ",
+        ] {
+            assert!(
+                matches!(
+                    decide(&policy, &lbl(&[written], &[alice()]), &saas("claude")),
+                    Verdict::Deny {
+                        reason: DenyReason::CredentialsNeverLeave,
+                        ..
+                    }
+                ),
+                "{written:?} must be held back like the credentials class"
+            );
+        }
+    }
+
+    /// Ordinary plain-ASCII class names are not caught by this rule; they stay governed by the policy's own rules.
+    #[test]
+    fn ordinary_plain_class_names_are_left_to_the_policy_rules() {
+        let policy = Policy {
+            version: 1,
+            rules: vec![Rule::allow("all", ProviderMatch::Any, &[]).including_minors()],
+        };
+        for other in [
+            "notes",
+            "photos",
+            "health",
+            "location",
+            "health.records",
+            "x:y",
+            "a_b-c",
+        ] {
+            assert!(
+                !matches!(
+                    decide(&policy, &lbl(&[other], &[alice()]), &saas("claude")),
+                    Verdict::Deny {
+                        reason: DenyReason::CredentialsNeverLeave,
+                        ..
+                    }
+                ),
+                "{other:?} is an ordinary class"
+            );
+        }
     }
 
     #[test]
