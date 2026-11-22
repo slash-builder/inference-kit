@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ConfigError` gains the variant `UnpricedProvider`.
   - `AnthropicConfig`, `GeminiConfig` and `OpenAiCompatConfig` gain the field `connect_timeout` (default 10 s); `timeout` still limits the whole request. Code that builds these structs with a literal must set it.
   - Added: `Pricing::can_cap(RequestKind)`.
+- **Breaking (`provider-openai-compat`): a reply can now be refused for a prompt the server cut.** Ollama cuts an over-long prompt to about half its context, answers normally and reports the cut length. `OpenAiCompatConfig` gains
+  `context_tokens: Option<u32>` (default `None` = off); when it is set, `call` returns `ProviderError::ContextOverflow` instead of an answer in three cases: a prompt of more than 8 bytes per context token (refused before it is sent);
+  a reported prompt length within 16 tokens of half the context, at least 256, for a prompt of more than 8 bytes per reported token; reported prompt and completion lengths that together exceed the context by more than 16 (the server shifted its window while generating). API changes:
+  - the new public field breaks code that builds `OpenAiCompatConfig` with a struct literal (`OpenAiCompatConfig` is not `#[non_exhaustive]`); start from `OpenAiCompatConfig::ollama(..)` and assign fields;
+  - with the field set, a call that used to return an answer can return `ContextOverflow`, **after the request was made and settled**: a remote provider's spend is charged, the answer is dropped.
+  - This is a partial guard. It does not catch a cut prompt that is not very long in bytes (code, JSON or CJK between about one and two contexts long, which looks like an honest prompt of about half the context), a cached repeat that reports a short count, or a declared context
+    that differs from the server's. Set the server's context explicitly, or use an engine that answers an over-long prompt with an error (the llama.cpp server returns 400).
 - Candle 0.9.2 -> **0.11** (verified: KV isolation A/B/A on CPU and CUDA, real-weights multimodal tests).
 - `AiKitError::to_error_code()` is **deprecated**: its numbers (20-24, 13, 90) collide with the fabric `ErrorCode` space (a remote peer could trigger an ops alert). Use `to_inference_error_code()`.
 - The router keeps the original typed error when a call fails (an out-of-memory error used to become `Internal`).

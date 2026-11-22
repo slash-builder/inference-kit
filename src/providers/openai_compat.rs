@@ -13,6 +13,11 @@
 //! none. Errors are classes only, never the upstream body. An OpenAI-style `message.refusal` is a *result* ([`FinishReason::Refusal`]),
 //! and a `content_filter` finish ends the chain too.
 //!
+//! **Silent truncation.** Ollama cuts an over-long prompt to about half its context and answers normally. With
+//! [`OpenAiCompatConfig::context_tokens`] declared the adapter refuses what it can recognise as such; that is a partial guard (it
+//! does not catch code, JSON or CJK between one and two contexts long, nor a cached repeat), and the field's documentation says exactly
+//! what it does and does not catch. Set the server's context explicitly, or use an engine that answers an over-long prompt with an error.
+//!
 //! Not in this slice: streaming, tool calls, images, structured output, capacity probing (`/api/ps`). Tested against wiremock; one
 //! `#[ignore]` test runs against a real local Ollama.
 
@@ -48,13 +53,37 @@ pub struct OpenAiCompatConfig {
     /// The limit on the whole request, reply included. For a remote provider, a timeout after the request was sent is charged at the
     /// reserved worst case.
     pub timeout: Duration,
-    /// The context, in tokens per request, that the server was started with, if known. When set, a reply whose reported prompt length is
-    /// about half of it is refused as `ContextOverflow` (see [`looks_cut_to_half`]). **When `None` the adapter cannot tell a cut prompt
-    /// from a short one**, so a server that truncates silently (Ollama does, at a default of 4,096 tokens) is unguarded: set this for
-    /// any such server. Seen with Ollama 0.35.1 and 0.40.13 on Linux, Windows and macOS.
+    /// The context, in tokens per request, that the server was started with, if known. `None` (or 0) turns the guards below off.
+    ///
+    /// Servers such as Ollama cut an over-long prompt to about half the context and answer normally, reporting the CUT length as the
+    /// prompt size (2,050 for a 4,096 context; seen with Ollama 0.35.1 and 0.40.13 on Linux, Windows and macOS). The adapter cannot see
+    /// the cut, so when this is set it applies three checks and answers `ContextOverflow` to what they catch:
+    ///
+    /// 1. **Before sending**: a prompt of more than 8 bytes per context token (over `8 * context_tokens` bytes) is refused unsent.
+    /// 2. **On the reply**: the reported prompt length is within 16 tokens of half the context, is at least 256, and the prompt is longer
+    ///    than 8 bytes per *reported* token (`looks_cut_to_half`). Any spend has already been settled by then: the call was made
+    ///    and paid for, and the answer is dropped.
+    /// 3. **On the reply**: the reported prompt and completion lengths together exceed the context by more than 16 tokens. The server
+    ///    cannot hold that many, so it shifted its window during generation and discarded the start of the prompt.
+    ///
+    /// **This is a partial guard, not a proof.** What it cannot catch:
+    /// - A cut prompt that is not very long in bytes. Check 2 compares bytes with the CUT token count, so it needs more than
+    ///   `4 * context_tokens` bytes (16.4 KB for 4,096); a prompt between 1x and 2x the context in tokens is caught only if it is
+    ///   English-like prose. Code and JSON (about 3 bytes per token, cut from 12 KB) and Chinese, Japanese or Korean text (about 2 to 3
+    ///   bytes per token, cut from 8 KB) are answered unflagged up to roughly 1.3x to 2x the context. These cannot be told from an honest
+    ///   prompt of about half the context: the same reported length, a similar byte count.
+    /// - A reply that omits `usage.prompt_tokens`, or reports a count that is not the prompt's (a server that caches the prompt prefix
+    ///   reports only the part it processed, so a repeat of the same over-long prompt can show 0): check 2 never refuses on missing
+    ///   data, only check 1 applies.
+    /// - A declared context that is not the one the server runs with. If it is smaller, honest replies can be refused.
+    ///
+    /// The robust remedy is on the server: set its context explicitly and large enough (for Ollama, `num_ctx` or `OLLAMA_CONTEXT_LENGTH`),
+    /// or use an engine that answers an over-long prompt with an error (the llama.cpp server returns HTTP 400, which this adapter maps to
+    /// `ContextOverflow` without any of the above).
     ///
     /// **API note:** adding this public field breaks code that builds `OpenAiCompatConfig` with a struct literal. Start from
-    /// `OpenAiCompatConfig::ollama(..)` and assign the fields you need.
+    /// `OpenAiCompatConfig::ollama(..)` and assign the fields you need. Setting it also means `call` can return `ContextOverflow` for a
+    /// reply that used to be returned as an answer.
     pub context_tokens: Option<u32>,
     /// The limit on making the connection. A host that does not answer within it is a request that was never sent: released, not charged.
     pub connect_timeout: Duration,
@@ -115,21 +144,54 @@ fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// More bytes per token than any ordinary text has. A prompt with fewer bytes than `reported_tokens * this` could honestly have been that
-/// many tokens; one with more could not have been that short.
+/// More bytes per token than any ordinary text has (English prose is about 4, code about 3, CJK 2 to 3). A prompt with fewer bytes than
+/// `tokens * this` could honestly have been that many tokens; one with more could not have been that short. Not a proof: long runs of
+/// padding or whitespace tokenise to few tokens and can exceed it.
 const MAX_PLAUSIBLE_BYTES_PER_TOKEN: u64 = 8;
+/// How far from `context / 2` a reported prompt length may be and still look like a cut (Ollama reports `context / 2 + 2`).
+const CUT_WINDOW_TOKENS: u64 = 16;
+/// Below this a reported length is too common in honest prompts to mean anything.
+const MIN_CUT_TOKENS: u64 = 256;
+/// Tokens the reported prompt and completion may exceed the context by before a window shift is concluded (the last sampled token is
+/// not fed back, so the sum can honestly reach `context + 1`).
+const SHIFT_SLACK_TOKENS: u64 = 16;
+
+/// True if the prompt is so long in bytes that it cannot have fit the context, whatever it is made of: more than
+/// [`MAX_PLAUSIBLE_BYTES_PER_TOKEN`] bytes for every token of the context. Decided before anything is sent, so it needs nothing from the
+/// reply (it also catches a repeat of a prompt the server has cached, which reports a short count). For 4,096 that is over 32 KB, about
+/// twice the context in English prose and more for code or CJK, so most prompts that are cut are **not** caught by it.
+fn exceeds_any_honest_context(prompt_bytes: u64, context_tokens: u32) -> bool {
+    prompt_bytes > u64::from(context_tokens) * MAX_PLAUSIBLE_BYTES_PER_TOKEN
+}
 
 /// True if a reported prompt length is the signature of a prompt silently cut to about half the context: Ollama's llama.cpp runner runs
 /// with context shift on, keeps roughly `ctx / 2` tokens (2,050 for 4,096) and answers normally. Seen on Linux, Windows and macOS with
-/// Ollama 0.35.1 and 0.40.13. Two conditions must both hold, so an honest prompt is not refused just because its length happens to be
-/// near half the context: the reported length is within a narrow window of `ctx / 2`, **and** the prompt that was sent is too long, in
-/// bytes, to have honestly been that short. A cut that lands outside the window is not caught, which is why the field that enables this
-/// is documented as a partial guard, not a proof.
+/// Ollama 0.35.1 and 0.40.13. Three conditions must all hold, so an honest prompt is not refused just because its length happens to be
+/// near half the context: the reported length is at least 256, it is within 16 tokens of `ctx / 2`, **and** the prompt that was sent is
+/// too long, in bytes, to have honestly been that short (more than 8 bytes per reported token).
+///
+/// The last condition is against the CUT count, not the original one, so it needs more than `4 * ctx` bytes: a cut prompt shorter than
+/// that (code, JSON or CJK between one and two contexts long) is **not** recognised, because it looks like an honest prompt of about half
+/// the context. A false refusal throws away a reply that was already paid for, so the guard prefers to miss.
 fn looks_cut_to_half(prompt_tokens: u64, context_tokens: u32, prompt_bytes: u64) -> bool {
     let half = u64::from(context_tokens) / 2;
-    prompt_tokens >= 256
-        && prompt_tokens.abs_diff(half) <= 16
+    prompt_tokens >= MIN_CUT_TOKENS
+        && prompt_tokens.abs_diff(half) <= CUT_WINDOW_TOKENS
         && prompt_bytes / MAX_PLAUSIBLE_BYTES_PER_TOKEN > prompt_tokens
+}
+
+/// True if the reported prompt and completion lengths cannot both have fit the context: the server shifted its window mid-generation and
+/// dropped the start of the prompt (a prompt that fits, with a completion that does not). Exact when the declared context is the real
+/// one; says nothing if either count is missing.
+fn shifted_during_generation(
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    context_tokens: u32,
+) -> bool {
+    match (prompt_tokens, completion_tokens) {
+        (Some(p), Some(c)) => p.saturating_add(c) > u64::from(context_tokens) + SHIFT_SLACK_TOKENS,
+        _ => false,
+    }
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -328,6 +390,13 @@ impl OpenAiCompatAdapter {
         } else {
             p.max_tokens
         };
+        // A prompt that cannot fit is refused before anything is reserved or sent.
+        let context = self.cfg.context_tokens.filter(|c| *c > 0);
+        if let Some(ctx) = context {
+            if exceeds_any_honest_context(p.prompt.len() as u64, ctx) {
+                return Err(ProviderError::ContextOverflow);
+            }
+        }
         let reservation = match &self.budget {
             Some(b) => Some(
                 b.ledger.reserve(
@@ -372,9 +441,14 @@ impl OpenAiCompatAdapter {
                 b.ledger.settle_reserved(r);
             }
         }
-        // A server that cuts an over-long prompt and answers anyway (Ollama) reports the CUT length. Refuse, after any spend is settled above.
-        if let Some(ctx) = self.cfg.context_tokens {
-            if looks_cut_to_half(usage.input_tokens, ctx, p.prompt.len() as u64) {
+        // A server that cuts an over-long prompt and answers anyway (Ollama) reports the CUT length, and one that shifts its window
+        // while generating reports counts that do not fit. Refuse, after any spend is settled above. Missing counts never refuse.
+        if let Some(ctx) = context {
+            let prompt_tokens = resp["usage"]["prompt_tokens"].as_u64();
+            let completion_tokens = resp["usage"]["completion_tokens"].as_u64();
+            if prompt_tokens.is_some_and(|t| looks_cut_to_half(t, ctx, p.prompt.len() as u64))
+                || shifted_during_generation(prompt_tokens, completion_tokens, ctx)
+            {
                 return Err(ProviderError::ContextOverflow);
             }
         }
@@ -614,43 +688,165 @@ mod tests {
     }
 
     fn chat_reporting(prompt_tokens: u64) -> Value {
+        chat_reporting_both(prompt_tokens, 3)
+    }
+    fn chat_reporting_both(prompt_tokens: u64, completion_tokens: u64) -> Value {
         json!({"id":"c1","model":"test-model:served","choices":[{"index":0,"message":{"role":"assistant","content":"an answer"},"finish_reason":"stop"}],
-               "usage":{"prompt_tokens":prompt_tokens,"completion_tokens":3}})
+               "usage":{"prompt_tokens":prompt_tokens,"completion_tokens":completion_tokens}})
     }
 
-    /// About 32 KB: too long, in bytes, to honestly be only about 2,050 tokens.
-    fn long_prompt() -> String {
-        "The household notes were filed under their own heading. ".repeat(600)
+    /// English-like prose of about `bytes` bytes (about 4 to 5 bytes per token).
+    fn prose(bytes: usize) -> String {
+        let sentence = "The household notes were filed under their own heading. ";
+        sentence
+            .repeat(bytes / sentence.len() + 1)
+            .chars()
+            .take(bytes)
+            .collect()
     }
+    /// A JSON document of `bytes` bytes: about 3 bytes per token.
+    fn json_doc(bytes: usize) -> String {
+        let row = r#"{"id":1234,"kind":"entry","tags":["a","b"],"ok":true},"#;
+        format!("[{}]", row.repeat(bytes / row.len() + 1))
+            .chars()
+            .take(bytes)
+            .collect()
+    }
+    /// Chinese text of `chars` characters: 3 bytes each in UTF-8, about 2 to 3 bytes per token.
+    fn cjk(chars: usize) -> String {
+        "家庭记录按各自的标题归档。"
+            .chars()
+            .cycle()
+            .take(chars)
+            .collect()
+    }
+
+    /// An adapter against `s` declaring `ctx`, and what it answered to `prompt`.
+    async fn answer(
+        s: &MockServer,
+        ctx: Option<u32>,
+        prompt: &str,
+    ) -> Result<ProviderReply, ProviderError> {
+        let mut c = cfg(s);
+        c.context_tokens = ctx;
+        OpenAiCompatAdapter::new(c, None, None)
+            .unwrap()
+            .call(&text(prompt))
+            .await
+    }
+    async fn answering(reply: Value) -> MockServer {
+        let s = MockServer::start().await;
+        serve(&s, 200, reply).await;
+        s
+    }
+
+    #[test]
+    fn the_fixtures_have_the_byte_lengths_the_tests_say_they_have() {
+        for n in [1usize, 12_000, 16_400, 32_769, 184_000] {
+            assert_eq!(prose(n).len(), n);
+            assert_eq!(json_doc(n).len(), n);
+        }
+        assert_eq!(cjk(5000).len(), 15_000);
+    }
+
+    // ---- the decisions, as plain functions ----
+
+    #[test]
+    fn the_window_around_half_the_context_is_exactly_16_tokens_wide_at_every_context_size() {
+        let huge = 100_000_000;
+        for ctx in [1024u32, 2048, 4096, 4097, 8192, 32_768, 131_072] {
+            let half = u64::from(ctx) / 2;
+            for off in 0..=16u64 {
+                assert!(
+                    looks_cut_to_half(half + off, ctx, huge),
+                    "ctx {ctx}: half + {off}"
+                );
+                assert!(
+                    looks_cut_to_half(half - off, ctx, huge),
+                    "ctx {ctx}: half - {off}"
+                );
+            }
+            assert!(!looks_cut_to_half(half + 17, ctx, huge), "ctx {ctx}: +17");
+            assert!(!looks_cut_to_half(half - 17, ctx, huge), "ctx {ctx}: -17");
+        }
+    }
+
+    #[test]
+    fn a_reported_length_under_256_is_never_a_cut() {
+        // the floor binds only where the window reaches below it: contexts of about 512 and under
+        for (ctx, reported, want) in [
+            (510u32, 255u64, false), // in the window, under the floor
+            (510, 256, true),
+            (500, 250, false),
+            (500, 256, true),
+            (512, 256, true),
+            (256, 128, false),
+            (64, 32, false),
+        ] {
+            assert_eq!(
+                looks_cut_to_half(reported, ctx, 1_000_000),
+                want,
+                "ctx {ctx}, reported {reported}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_prompt_must_be_longer_than_8_bytes_per_reported_token() {
+        // 2,050 reported: 16,400 bytes is the most an honest 2,050-token prompt can have at 8 per token
+        assert!(!looks_cut_to_half(2050, 4096, 16_400));
+        assert!(!looks_cut_to_half(2050, 4096, 16_407));
+        assert!(looks_cut_to_half(2050, 4096, 16_408));
+        assert!(!looks_cut_to_half(2050, 4096, 0));
+    }
+
+    #[test]
+    fn a_prompt_of_over_8_bytes_per_context_token_is_over_the_context() {
+        assert!(!exceeds_any_honest_context(32_768, 4096));
+        assert!(exceeds_any_honest_context(32_769, 4096));
+        assert!(!exceeds_any_honest_context(0, 4096));
+        assert!(exceeds_any_honest_context(17, 2));
+    }
+
+    #[test]
+    fn counts_that_cannot_both_fit_the_context_mean_the_window_shifted() {
+        assert!(!shifted_during_generation(Some(3000), Some(1096), 4096));
+        assert!(!shifted_during_generation(Some(3000), Some(1112), 4096)); // exactly 16 over
+        assert!(shifted_during_generation(Some(3000), Some(1113), 4096));
+        assert!(!shifted_during_generation(None, Some(9999), 4096));
+        assert!(!shifted_during_generation(Some(9999), None, 4096));
+        assert!(!shifted_during_generation(None, None, 4096));
+        assert!(shifted_during_generation(
+            Some(u64::MAX),
+            Some(u64::MAX),
+            4096
+        ));
+    }
+
+    // ---- the guard against a prompt cut to half the context ----
 
     /// An honest prompt whose real length happens to be about half the context must still be answered: it is short in bytes, so it could
     /// honestly have been that many tokens.
     #[tokio::test]
     async fn an_honest_prompt_that_is_about_half_the_context_is_an_answer() {
-        let s = MockServer::start().await;
-        serve(&s, 200, chat_reporting(2050)).await;
-        let mut c = cfg(&s);
-        c.context_tokens = Some(4096);
-        let a = OpenAiCompatAdapter::new(c, None, None).unwrap();
+        let s = answering(chat_reporting(2050)).await;
         let honest = "word ".repeat(1600); // 8,000 bytes: could well be 2,050 tokens
-        let r = a
-            .call(&text(&honest))
+        let r = answer(&s, Some(4096), &honest)
             .await
             .expect("an honest prompt was refused");
         assert_eq!(out(&r), "an answer");
+        // even a dense one: 16,400 bytes is 8 bytes for every one of 2,050 tokens
+        assert!(answer(&s, Some(4096), &prose(16_400)).await.is_ok());
     }
 
     /// Ollama keeps about half the context of an over-long prompt, answers normally (finish "stop") and reports the CUT prompt length:
     /// 2,050 for a 4,096 context, on every platform and version tried (2026-11-21). The locked rule is that overflow is a hard error.
     #[tokio::test]
-    async fn a_prompt_cut_to_about_half_the_declared_context_is_an_overflow_not_an_answer() {
-        for reported in [2048u64, 2050, 2040, 2060] {
-            let s = MockServer::start().await;
-            serve(&s, 200, chat_reporting(reported)).await;
-            let mut c = cfg(&s);
-            c.context_tokens = Some(4096);
-            let a = OpenAiCompatAdapter::new(c, None, None).unwrap();
-            let got = a.call(&text(&long_prompt())).await;
+    async fn a_prose_prompt_cut_to_about_half_the_declared_context_is_an_overflow_not_an_answer() {
+        // 20 KB of prose is about 4,400 tokens, over a 4,096 context
+        for reported in [2032u64, 2040, 2048, 2050, 2060, 2064] {
+            let s = answering(chat_reporting(reported)).await;
+            let got = answer(&s, Some(4096), &prose(20_000)).await;
             assert!(
                 matches!(got, Err(ProviderError::ContextOverflow)),
                 "{reported} prompt tokens against a 4096 context must be refused, got {got:?}"
@@ -659,28 +855,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_long_prompt_reporting_a_length_just_outside_the_window_is_an_answer() {
+        for reported in [2031u64, 2065, 255, 4096] {
+            let s = answering(chat_reporting(reported)).await;
+            assert!(
+                answer(&s, Some(4096), &prose(20_000)).await.is_ok(),
+                "{reported}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_guard_follows_the_declared_context_size() {
+        // (context, the cut length Ollama reports, a prompt of about 1.4 contexts of prose)
+        for (ctx, cut, bytes) in [
+            (2048u32, 1026u64, 11_500usize),
+            (4096, 2050, 23_000),
+            (8192, 4098, 46_000),
+            (32_768, 16_386, 184_000),
+        ] {
+            let s = answering(chat_reporting(cut)).await;
+            let got = answer(&s, Some(ctx), &prose(bytes)).await;
+            assert!(
+                matches!(got, Err(ProviderError::ContextOverflow)),
+                "ctx {ctx}: {got:?}"
+            );
+            // the same report against a different declared context is not a cut
+            assert!(answer(&s, Some(ctx * 2 + 4096), &prose(bytes))
+                .await
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
     async fn ordinary_prompt_lengths_are_answers_even_with_a_declared_context() {
         for reported in [7u64, 300, 511, 1500, 1900, 2100, 2500, 3900, 4096] {
-            let s = MockServer::start().await;
-            serve(&s, 200, chat_reporting(reported)).await;
-            let mut c = cfg(&s);
-            c.context_tokens = Some(4096);
-            let a = OpenAiCompatAdapter::new(c, None, None).unwrap();
-            let r = a
-                .call(&text("hi"))
+            let s = answering(chat_reporting(reported)).await;
+            let r = answer(&s, Some(4096), "hi")
                 .await
                 .unwrap_or_else(|e| panic!("{reported} tokens was refused: {e:?}"));
             assert_eq!(out(&r), "an answer");
         }
     }
 
-    /// The limit stated in the field's documentation, as a test: with no declared context nothing can be told, so nothing is refused.
+    /// The limit, stated as tests: a cut prompt that is not very long in bytes looks exactly like an honest prompt of about half the context,
+    /// so it is answered. Code and JSON (about 3 bytes per token) and CJK (about 2 to 3) between one and two contexts long fall here.
+    /// If someone makes the guard catch these, they must show an honest prompt is still answered: both are the same `(2050, bytes)`.
+    #[tokio::test]
+    async fn known_miss_dense_prompts_cut_to_half_are_not_recognised() {
+        let s = answering(chat_reporting(2050)).await;
+        // JSON of 12,000 bytes is about 4,000 tokens: right at the context, and cut
+        assert!(answer(&s, Some(4096), &json_doc(12_000)).await.is_ok());
+        // 16,000 bytes of JSON is about 5,300 tokens (1.3x the context), cut to 2,050, still under the 16.4 KB line
+        assert!(answer(&s, Some(4096), &json_doc(16_000)).await.is_ok());
+        // 5,000 Chinese characters: 15,000 bytes, about 5,000 to 7,500 tokens
+        assert!(answer(&s, Some(4096), &cjk(5000)).await.is_ok());
+        // an honest 2,050-token prompt of the same shape is, of course, an answer too
+        assert!(answer(&s, Some(4096), &json_doc(6_000)).await.is_ok());
+    }
+
+    /// The same kinds of prompt are caught once they are long enough in bytes to be too long for 2,050 tokens at 8 bytes per token.
+    #[tokio::test]
+    async fn dense_prompts_far_over_the_context_are_refused() {
+        let s = answering(chat_reporting(2050)).await;
+        for (what, prompt) in [
+            ("json 24 KB (about 8,000 tokens)", json_doc(24_000)),
+            ("cjk 7,000 characters (21 KB)", cjk(7000)),
+        ] {
+            let got = answer(&s, Some(4096), &prompt).await;
+            assert!(
+                matches!(got, Err(ProviderError::ContextOverflow)),
+                "{what}: {got:?}"
+            );
+        }
+    }
+
+    /// With no declared context nothing can be told, so nothing is refused, however long the prompt.
     #[tokio::test]
     async fn without_a_declared_context_a_cut_prompt_cannot_be_told_from_a_short_one() {
+        let s = answering(chat_reporting(2050)).await;
+        assert!(answer(&s, None, &prose(20_000)).await.is_ok());
+        assert!(answer(&s, None, &prose(100_000)).await.is_ok());
+        // a declared context of 0 is "not declared", not "everything overflows"
+        assert!(answer(&s, Some(0), &prose(20_000)).await.is_ok());
+    }
+
+    // ---- before sending ----
+
+    #[tokio::test]
+    async fn a_prompt_over_8_bytes_per_context_token_is_refused_before_it_is_sent() {
         let s = MockServer::start().await;
-        serve(&s, 200, chat_reporting(2050)).await;
-        let a = OpenAiCompatAdapter::new(cfg(&s), None, None).unwrap();
-        assert!(a.call(&text(&long_prompt())).await.is_ok());
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reporting(7)))
+            .expect(0)
+            .mount(&s)
+            .await;
+        let got = answer(&s, Some(4096), &prose(8 * 4096 + 1)).await;
+        assert!(
+            matches!(got, Err(ProviderError::ContextOverflow)),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_of_exactly_8_bytes_per_context_token_is_sent() {
+        let s = answering(chat_reporting(7)).await;
+        assert!(answer(&s, Some(4096), &prose(8 * 4096)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_before_sending_reserves_and_charges_nothing() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reporting(7)))
+            .expect(0)
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas_ctx(&s, &ledger, Some(4096)).unwrap();
+        assert_eq!(
+            a.call(&text(&prose(40_000))).await.unwrap_err(),
+            ProviderError::ContextOverflow
+        );
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    // ---- what the reply does not say ----
+
+    /// A server that caches the prompt prefix may report a short count, or none, for a repeat of the same over-long prompt: the window
+    /// check has nothing to go on and must not refuse on missing data. Only the bytes can still refuse.
+    #[tokio::test]
+    async fn a_reply_with_a_missing_or_zero_prompt_count_is_never_refused_by_the_window_check() {
+        let replies = [
+            chat_reporting(0),
+            json!({"model":"m","choices":[{"message":{"content":"x"},"finish_reason":"stop"}]}),
+            json!({"model":"m","choices":[{"message":{"content":"x"},"finish_reason":"stop"}],"usage":{"completion_tokens":3}}),
+            json!({"model":"m","choices":[{"message":{"content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":null,"completion_tokens":3}}),
+        ];
+        for reply in replies {
+            let s = answering(reply.clone()).await;
+            // 20 KB: over the context, under the pre-flight line, so it is sent and what comes back is all there is to go on
+            assert!(
+                answer(&s, Some(4096), &prose(20_000)).await.is_ok(),
+                "{reply}"
+            );
+            // 40 KB: refused on its length alone, whatever a reply might say
+            let s = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(reply.clone()))
+                .expect(0)
+                .mount(&s)
+                .await;
+            assert!(matches!(
+                answer(&s, Some(4096), &prose(40_000)).await,
+                Err(ProviderError::ContextOverflow)
+            ));
+        }
+    }
+
+    // ---- the window shifts while generating ----
+
+    #[tokio::test]
+    async fn a_prompt_that_fits_but_a_completion_that_does_not_is_an_overflow() {
+        // 3,000 + 1,200 = 4,200 against 4,096: the server must have dropped the start of the prompt
+        let s = answering(chat_reporting_both(3000, 1200)).await;
+        let got = answer(&s, Some(4096), "a short prompt").await;
+        assert!(
+            matches!(got, Err(ProviderError::ContextOverflow)),
+            "{got:?}"
+        );
+        // right up to the context (and the slack of the last sampled token) is an answer
+        for completion in [96u64, 1096, 1112] {
+            let s = answering(chat_reporting_both(3000, completion)).await;
+            assert!(
+                answer(&s, Some(4096), "a short prompt").await.is_ok(),
+                "{completion}"
+            );
+        }
+        // with no declared context it is not looked at
+        let s = answering(chat_reporting_both(3000, 1200)).await;
+        assert!(answer(&s, None, "a short prompt").await.is_ok());
+    }
+
+    // ---- the money is already spent ----
+
+    #[tokio::test]
+    async fn a_refused_reply_has_already_been_paid_for_and_the_spend_is_settled() {
+        let replies = [
+            ("cut to half", chat_reporting(2050), prose(20_000)),
+            (
+                "window shifted",
+                chat_reporting_both(3000, 1200),
+                "hi".to_string(),
+            ),
+        ];
+        for (what, reply, prompt) in replies {
+            let s = answering(reply.clone()).await;
+            let ledger = Arc::new(Ledger::new(10_000_000));
+            let a = saas_ctx(&s, &ledger, Some(4096)).unwrap();
+            assert_eq!(
+                a.call(&text(&prompt)).await.unwrap_err(),
+                ProviderError::ContextOverflow,
+                "{what}"
+            );
+            let usage = Usage {
+                input_tokens: reply["usage"]["prompt_tokens"].as_u64().unwrap(),
+                output_tokens: reply["usage"]["completion_tokens"].as_u64().unwrap(),
+                ..Usage::default()
+            };
+            assert!(PAID.cost(&usage) > 0);
+            assert_eq!(ledger.spent(), PAID.cost(&usage), "{what}");
+            assert_eq!(ledger.available(), 10_000_000 - ledger.spent(), "{what}");
+        }
     }
 
     #[tokio::test]
@@ -1076,8 +1462,10 @@ mod tests {
         assert!(a.health().await);
     }
 
-    /// Against a REAL local Ollama started with a 4,096-token context (its default). A prompt of roughly 6,000 tokens is silently cut to
-    /// about 2,050 and answered normally; with the context declared the adapter must refuse it, and a short prompt must still be answered.
+    /// Against a REAL local Ollama started with a 4,096-token context (its default). Prose of 6 bytes per context token is about 1.3
+    /// contexts: Ollama cuts it to about half and answers normally, and the reply check must refuse it. A short prompt must still be
+    /// answered; a prompt of over 8 bytes per context token is refused before it is sent. Dense prompts of the same token length (JSON) are
+    /// only printed, not asserted: they are the documented miss.
     /// `AI_KIT_OLLAMA_MODEL` (default `qwen2.5:7b`) must be installed; `AI_KIT_OLLAMA_CTX` is the context the server runs with (default 4096).
     #[tokio::test]
     #[ignore = "needs a running Ollama with the model installed"]
@@ -1099,18 +1487,41 @@ mod tests {
             .await
             .unwrap();
         println!("short prompt answered: {:?}", out(&r));
-        // about 1.3 tokens per word: enough words to be well over the context
-        let long = "The household notes were filed under their own heading. "
-            .repeat(u64::from(ctx) as usize / 8 * 2);
+
+        let ctx_bytes = ctx as usize;
+        // over 4 bytes per context token (so the reply check can see it) and under 8 (so it is sent): about 1.3 contexts of prose
+        let long = prose(ctx_bytes * 6);
         let got = a.call(&text(&long)).await;
         println!(
-            "long prompt ({} bytes): {:?}",
+            "prose, {} bytes: {:?}",
             long.len(),
-            got.as_ref().map(out)
+            got.as_ref().map(|r| match &r.output {
+                Output::Text(t) => t.prompt_tokens,
+                _ => 0,
+            })
         );
         assert!(
             matches!(got, Err(ProviderError::ContextOverflow)),
-            "an over-long prompt must be refused, not answered"
+            "a cut prompt must be refused, not answered"
+        );
+
+        // over 8 bytes per context token: refused without being sent
+        let huge = prose(ctx_bytes * 9);
+        assert!(matches!(
+            a.call(&text(&huge)).await,
+            Err(ProviderError::ContextOverflow)
+        ));
+
+        // the documented miss: dense text about 1.3 contexts long is cut and answered
+        let dense = json_doc(ctx_bytes * 4);
+        let got = a.call(&text(&dense)).await;
+        println!(
+            "json, {} bytes (not asserted; expected to be answered): {:?}",
+            dense.len(),
+            got.as_ref().map(|r| match &r.output {
+                Output::Text(t) => t.prompt_tokens,
+                _ => 0,
+            })
         );
     }
 
@@ -1239,7 +1650,25 @@ mod tests {
         pricing: Pricing,
         timeout: Duration,
     ) -> Result<OpenAiCompatAdapter, ConfigError> {
+        saas_with(s, ledger, pricing, timeout, None)
+    }
+    /// A paid adapter that declares its context.
+    fn saas_ctx(
+        s: &MockServer,
+        ledger: &Arc<Ledger>,
+        ctx: Option<u32>,
+    ) -> Result<OpenAiCompatAdapter, ConfigError> {
+        saas_with(s, ledger, PAID, Duration::from_secs(5), ctx)
+    }
+    fn saas_with(
+        s: &MockServer,
+        ledger: &Arc<Ledger>,
+        pricing: Pricing,
+        timeout: Duration,
+        ctx: Option<u32>,
+    ) -> Result<OpenAiCompatAdapter, ConfigError> {
         let mut c = cfg(s);
+        c.context_tokens = ctx;
         c.locality = Locality::Saas;
         c.credential_name = Some("key".into());
         c.embedding_model = Some("embed-model".into());
