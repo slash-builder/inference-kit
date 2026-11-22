@@ -26,7 +26,8 @@ pub enum ConfigError {
     CredentialUnavailable,
     BadUrl,
     HttpClient,
-    /// A provider that leaves the home was given prices that are all zero, so the spend ledger could never refuse a call.
+    /// A provider that leaves the home was given prices that cannot cap every kind of request it offers (a zero input or output rate), so
+    /// the spend ledger could never refuse such a call.
     UnpricedProvider,
 }
 
@@ -42,7 +43,7 @@ impl fmt::Display for ConfigError {
             ConfigError::BadUrl => "the base URL is not valid",
             ConfigError::HttpClient => "the HTTP client could not be built",
             ConfigError::UnpricedProvider => {
-                "a remote provider needs declared prices; all-zero pricing cannot be capped"
+                "a remote provider needs a declared price for every kind of request it offers; a zero rate cannot be capped"
             }
         })
     }
@@ -56,15 +57,58 @@ pub struct Budget {
     pub pricing: Pricing,
 }
 
+/// Refuse prices the ledger could not enforce for the request `kinds` an adapter offers: a kind whose reservation would come to zero
+/// (a missing input or output rate) is never capped, so the adapter must not be built. A rate of zero is a declaration of "free", and a
+/// provider that leaves the home is never taken at its word on that.
+#[cfg(any(
+    feature = "provider-anthropic",
+    feature = "provider-openai-compat",
+    feature = "provider-gemini"
+))]
+pub(crate) fn validate_pricing(
+    pricing: &Pricing,
+    kinds: &[crate::modality::RequestKind],
+) -> Result<(), ConfigError> {
+    if kinds.iter().all(|k| pricing.can_cap(*k)) {
+        Ok(())
+    } else {
+        Err(ConfigError::UnpricedProvider)
+    }
+}
+
+/// How long a connection may take to be made before the request is given up as never sent.
+#[cfg(any(
+    feature = "provider-anthropic",
+    feature = "provider-openai-compat",
+    feature = "provider-gemini"
+))]
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The HTTP client every adapter starts from. The connect phase has its own, shorter limit so that a host that never answers is
+/// reported as a connection that was never made (the request was not sent, so it is not billed), not as a timeout of a request that may
+/// have been.
+#[cfg(any(
+    feature = "provider-anthropic",
+    feature = "provider-openai-compat",
+    feature = "provider-gemini"
+))]
+pub(crate) fn http_builder(
+    timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+}
+
 #[cfg(any(feature = "provider-openai-compat", feature = "provider-gemini"))]
 impl Budget {
-    /// Refuse prices the ledger could not enforce (all zero).
-    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
-        if self.pricing.is_unpriced() {
-            Err(ConfigError::UnpricedProvider)
-        } else {
-            Ok(())
-        }
+    /// Refuse prices the ledger could not enforce for these request kinds (see [`validate_pricing`]).
+    pub(crate) fn validate(
+        &self,
+        kinds: &[crate::modality::RequestKind],
+    ) -> Result<(), ConfigError> {
+        validate_pricing(&self.pricing, kinds)
     }
 
     /// The most an embedding call over `inputs` could cost: every input at ~1 token per 3 bytes (rounded up), at the input rate. The same
@@ -85,6 +129,34 @@ impl Budget {
 ))]
 pub(crate) fn may_have_been_billed(e: &reqwest::Error) -> bool {
     !(e.is_connect() || e.is_builder())
+}
+
+/// Helpers for the adapters' tests.
+#[cfg(all(
+    test,
+    any(
+        feature = "provider-anthropic",
+        feature = "provider-openai-compat",
+        feature = "provider-gemini"
+    )
+))]
+pub(crate) mod test_support {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    /// The `host:port` of an address on which a connection attempt hangs (packets are dropped, nothing refuses), or `None` where that is
+    /// not so (no route, a refusal, or something answers). It is probed, not assumed: a test that needs a connect timeout must skip, not
+    /// fail, on a machine whose network does not blackhole this address.
+    pub(crate) fn blackholed_addr() -> Option<String> {
+        let addr: SocketAddr = "10.255.255.1:81".parse().ok()?;
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Some(addr.to_string()),
+            _ => {
+                eprintln!("skipped: {addr} is not blackholed on this network");
+                None
+            }
+        }
+    }
 }
 
 #[cfg(feature = "provider-anthropic")]
