@@ -150,13 +150,13 @@ pipeline {
           }
         }
 
-        // The Windows and macOS legs run on agents this repo does not control (mars, saturn), and
+        // The Windows and macOS legs run on agents this repo does not control (mars, terra), and
         // they come and go. They are verification, not a release gate, so they must never block
         // Publish. Two things used to:
         //   1. catchError defaults to buildResult FAILURE, and a declarative pipeline does not run
         //      later stages once the build is FAILURE -- so one failing leg skipped Publish.
-        //   2. A stage-level `agent { label 'saturn' }` waits for an agent with no limit, so an
-        //      offline saturn hung the whole build (and the PR check) until someone cancelled it.
+        //   2. A stage-level `agent { label 'darwin && arm64' }` waits for an agent with no limit, so an
+        //      offline Mac agent hung the whole build (and the PR check) until someone cancelled it.
         // optionalLeg() fixes both: a leg that cannot get an agent is abandoned (yellow stage, build still
         // green); a leg that runs and fails makes the build UNSTABLE and Publish still runs. A leg that takes too
         // long is stopped. Publish still runs on main, and the unstable result stays visible.
@@ -179,7 +179,7 @@ pipeline {
         stage('macos-arm64') {
           steps {
             script {
-              optionalLeg('macos-arm64', 'saturn', 40) {
+              optionalLeg('macos-arm64', 'darwin && arm64', 40) {
                 sh '''
                   rustup component add rustfmt clippy
                   cargo fmt --check
