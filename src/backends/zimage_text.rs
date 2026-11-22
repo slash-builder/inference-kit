@@ -8,6 +8,7 @@
 //! The maths mirrors Candle's `z_image::text_encoder` exactly (RMSNorm on q and k per head, RoPE with theta 1e6, grouped-query
 //! attention with 8 KV heads, SwiGLU); `streaming_matches_candles_full_encoder` checks that on real weights.
 
+use crate::backends::common::VerifiedMaps;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, rms_norm, RmsNorm, VarBuilder};
 use candle_transformers::models::z_image::TextEncoderConfig;
@@ -106,18 +107,11 @@ pub(crate) fn encode_streaming(
 ) -> Result<Tensor> {
     let cfg = TextEncoderConfig::z_image();
     let l = ids.len();
-    // Called once per request, long after `load_model` hashed the shards: re-check each is still the file that was hashed.
-    for shard in shards {
-        crate::backends::common::ensure_unchanged(shard)
-            .map_err(|e| candle_core::Error::msg(e.to_string()))?;
-    }
-    // SAFETY: `from_mmaped_safetensors` is unsafe because behaviour is undefined if a mapped file is modified while mapped. The invariants
-    // relied on: (1) each shard is the file `verify_model_files` hashed against the catalog at load; checked by the `ensure_unchanged`
-    // loop above (size, mtime, device and inode), not re-hashed per request; (2) nothing with write access to the model directory
-    // modifies a shard while it is mapped. (2) is not enforced here: models are immutable OS resources and the directory is not
-    // writable by other principals. Both mappings live only for this call.
-    let on_cpu = unsafe { VarBuilder::from_mmaped_safetensors(shards, dtype, &Device::Cpu)? };
-    let on_dev = unsafe { VarBuilder::from_mmaped_safetensors(shards, dtype, device)? };
+    // Called once per request, long after `load_model` hashed the shards: open each once, check that handle against the hash taken at
+    // load, and map from that same handle (see `VerifiedMaps`). Both builders share the mappings, which live only for this call.
+    let maps = VerifiedMaps::open(shards).map_err(|e| candle_core::Error::msg(e.to_string()))?;
+    let on_cpu = maps.var_builder(dtype, &Device::Cpu)?;
+    let on_dev = maps.var_builder(dtype, device)?;
 
     // embedding lookup on the CPU: only the prompt's rows are copied to the device
     let table = on_cpu

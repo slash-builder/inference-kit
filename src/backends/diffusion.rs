@@ -25,7 +25,9 @@
 //! steps from Candle's own RNG, which this backend seeds on CUDA (so a seed reproduces an image exactly there) but which cannot be seeded
 //! on the CPU. With `steps = 1` (no extra noise) the same seed gives the same image everywhere. No img2img, inpainting or LoRA. One request at a time per model.
 
-use crate::backends::common::{check_vram, device_for, verify_model_files, DevicePreference};
+use crate::backends::common::{
+    check_vram, device_for, verify_model_files, DevicePreference, VerifiedFile,
+};
 use crate::backends::zimage::{ZImageFiles, ZImagePipeline};
 use crate::error::{AiKitError, Result};
 use crate::modality::{
@@ -191,6 +193,14 @@ impl CandleImageService {
         let cfg = StableDiffusionConfig::v2_1(None, Some(512), Some(512));
         let clip_cfg = ClipConfig::v2_1();
         let wrap = |what: &str, e: candle_core::Error| fail(format!("{what}: {e}"));
+        // Candle's SD builders take paths, so these three cannot be handed the checked handle. Best available: check each file against
+        // its recorded hash-time identity immediately before it is opened. A swap in the gap between that check and Candle's open is not
+        // closed here (unlike the Z-Image path, which maps from the checked handle); this runs once at load, not per request.
+        for p in [&clip_path, &vae_path, &unet_path] {
+            VerifiedFile::open(p)?;
+        }
+        let tokenizer = Tokenizer::from_bytes(VerifiedFile::open(&tok_path)?.read_all()?)
+            .map_err(|e| fail(format!("tokenizer: {e}")))?;
         let clip = stable_diffusion::build_clip_transformer(&clip_cfg, &clip_path, &device, dtype)
             .map_err(|e| wrap("text encoder", e))?;
         let vae = cfg
@@ -199,8 +209,6 @@ impl CandleImageService {
         let unet = cfg
             .build_unet(&unet_path, &device, 4, false, dtype)
             .map_err(|e| wrap("unet", e))?;
-        let tokenizer =
-            Tokenizer::from_file(&tok_path).map_err(|e| fail(format!("tokenizer: {e}")))?;
         self.loaded
             .write()
             .map_err(|_| AiKitError::Internal {

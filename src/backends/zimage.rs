@@ -27,6 +27,7 @@
 //! - Dimensions must be multiples of 16. No img2img, LoRA or batching.
 //! - Candle's attention here is the plain matmul-softmax form, so 1024x1024 uses a lot of activation memory.
 
+use crate::backends::common::{VerifiedFile, VerifiedMaps};
 use crate::error::{AiKitError, Result};
 use crate::modality::ImageGenParams;
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
@@ -83,14 +84,6 @@ fn internal(what: &str, e: impl std::fmt::Display) -> AiKitError {
 
 impl ZImagePipeline {
     pub(crate) fn new(files: ZImageFiles, device: Device) -> Self {
-        // fixtures point at local reference weights that did not go through a catalog entry: trust their current state
-        #[cfg(test)]
-        for f in std::iter::once(&files.gguf)
-            .chain(&files.text_encoder_shards)
-            .chain(std::iter::once(&files.vae))
-        {
-            crate::backends::common::trust_for_test(f);
-        }
         // bf16 is what the model is trained and distributed in; every CUDA card the kit targets (sm_80+) has it.
         let dtype = if device.is_cuda() {
             DType::BF16
@@ -102,6 +95,20 @@ impl ZImagePipeline {
             device,
             dtype,
         }
+    }
+
+    /// Test only: for the developer's local reference weights, which did not go through a catalog entry. Records their current state as
+    /// the trusted one. Tests of the verification itself use [`Self::new`] after `verify_model_files`, like production.
+    #[cfg(test)]
+    fn new_trusting_local_files(files: ZImageFiles, device: Device) -> Self {
+        for f in std::iter::once(&files.gguf)
+            .chain(&files.text_encoder_shards)
+            .chain(std::iter::once(&files.vae))
+            .chain(std::iter::once(&files.tokenizer))
+        {
+            crate::backends::common::trust_for_test(f);
+        }
+        Self::new(files, device)
     }
 
     pub(crate) fn device(&self) -> &Device {
@@ -151,8 +158,9 @@ impl ZImagePipeline {
 
     /// Token ids of the chat-templated prompt (diffusers keeps only the valid tokens, truncated to 512).
     fn prompt_ids(&self, prompt: &str) -> Result<Vec<u32>> {
-        let tok =
-            Tokenizer::from_file(&self.files.tokenizer).map_err(|e| internal("tokenizer", e))?;
+        // read through a handle checked against the hash taken at load, not re-opened by path
+        let bytes = VerifiedFile::open(&self.files.tokenizer)?.read_all()?;
+        let tok = Tokenizer::from_bytes(bytes).map_err(|e| internal("tokenizer", e))?;
         let enc = tok
             .encode(Self::chat_prompt(prompt), false)
             .map_err(|e| internal("tokenize", e))?;
@@ -184,15 +192,9 @@ impl ZImagePipeline {
         let input = Tensor::new(ids.as_slice(), &self.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(|e| internal("ids", e))?;
-        let paths: Vec<&str> = self
-            .files
-            .text_encoder_shards
-            .iter()
-            .map(String::as_str)
-            .collect();
-        // SAFETY (test only): maps the developer's local reference weights, which nothing modifies during the run. Production code maps
-        // through `encode_streaming` and `decode`, which re-check the file first.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, self.dtype, &self.device) }
+        let maps = VerifiedMaps::open(&self.files.text_encoder_shards)?;
+        let vb = maps
+            .var_builder(self.dtype, &self.device)
             .map_err(|e| internal("text encoder weights", e))?;
         let te = ZImageTextEncoder::new(&TextEncoderConfig::z_image(), vb)
             .map_err(|e| internal("text encoder", e))?;
@@ -287,22 +289,12 @@ impl ZImagePipeline {
     // ------------------------------------------------------------------ phase 3: VAE
 
     fn decode(&self, latents: &Tensor) -> Result<Vec<u8>> {
-        // Called once per request, long after `load_model` hashed the file: re-check it is still that file before mapping it.
-        crate::backends::common::ensure_unchanged(&self.files.vae)?;
-        // SAFETY: `from_mmaped_safetensors` is unsafe because behaviour is undefined if the mapped file is modified while mapped. The
-        // invariants relied on: (1) the file at this path is the one `verify_model_files` hashed against the catalog at load; that is
-        // checked by the `ensure_unchanged` call above (size, mtime, device and inode, so a swap or rewrite since load is refused) and
-        // is NOT re-hashed per request; (2) nothing with write access to the model directory modifies it while it is mapped. (2) is not
-        // enforced here: models are immutable OS resources and the directory is not writable by other principals. The mapping lives only
-        // for this call.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[self.files.vae.as_str()],
-                self.dtype,
-                &self.device,
-            )
-        }
-        .map_err(|e| internal("vae weights", e))?;
+        // Called once per request, long after `load_model` hashed the file: open it once, check that handle against the hash taken at
+        // load, and map from that same handle (see `VerifiedMaps`). The mapping lives only for this call.
+        let maps = VerifiedMaps::open(&[self.files.vae.as_str()])?;
+        let vb = maps
+            .var_builder(self.dtype, &self.device)
+            .map_err(|e| internal("vae weights", e))?;
         let vae = AutoEncoderKL::new(&VaeConfig::z_image(), vb).map_err(|e| internal("vae", e))?;
         let (lh, lw) = (
             latents.dim(2).map_err(|e| internal("latents", e))?,
@@ -435,22 +427,21 @@ struct Weights {
 
 impl Weights {
     fn open(gguf: &str, device: &Device, dtype: DType) -> Result<Self> {
-        // re-opened per request (read, not mapped): refuse a file that is not the one hashed at load
-        crate::backends::common::ensure_unchanged(gguf)?;
-        let mut file = std::fs::File::open(gguf)?;
-        let content =
-            gguf_file::Content::read(&mut file).map_err(|e| internal("gguf header", e))?;
+        // re-opened per request: open once, check that handle against the hash taken at load, and read everything from it
+        let mut verified = VerifiedFile::open(gguf)?;
+        let file = verified.file_mut();
+        let content = gguf_file::Content::read(file).map_err(|e| internal("gguf header", e))?;
         let mut map = HashMap::new();
         for (name, info) in &content.tensor_infos {
             let w = match info.ggml_dtype {
                 GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => Weight::Quant(Arc::new(
                     content
-                        .tensor(&mut file, name, device)
+                        .tensor(file, name, device)
                         .map_err(|e| internal(&format!("upload {name}"), e))?,
                 )),
                 _ => {
                     let qt = content
-                        .tensor(&mut file, name, &Device::Cpu)
+                        .tensor(file, name, &Device::Cpu)
                         .map_err(|e| internal(&format!("read {name}"), e))?;
                     Weight::Dense(
                         qt.dequantize(&Device::Cpu)
@@ -461,6 +452,8 @@ impl Weights {
             };
             map.insert(name.clone(), w);
         }
+        // nothing wrote to the file while it was being read
+        verified.recheck()?;
         Ok(Self {
             map,
             device: device.clone(),
@@ -747,6 +740,200 @@ mod tests {
         assert!(s.windows(2).all(|w| w[0] > w[1]), "strictly decreasing");
     }
 
+    // ---- the per-request re-check of files hashed at load, through the real code paths with tiny synthetic files ----------------------
+
+    const CHANGED: &str = "changed since it was verified";
+
+    /// Files laid out and verified the way production does it (`verify_model_files` on a catalog entry), then a pipeline over them.
+    struct Verified {
+        _dir: tempfile::TempDir,
+        files: ZImageFiles,
+        pipe: ZImagePipeline,
+    }
+
+    fn safetensors_bytes() -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.safetensors");
+        let t = Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap();
+        candle_core::safetensors::save(&HashMap::from([("w".to_string(), t)]), &p).unwrap();
+        std::fs::read(p).unwrap()
+    }
+
+    fn verified_fixture() -> Verified {
+        use crate::types::{ModelFile, ModelMetadata, ModelMetadataExtended};
+        let dir = tempfile::tempdir().unwrap();
+        let st = safetensors_bytes();
+        let content: [(&str, &str, Vec<u8>); 4] = [
+            (
+                "gguf",
+                "m.gguf",
+                b"not a real gguf, just bytes to hash".to_vec(),
+            ),
+            ("text_encoder", "te.safetensors", st.clone()),
+            ("vae", "vae.safetensors", st),
+            (
+                "tokenizer",
+                "tokenizer.json",
+                b"{ not a tokenizer }".to_vec(),
+            ),
+        ];
+        let mut paths = HashMap::new();
+        let mut extra = Vec::new();
+        for (role, name, bytes) in &content {
+            let p = dir.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            let p = p.to_str().unwrap().to_string();
+            if *role != "gguf" {
+                extra.push(ModelFile {
+                    role: role.to_string(),
+                    location: format!("file://{p}"),
+                    hash: blake3::hash(bytes).to_hex().to_string(),
+                    size_bytes: bytes.len() as u64,
+                });
+            }
+            paths.insert(*role, p);
+        }
+        let gguf = &content[0].2;
+        let model = ModelMetadata {
+            id: "z".into(),
+            version: "1".into(),
+            os_arch: vec![],
+            quantization_variants: vec![],
+            default_quantization: String::new(),
+            hash: blake3::hash(gguf).to_hex().to_string(),
+            size_bytes: gguf.len() as u64,
+            location: format!("file://{}", paths["gguf"]),
+            metadata: ModelMetadataExtended {
+                parameters: 0,
+                context_window: 0,
+                vram_required_mb: 0,
+                inference_latency_ms: 0,
+                framework: String::new(),
+                custom: HashMap::new(),
+            },
+            files: extra,
+        };
+        // let the filesystem's timestamp tick pass, so an in-place rewrite later cannot share the stamp's tick
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        crate::backends::common::verify_model_files(&model).unwrap();
+        let mk = || ZImageFiles {
+            gguf: paths["gguf"].clone(),
+            text_encoder_shards: vec![paths["text_encoder"].clone()],
+            vae: paths["vae"].clone(),
+            tokenizer: paths["tokenizer"].clone(),
+        };
+        Verified {
+            _dir: dir,
+            files: mk(),
+            pipe: ZImagePipeline::new(mk(), Device::Cpu),
+        }
+    }
+
+    /// Replace `path` with a different file of the same size, by rename (a new inode).
+    fn swap_by_rename(path: &str) {
+        let mut b = std::fs::read(path).unwrap();
+        *b.last_mut().unwrap() ^= 0xff;
+        let tmp = format!("{path}.swap");
+        std::fs::write(&tmp, b).unwrap();
+        std::fs::rename(tmp, path).unwrap();
+    }
+
+    /// Rewrite `path` in place with different bytes of the same length.
+    fn rewrite_in_place(path: &str) {
+        let mut b = std::fs::read(path).unwrap();
+        *b.last_mut().unwrap() ^= 0xff;
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn latents() -> Tensor {
+        Tensor::zeros((1, 16, 2, 2), DType::F32, &Device::Cpu).unwrap()
+    }
+
+    /// The same call with the file untouched must get past the check and fail later for another reason; otherwise a test that only
+    /// looks for an error would pass for the wrong one.
+    fn not_the_check(e: impl std::fmt::Display) {
+        assert!(!e.to_string().contains(CHANGED), "{e}");
+    }
+
+    #[test]
+    fn decode_refuses_a_vae_replaced_after_verification() {
+        for swap in [swap_by_rename, rewrite_in_place] {
+            let v = verified_fixture();
+            not_the_check(v.pipe.decode(&latents()).unwrap_err());
+            swap(&v.files.vae);
+            let e = v.pipe.decode(&latents()).unwrap_err();
+            assert!(e.to_string().contains(CHANGED), "{e}");
+        }
+    }
+
+    #[test]
+    fn weights_open_refuses_a_gguf_replaced_after_verification() {
+        for swap in [swap_by_rename, rewrite_in_place] {
+            let v = verified_fixture();
+            let err = |v: &Verified| match Weights::open(&v.files.gguf, &Device::Cpu, DType::F32) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("a file that is not a GGUF opened"),
+            };
+            not_the_check(err(&v));
+            swap(&v.files.gguf);
+            assert!(err(&v).contains(CHANGED));
+        }
+    }
+
+    #[test]
+    fn encode_streaming_refuses_a_shard_replaced_after_verification() {
+        for swap in [swap_by_rename, rewrite_in_place] {
+            let v = verified_fixture();
+            let shards = [v.files.text_encoder_shards[0].as_str()];
+            let run = || {
+                crate::backends::zimage_text::encode_streaming(
+                    &[1],
+                    &shards,
+                    &Device::Cpu,
+                    DType::F32,
+                )
+            };
+            not_the_check(run().unwrap_err());
+            swap(shards[0]);
+            assert!(run().unwrap_err().to_string().contains(CHANGED));
+        }
+    }
+
+    #[test]
+    fn the_tokenizer_replaced_after_verification_is_refused_on_every_request() {
+        for swap in [swap_by_rename, rewrite_in_place] {
+            let v = verified_fixture();
+            not_the_check(v.pipe.prompt_ids("a cat").unwrap_err());
+            swap(&v.files.tokenizer);
+            let e = v.pipe.prompt_ids("a cat").unwrap_err();
+            assert!(e.to_string().contains(CHANGED), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_file_that_was_never_verified_is_refused_at_every_site() {
+        let d = tempfile::tempdir().unwrap();
+        let st = d.path().join("x.safetensors");
+        std::fs::write(&st, safetensors_bytes()).unwrap();
+        let st = st.to_str().unwrap().to_string();
+        let pipe = ZImagePipeline::new(
+            ZImageFiles {
+                gguf: st.clone(),
+                text_encoder_shards: vec![st.clone()],
+                vae: st.clone(),
+                tokenizer: st.clone(),
+            },
+            Device::Cpu,
+        );
+        for e in [
+            pipe.decode(&latents()).unwrap_err().to_string(),
+            pipe.prompt_ids("x").unwrap_err().to_string(),
+            pipe.encode_prompt("x").unwrap_err().to_string(),
+        ] {
+            assert!(e.contains("never verified"), "{e}");
+        }
+    }
+
     #[test]
     fn dimensions_that_are_not_multiples_of_16_are_rejected_before_any_weight_is_read() {
         let mut p = ImageGenParams::new("z-image-turbo", "x");
@@ -879,7 +1066,7 @@ mod tests {
         };
         let te = ["00001", "00002", "00003"]
             .map(|n| format!("{native}/text_encoder/model-{n}-of-00003.safetensors"));
-        let pipe = ZImagePipeline::new(
+        let pipe = ZImagePipeline::new_trusting_local_files(
             ZImageFiles {
                 gguf: env("AI_KIT_ZIMAGE_GGUF"),
                 text_encoder_shards: te.to_vec(),
@@ -1045,7 +1232,7 @@ mod tests {
                 .0;
         let te = ["00001", "00002", "00003"]
             .map(|n| format!("{native}/text_encoder/model-{n}-of-00003.safetensors"));
-        let mut pipe = ZImagePipeline::new(
+        let mut pipe = ZImagePipeline::new_trusting_local_files(
             ZImageFiles {
                 gguf: env("AI_KIT_ZIMAGE_GGUF"),
                 text_encoder_shards: te.to_vec(),
@@ -1105,7 +1292,7 @@ mod tests {
                 .0;
         let te = ["00001", "00002", "00003"]
             .map(|n| format!("{native}/text_encoder/model-{n}-of-00003.safetensors"));
-        let pipe = ZImagePipeline::new(
+        let pipe = ZImagePipeline::new_trusting_local_files(
             ZImageFiles {
                 gguf: String::new(),
                 text_encoder_shards: te.to_vec(),
@@ -1132,7 +1319,7 @@ mod tests {
             crate::backends::common::device_for(crate::backends::common::DevicePreference::Cuda(0))
                 .unwrap()
                 .0;
-        let pipe = ZImagePipeline::new(
+        let pipe = ZImagePipeline::new_trusting_local_files(
             ZImageFiles {
                 gguf: String::new(),
                 text_encoder_shards: vec![],

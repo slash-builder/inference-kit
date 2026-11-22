@@ -8,7 +8,9 @@
 //! device) is the right one and this backend has no cloud counterpart. The catalog entry has `model.safetensors` as the main file and
 //! `config` and `tokenizer` as extra files; every file is BLAKE3-verified on load.
 
-use crate::backends::common::{check_vram, device_for, verify_model_files, DevicePreference};
+use crate::backends::common::{
+    check_vram, device_for, verify_model_files, DevicePreference, VerifiedFile, VerifiedMaps,
+};
 use crate::error::{AiKitError, Result};
 use crate::modality::{
     unsupported, EmbeddingParams, EmbeddingResponse, Output, Request, RequestKind, RequestService,
@@ -17,7 +19,6 @@ use crate::registry::ModelRegistry;
 use crate::types::ModelMetadata;
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -83,10 +84,11 @@ impl CandleEmbeddingService {
                 .ok_or_else(|| fail(format!("catalog entry has no '{role}' file")))
         };
         let (cfg_path, tok_path) = (need("config")?, need("tokenizer")?);
-        let config: Config = serde_json::from_str(&std::fs::read_to_string(&cfg_path)?)
+        // read through handles checked against the hashes just taken, not re-opened by path
+        let config: Config = serde_json::from_slice(&VerifiedFile::open(&cfg_path)?.read_all()?)
             .map_err(|e| fail(format!("config: {e}")))?;
-        let mut tokenizer =
-            Tokenizer::from_file(&tok_path).map_err(|e| fail(format!("tokenizer: {e}")))?;
+        let mut tokenizer = Tokenizer::from_bytes(VerifiedFile::open(&tok_path)?.read_all()?)
+            .map_err(|e| fail(format!("tokenizer: {e}")))?;
         tokenizer.with_padding(Some(PaddingParams::default()));
         tokenizer
             .with_truncation(Some(TruncationParams {
@@ -94,12 +96,11 @@ impl CandleEmbeddingService {
                 ..Default::default()
             }))
             .map_err(|e| fail(format!("tokenizer: {e}")))?;
-        // SAFETY: `from_mmaped_safetensors` is unsafe because behaviour is undefined if the mapped file is modified while mapped. Relied
-        // on: (1) `weights` is the file `verify_model_files` hashed against the catalog a few lines above, in this same call, and it is
-        // mapped straight away; (2) nothing with write access to the model directory modifies it while the model is loaded. (2) is not
-        // enforced here: models are immutable OS resources and the directory is not writable by other principals. Unlike the Z-Image
-        // path the mapping is kept for the life of the loaded model, so a later swap is not re-checked.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device) }
+        // Mapped from a handle checked against the hash `verify_model_files` just took (see `VerifiedMaps`), not re-opened by path. The
+        // tensors are copied out by `BertModel::load`, so the mapping is dropped when this function returns.
+        let maps = VerifiedMaps::open(&[weights.as_str()])?;
+        let vb = maps
+            .var_builder(DType::F32, &device)
             .map_err(|e| fail(format!("weights: {e}")))?;
         let bert = BertModel::load(vb, &config).map_err(|e| fail(format!("model: {e}")))?;
         self.loaded
@@ -200,5 +201,137 @@ impl RequestService for CandleEmbeddingService {
             Request::Embedding(p) => self.embed(&p).map(Output::Embeddings),
             other => Err(unsupported(other.kind(), "this is an embedding backend")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::{VarBuilder, VarMap};
+    use tokenizers::models::wordlevel::WordLevel;
+
+    /// A catalog entry for a tiny random-free BERT written to disk: weights, config and tokenizer, all hashed.
+    fn tiny_catalog(dir: &std::path::Path, tamper_weights_hash: bool) -> String {
+        let config = Config {
+            vocab_size: 8,
+            hidden_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            intermediate_size: 16,
+            max_position_embeddings: 16,
+            type_vocab_size: 2,
+            ..Config::default()
+        };
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
+        BertModel::load(vb, &config).unwrap();
+        let weights = dir.join("model.safetensors");
+        vm.save(&weights).unwrap();
+        let cfg = dir.join("config.json");
+        std::fs::write(
+            &cfg,
+            r#"{"vocab_size":8,"hidden_size":8,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":16,
+            "hidden_act":"gelu","hidden_dropout_prob":0.0,"max_position_embeddings":16,"type_vocab_size":2,
+            "initializer_range":0.02,"layer_norm_eps":1e-12,"pad_token_id":1}"#,
+        )
+        .unwrap();
+        let tok = dir.join("tokenizer.json");
+        let vocab = ["[UNK]", "[PAD]", "hello", "world"]
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.to_string(), i as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut t = Tokenizer::new(model);
+        t.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace {}));
+        t.save(&tok, false).unwrap();
+
+        let h = |p: &std::path::Path| {
+            blake3::hash(&std::fs::read(p).unwrap())
+                .to_hex()
+                .to_string()
+        };
+        let size = |p: &std::path::Path| std::fs::metadata(p).unwrap().len();
+        let w_hash = if tamper_weights_hash {
+            "0".repeat(64)
+        } else {
+            h(&weights)
+        };
+        let catalog = format!(
+            r#"
+version: "1.0"
+models:
+  - id: "tiny"
+    version: "1.0.0"
+    os_arch: ["x86_64"]
+    quantization_variants: ["f32"]
+    default_quantization: "f32"
+    hash: "{w_hash}"
+    size_bytes: {}
+    location: "file://{}"
+    metadata:
+      parameters: 1
+      context_window: 16
+      vram_required_mb: 1
+      inference_latency_ms: 1
+      custom:
+        kind: "embedding"
+    files:
+      - role: "config"
+        location: "file://{}"
+        hash: "{}"
+        size_bytes: {}
+      - role: "tokenizer"
+        location: "file://{}"
+        hash: "{}"
+        size_bytes: {}
+"#,
+            size(&weights),
+            weights.display(),
+            cfg.display(),
+            h(&cfg),
+            size(&cfg),
+            tok.display(),
+            h(&tok),
+            size(&tok),
+        );
+        let path = dir.join("catalog.yaml");
+        std::fs::write(&path, catalog).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_verified_model_loads_through_the_checked_handles_and_embeds() {
+        let d = tempfile::tempdir().unwrap();
+        let svc =
+            CandleEmbeddingService::new(&tiny_catalog(d.path(), false), DevicePreference::Cpu)
+                .unwrap();
+        svc.load_model("tiny").unwrap();
+        let out = svc
+            .embed(&EmbeddingParams {
+                model_id: "tiny".into(),
+                inputs: vec!["hello world".into()],
+                normalize: false,
+                session_id: None,
+                request_id: None,
+            })
+            .unwrap();
+        assert_eq!(out.dimensions, 8);
+    }
+
+    #[test]
+    fn a_model_whose_weights_do_not_match_the_catalog_never_loads() {
+        let d = tempfile::tempdir().unwrap();
+        let svc = CandleEmbeddingService::new(&tiny_catalog(d.path(), true), DevicePreference::Cpu)
+            .unwrap();
+        assert!(matches!(
+            svc.load_model("tiny"),
+            Err(AiKitError::IntegrityCheckFailed { .. })
+        ));
+        assert!(!svc.loaded.read().unwrap().contains_key("tiny"));
     }
 }
