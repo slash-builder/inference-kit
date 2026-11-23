@@ -45,7 +45,11 @@ pub struct OpenAiCompatConfig {
     /// Credential NAME, if the server needs a bearer token (a local server usually does not).
     pub credential_name: Option<String>,
     pub default_max_tokens: u32,
+    /// The limit on the whole request, reply included. For a remote provider, a timeout after the request was sent is charged at the
+    /// reserved worst case.
     pub timeout: Duration,
+    /// The limit on making the connection. A host that does not answer within it is a request that was never sent: released, not charged.
+    pub connect_timeout: Duration,
 }
 
 impl OpenAiCompatConfig {
@@ -60,6 +64,7 @@ impl OpenAiCompatConfig {
             credential_name: None,
             default_max_tokens: 1024,
             timeout: Duration::from_secs(300),
+            connect_timeout: super::DEFAULT_CONNECT_TIMEOUT,
         }
     }
 }
@@ -80,6 +85,12 @@ impl fmt::Debug for OpenAiCompatAdapter {
             .field("model", &self.cfg.model)
             .finish()
     }
+}
+
+/// Why a POST failed, and whether the vendor may nevertheless have billed it.
+struct PostFailure {
+    err: ProviderError,
+    maybe_billed: bool,
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -115,13 +126,33 @@ fn is_private(host: &str) -> bool {
 }
 
 impl OpenAiCompatAdapter {
-    /// Build the adapter. **Fails closed** on a locality that does not match the address, a SaaS provider without a budget, and a credential
-    /// that cannot be loaded.
+    /// Build the adapter. **Fails closed** on a locality that does not match the address, a SaaS (or unspecified) provider without a budget,
+    /// a provider that leaves the home whose prices cannot cap every kind of request it offers (text needs an input and an output rate;
+    /// embeddings, when configured, need the input rate), and a credential that cannot be loaded.
     pub fn new(
         cfg: OpenAiCompatConfig,
         creds: Option<Arc<dyn CredentialSource>>,
         budget: Option<Budget>,
     ) -> Result<Self, ConfigError> {
+        Self::build(cfg, creds, budget, |b| b)
+    }
+
+    /// `new`, with a hook on the HTTP client builder (tests use it to keep a proxy in the environment out of the way).
+    fn build(
+        cfg: OpenAiCompatConfig,
+        creds: Option<Arc<dyn CredentialSource>>,
+        budget: Option<Budget>,
+        tweak: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    ) -> Result<Self, ConfigError> {
+        let mut kinds = vec![RequestKind::TextGeneration];
+        if cfg.embedding_model.is_some() {
+            kinds.push(RequestKind::Embedding);
+        }
+        if let Some(b) = &budget {
+            if cfg.locality.leaves_home() {
+                b.validate(&kinds)?;
+            }
+        }
         let host = host_of(&cfg.base_url).ok_or(ConfigError::BadUrl)?;
         match cfg.locality {
             Locality::Device if !is_loopback(&host) => {
@@ -145,12 +176,7 @@ impl OpenAiCompatAdapter {
             c.get(name)
                 .map_err(|_| ConfigError::CredentialUnavailable)?;
         }
-        let mut kinds = vec![RequestKind::TextGeneration];
-        if cfg.embedding_model.is_some() {
-            kinds.push(RequestKind::Embedding);
-        }
-        let http = reqwest::Client::builder()
-            .timeout(cfg.timeout)
+        let http = tweak(super::http_builder(cfg.timeout, cfg.connect_timeout))
             .build()
             .map_err(|_| ConfigError::HttpClient)?;
         Ok(Self {
@@ -234,24 +260,38 @@ impl OpenAiCompatAdapter {
         self.discover_models("").await.is_ok()
     }
 
-    async fn post(&self, path: &str, body: &Value) -> Result<(u64, Value, u64), ProviderError> {
-        let bytes = serde_json::to_vec(body).map_err(|_| ProviderError::Other)?;
+    /// POST and parse. On failure the error says whether the request may have reached the vendor (`maybe_billed`): a connection that was
+    /// never made, or a refusal to even build the request, cannot have been.
+    async fn post(&self, path: &str, body: &Value) -> Result<(u64, Value, u64), PostFailure> {
+        let not_sent = |err| PostFailure {
+            err,
+            maybe_billed: false,
+        };
+        let bytes = serde_json::to_vec(body).map_err(|_| not_sent(ProviderError::Other))?;
         let sent = bytes.len() as u64;
         let mut rb = self
             .http
             .post(self.url(path))
             .header("content-type", "application/json")
             .body(bytes);
-        if let Some(k) = self.auth()? {
+        if let Some(k) = self.auth().map_err(not_sent)? {
             rb = rb.bearer_auth(k);
         }
-        let resp = rb.send().await.map_err(|e| self.transport(e))?;
+        let transport_failure = |e: reqwest::Error| PostFailure {
+            maybe_billed: super::may_have_been_billed(&e),
+            err: self.transport(e),
+        };
+        let resp = rb.send().await.map_err(transport_failure)?;
         let status = resp.status().as_u16();
         let retry = retry_after(resp.headers());
-        let text = resp.text().await.map_err(|e| self.transport(e))?;
+        let text = resp.text().await.map_err(transport_failure)?;
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if status != 200 {
-            return Err(classify(status, retry, &parsed));
+            // an error status is not billed, except the few a gateway uses when it gave up on a call the vendor may have finished
+            return Err(PostFailure {
+                err: classify(status, retry, &parsed),
+                maybe_billed: super::status_may_have_been_billed(status),
+            });
         }
         Ok((sent, parsed, text.len() as u64))
     }
@@ -283,11 +323,15 @@ impl OpenAiCompatAdapter {
         });
         let (sent, resp, received) = match self.post("/v1/chat/completions", &body).await {
             Ok(r) => r,
-            Err(e) => {
+            Err(f) => {
                 if let (Some(b), Some(r)) = (&self.budget, reservation) {
-                    b.ledger.release(r);
+                    if f.maybe_billed {
+                        b.ledger.settle_reserved(r);
+                    } else {
+                        b.ledger.release(r);
+                    }
                 }
-                return Err(e);
+                return Err(f.err);
             }
         };
         let usage = Usage {
@@ -296,7 +340,14 @@ impl OpenAiCompatAdapter {
             ..Usage::default()
         };
         if let (Some(b), Some(r)) = (&self.budget, reservation) {
-            b.ledger.settle(r, b.pricing.cost(&usage));
+            if resp["usage"]["prompt_tokens"].is_u64()
+                && resp["usage"]["completion_tokens"].is_u64()
+            {
+                b.ledger.settle(r, b.pricing.cost(&usage));
+            } else {
+                // no usage in a billed reply: charge the worst case, never zero
+                b.ledger.settle_reserved(r);
+            }
         }
         let choice = &resp["choices"][0];
         let message = &choice["message"];
@@ -348,12 +399,43 @@ impl OpenAiCompatAdapter {
             .embedding_model
             .as_deref()
             .ok_or(ProviderError::Other)?;
-        let (sent, resp, received) = self
+        // a remote embedding call is paid for like a chat call: reserve first, refuse before sending if it does not fit
+        let reservation = match &self.budget {
+            Some(b) => Some(b.ledger.reserve(b.embedding_worst_case(&p.inputs))?),
+            None => None,
+        };
+        let posted = self
             .post(
                 "/v1/embeddings",
                 &json!({"model": model, "input": p.inputs}),
             )
-            .await?;
+            .await;
+        let (sent, resp, received) = match posted {
+            Ok(r) => r,
+            Err(f) => {
+                if let (Some(b), Some(r)) = (&self.budget, reservation) {
+                    if f.maybe_billed {
+                        b.ledger.settle_reserved(r);
+                    } else {
+                        b.ledger.release(r);
+                    }
+                }
+                return Err(f.err);
+            }
+        };
+        // settle from the reply's usage when it has one, else at the reserved estimate
+        if let (Some(b), Some(r)) = (&self.budget, reservation) {
+            match resp["usage"]["prompt_tokens"].as_u64() {
+                Some(t) => b.ledger.settle(
+                    r,
+                    b.pricing.cost(&Usage {
+                        input_tokens: t,
+                        ..Usage::default()
+                    }),
+                ),
+                None => b.ledger.settle_reserved(r),
+            }
+        }
         let mut vectors: Vec<Vec<f32>> = resp["data"]
             .as_array()
             .map(|a| {
@@ -704,7 +786,11 @@ mod tests {
         let b = || {
             Some(Budget {
                 ledger: Arc::new(Ledger::new(1_000_000)),
-                pricing: Pricing::default(),
+                pricing: Pricing {
+                    input_micro_per_mtok: 1_000_000,
+                    output_micro_per_mtok: 2_000_000,
+                    ..Pricing::default()
+                },
             })
         };
         assert_eq!(
@@ -998,6 +1084,511 @@ mod tests {
         assert!(
             sink.0.lock().unwrap().is_empty(),
             "a purely local answer needs no egress audit record"
+        );
+    }
+
+    // ---- the ledger fails closed ----
+
+    const PAID: Pricing = Pricing {
+        input_micro_per_mtok: 1_000_000,
+        output_micro_per_mtok: 2_000_000,
+        cache_read_micro_per_mtok: 0,
+        cache_write_micro_per_mtok: 0,
+    };
+
+    fn saas(
+        s: &MockServer,
+        ledger: &Arc<Ledger>,
+        pricing: Pricing,
+        timeout: Duration,
+    ) -> Result<OpenAiCompatAdapter, ConfigError> {
+        let mut c = cfg(s);
+        c.locality = Locality::Saas;
+        c.credential_name = Some("key".into());
+        c.embedding_model = Some("embed-model".into());
+        c.timeout = timeout;
+        OpenAiCompatAdapter::build(
+            c,
+            Some(Arc::new(InMemoryCredentials::with("key", "sk-test"))),
+            Some(Budget {
+                ledger: ledger.clone(),
+                pricing,
+            }),
+            |b| b.no_proxy(), // a proxy in the environment must not decide these tests
+        )
+    }
+    fn embed_req(inputs: &[&str]) -> Request {
+        Request::Embedding(EmbeddingParams {
+            model_id: "x".into(),
+            inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
+            normalize: false,
+            session_id: None,
+            request_id: None,
+        })
+    }
+    fn chat_worst() -> u64 {
+        PAID.worst_case("hi".len() as u64 / 3 + 1, 50)
+    }
+
+    #[tokio::test]
+    async fn saas_embeddings_are_reserved_and_refused_before_anything_is_sent_when_they_do_not_fit()
+    {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"data":[{"embedding":[1.0]}],"usage":{"prompt_tokens":1}}),
+                ),
+            )
+            .expect(0)
+            .mount(&s)
+            .await;
+        // one micro-dollar cannot cover the worst case of a long input
+        let ledger = Arc::new(Ledger::new(1));
+        let a = saas(&s, &ledger, PAID, Duration::from_secs(5)).unwrap();
+        let long = "x".repeat(30_000_000);
+        assert_eq!(
+            a.call(&embed_req(&[&long])).await.unwrap_err(),
+            ProviderError::BudgetExceeded
+        );
+        assert_eq!(ledger.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn saas_embeddings_are_settled_from_the_reported_usage() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"data":[{"embedding":[1.0]}],"usage":{"prompt_tokens":2000}}),
+            ))
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas(&s, &ledger, PAID, Duration::from_secs(5)).unwrap();
+        a.call(&embed_req(&["a"])).await.unwrap();
+        assert_eq!(
+            ledger.spent(),
+            PAID.cost(&Usage {
+                input_tokens: 2000,
+                ..Usage::default()
+            })
+        );
+        assert_eq!(ledger.available(), 10_000_000 - ledger.spent());
+    }
+
+    #[tokio::test]
+    async fn a_chat_200_without_usage_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        serve(
+            &s,
+            200,
+            json!({"model":"m","choices":[{"message":{"content":"x"},"finish_reason":"stop"}]}),
+        )
+        .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas(&s, &ledger, PAID, Duration::from_secs(5)).unwrap();
+        a.call(&text("hi")).await.unwrap();
+        assert_eq!(ledger.spent(), chat_worst());
+    }
+
+    #[tokio::test]
+    async fn a_chat_timeout_after_the_request_was_sent_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(chat_ok("late", "stop"))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas(&s, &ledger, PAID, Duration::from_millis(200)).unwrap();
+        assert_eq!(
+            a.call(&text("hi")).await.unwrap_err(),
+            ProviderError::Timeout
+        );
+        assert_eq!(ledger.spent(), chat_worst());
+    }
+
+    #[tokio::test]
+    async fn a_chat_connection_that_was_never_made_is_released_at_no_charge() {
+        let s = MockServer::start().await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let mut c = cfg(&s);
+        c.locality = Locality::Saas;
+        c.base_url = "http://127.0.0.1:1".into();
+        c.credential_name = Some("key".into());
+        let a = OpenAiCompatAdapter::build(
+            c,
+            Some(Arc::new(InMemoryCredentials::with("key", "sk-test"))),
+            Some(Budget {
+                ledger: ledger.clone(),
+                pricing: PAID,
+            }),
+            |b| b.no_proxy(),
+        )
+        .unwrap();
+        assert!(a.call(&text("hi")).await.is_err());
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    /// A remote provider config with or without an embedding model, for the construction tests.
+    fn remote(
+        locality: Locality,
+        embeds: bool,
+        pricing: Pricing,
+    ) -> Result<OpenAiCompatAdapter, ConfigError> {
+        let mut c = OpenAiCompatConfig::ollama("m");
+        c.base_url = "https://api.example.com".into();
+        c.locality = locality;
+        c.credential_name = Some("key".into());
+        c.embedding_model = embeds.then(|| "embed-model".to_string());
+        OpenAiCompatAdapter::new(
+            c,
+            Some(Arc::new(InMemoryCredentials::with("key", "sk-test"))),
+            Some(Budget {
+                ledger: Arc::new(Ledger::new(1_000_000)),
+                pricing,
+            }),
+        )
+    }
+
+    #[test]
+    fn a_remote_provider_whose_prices_cannot_cap_every_kind_it_offers_is_refused() {
+        let no_input = Pricing {
+            input_micro_per_mtok: 0,
+            ..PAID
+        };
+        let no_output = Pricing {
+            output_micro_per_mtok: 0,
+            ..PAID
+        };
+        for locality in [Locality::Saas, Locality::Unspecified] {
+            for embeds in [false, true] {
+                for (name, pricing) in [
+                    ("all zero", Pricing::default()),
+                    ("no input rate", no_input),
+                    ("no output rate", no_output),
+                ] {
+                    assert_eq!(
+                        remote(locality, embeds, pricing).err(),
+                        Some(ConfigError::UnpricedProvider),
+                        "{locality:?}, embeddings {embeds}, {name}"
+                    );
+                }
+                assert!(remote(locality, embeds, PAID).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn a_device_provider_is_not_made_to_declare_prices() {
+        let mut c = OpenAiCompatConfig::ollama("m");
+        c.embedding_model = Some("embed-model".into());
+        let budget = Budget {
+            ledger: Arc::new(Ledger::new(1)),
+            pricing: Pricing::default(),
+        };
+        assert!(OpenAiCompatAdapter::new(c, None, Some(budget)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_embedding_200_without_usage_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data":[{"embedding":[1.0]}]})),
+            )
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas(&s, &ledger, PAID, Duration::from_secs(5)).unwrap();
+        a.call(&embed_req(&["some text to embed"])).await.unwrap();
+        let reserved = Budget {
+            ledger: ledger.clone(),
+            pricing: PAID,
+        }
+        .embedding_worst_case(&["some text to embed".to_string()]);
+        assert!(reserved > 0);
+        assert_eq!(
+            ledger.spent(),
+            reserved,
+            "no usage reported: the worst case"
+        );
+        assert_eq!(ledger.available(), 10_000_000 - reserved);
+    }
+
+    #[tokio::test]
+    async fn an_embedding_200_with_usage_but_no_prompt_count_is_settled_at_the_worst_case() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"data":[{"embedding":[1.0]}],"usage":{"total_tokens":1}}),
+                ),
+            )
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas(&s, &ledger, PAID, Duration::from_secs(5)).unwrap();
+        a.call(&embed_req(&["some text to embed"])).await.unwrap();
+        let reserved = Budget {
+            ledger: ledger.clone(),
+            pricing: PAID,
+        }
+        .embedding_worst_case(&["some text to embed".to_string()]);
+        assert_eq!(ledger.spent(), reserved);
+    }
+
+    #[tokio::test]
+    async fn a_chat_200_with_only_part_of_the_usage_is_settled_at_the_reserved_worst_case() {
+        for usage in [json!({"prompt_tokens": 1}), json!({"completion_tokens": 1})] {
+            let s = MockServer::start().await;
+            serve(
+                &s,
+                200,
+                json!({"model":"m","choices":[{"message":{"content":"x"},"finish_reason":"stop"}],"usage":usage}),
+            )
+            .await;
+            let ledger = Arc::new(Ledger::new(10_000_000));
+            let a = saas(&s, &ledger, PAID, Duration::from_secs(5)).unwrap();
+            a.call(&text("hi")).await.unwrap();
+            assert_eq!(ledger.spent(), chat_worst(), "usage {usage}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connect_timeout_is_a_request_never_sent_and_is_released_at_no_charge() {
+        let Some(addr) = super::super::test_support::blackholed_addr() else {
+            return;
+        };
+        let s = MockServer::start().await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let mut c = cfg(&s);
+        c.locality = Locality::Saas;
+        c.base_url = format!("http://{addr}");
+        c.credential_name = Some("key".into());
+        c.timeout = Duration::from_secs(20);
+        c.connect_timeout = Duration::from_millis(300);
+        let a = OpenAiCompatAdapter::build(
+            c,
+            Some(Arc::new(InMemoryCredentials::with("key", "sk-test"))),
+            Some(Budget {
+                ledger: ledger.clone(),
+                pricing: PAID,
+            }),
+            |b| b.no_proxy(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert!(a.call(&text("hi")).await.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the connect limit, not the overall one, ended the call"
+        );
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    fn saas_at(
+        base: &str,
+        creds: Arc<dyn CredentialSource>,
+        ledger: &Arc<Ledger>,
+        timeout: Duration,
+        connect: Duration,
+    ) -> OpenAiCompatAdapter {
+        let mut c = OpenAiCompatConfig::ollama("test-model");
+        c.base_url = base.into();
+        c.locality = Locality::Saas;
+        c.credential_name = Some("key".into());
+        c.embedding_model = Some("embed-model".into());
+        c.timeout = timeout;
+        c.connect_timeout = connect;
+        OpenAiCompatAdapter::build(
+            c,
+            Some(creds),
+            Some(Budget {
+                ledger: ledger.clone(),
+                pricing: PAID,
+            }),
+            |b| b.no_proxy(),
+        )
+        .unwrap()
+    }
+    fn key_source() -> Arc<dyn CredentialSource> {
+        Arc::new(InMemoryCredentials::with("key", "sk-test"))
+    }
+    fn embed_worst(ledger: &Arc<Ledger>, inputs: &[&str]) -> u64 {
+        Budget {
+            ledger: ledger.clone(),
+            pricing: PAID,
+        }
+        .embedding_worst_case(&inputs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_breaks_while_its_body_is_read_is_charged_for_chat_and_embeddings() {
+        let base = format!(
+            "http://{}",
+            super::super::test_support::truncated_reply_server()
+        );
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas_at(
+            &base,
+            key_source(),
+            &ledger,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        assert!(a.call(&text("hi")).await.is_err());
+        assert_eq!(ledger.spent(), chat_worst());
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas_at(
+            &base,
+            key_source(),
+            &ledger,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        assert!(a.call(&embed_req(&["hi"])).await.is_err());
+        assert_eq!(ledger.spent(), embed_worst(&ledger, &["hi"]));
+    }
+
+    #[tokio::test]
+    async fn an_error_status_is_released_unless_it_is_one_a_gateway_uses_for_giving_up() {
+        for (status, charged) in [
+            (408u16, true),
+            (502, true),
+            (504, true),
+            (400, false),
+            (401, false),
+            (429, false),
+            (500, false),
+            (503, false),
+        ] {
+            for embed in [false, true] {
+                let s = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(status)
+                            .set_body_json(json!({"error":{"message":"x"}})),
+                    )
+                    .mount(&s)
+                    .await;
+                let ledger = Arc::new(Ledger::new(10_000_000));
+                let a = saas_at(
+                    &s.uri(),
+                    key_source(),
+                    &ledger,
+                    Duration::from_secs(5),
+                    Duration::from_secs(1),
+                );
+                let r = if embed {
+                    embed_req(&["hi"])
+                } else {
+                    text("hi")
+                };
+                assert!(a.call(&r).await.is_err());
+                let worst = if embed {
+                    embed_worst(&ledger, &["hi"])
+                } else {
+                    chat_worst()
+                };
+                let want = if charged { worst } else { 0 };
+                assert_eq!(ledger.spent(), want, "HTTP {status}, embeddings {embed}");
+                assert_eq!(
+                    ledger.available(),
+                    10_000_000 - want,
+                    "HTTP {status}, embeddings {embed}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_embedding_that_timed_out_after_it_was_sent_is_charged_and_one_never_connected_is_released(
+    ) {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas_at(
+            &s.uri(),
+            key_source(),
+            &ledger,
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            a.call(&embed_req(&["hi"])).await.unwrap_err(),
+            ProviderError::Timeout
+        );
+        assert_eq!(ledger.spent(), embed_worst(&ledger, &["hi"]));
+
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas_at(
+            "http://127.0.0.1:1",
+            key_source(),
+            &ledger,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        assert!(a.call(&embed_req(&["hi"])).await.is_err());
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[tokio::test]
+    async fn a_credential_that_vanishes_after_the_reservation_releases_it() {
+        let s = MockServer::start().await;
+        let creds = super::super::test_support::Vanishing::new("sk-test");
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas_at(
+            &s.uri(),
+            creds.clone(),
+            &ledger,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        creds.vanish();
+        assert_eq!(a.call(&text("hi")).await.unwrap_err(), ProviderError::Auth);
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+        assert_eq!(
+            a.call(&embed_req(&["hi"])).await.unwrap_err(),
+            ProviderError::Auth
+        );
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[tokio::test]
+    async fn a_connect_limit_longer_than_the_timeout_still_releases_a_hung_connection() {
+        let Some(addr) = super::super::test_support::blackholed_addr() else {
+            return;
+        };
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = saas_at(
+            &format!("http://{addr}"),
+            key_source(),
+            &ledger,
+            Duration::from_millis(400),
+            Duration::from_secs(30),
+        );
+        assert!(a.call(&text("hi")).await.is_err());
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[test]
+    fn the_default_connect_timeout_is_applied() {
+        assert_eq!(
+            OpenAiCompatConfig::ollama("m").connect_timeout,
+            Duration::from_secs(10)
         );
     }
 }

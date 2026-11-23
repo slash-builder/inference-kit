@@ -83,6 +83,12 @@ pub mod providers;
 pub mod registry;
 pub mod routed;
 pub mod router;
+#[cfg(any(
+    feature = "provider-anthropic",
+    feature = "provider-gemini",
+    feature = "claude-proxy"
+))]
+mod sensitive_header;
 pub mod service;
 pub mod types;
 mod yaml;

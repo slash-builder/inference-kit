@@ -33,6 +33,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Why a POST failed, and whether the vendor may nevertheless have billed it.
+struct PostFailure {
+    err: ProviderError,
+    maybe_billed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct GeminiConfig {
     pub provider_id: String,
@@ -44,7 +50,10 @@ pub struct GeminiConfig {
     /// The model for embedding requests; if `None` the adapter does not offer embeddings.
     pub embedding_model: Option<String>,
     pub default_max_tokens: u32,
+    /// The limit on the whole request, reply included. A timeout after the request was sent is charged at the reserved worst case.
     pub timeout: Duration,
+    /// The limit on making the connection. A host that does not answer within it is a request that was never sent: released, not charged.
+    pub connect_timeout: Duration,
 }
 
 impl GeminiConfig {
@@ -57,6 +66,7 @@ impl GeminiConfig {
             embedding_model: None,
             default_max_tokens: 1024,
             timeout: Duration::from_secs(120),
+            connect_timeout: super::DEFAULT_CONNECT_TIMEOUT,
         }
     }
 }
@@ -79,21 +89,32 @@ impl fmt::Debug for GeminiAdapter {
 }
 
 impl GeminiAdapter {
-    /// Build the adapter. **Fails closed** if the credential cannot be loaded now.
+    /// Build the adapter. **Fails closed** if the credential cannot be loaded now, or if the prices cannot cap every kind of request the
+    /// adapter offers (text needs an input and an output rate; embeddings, when configured, need the input rate).
     pub fn new(
         cfg: GeminiConfig,
         creds: Arc<dyn CredentialSource>,
         budget: Budget,
     ) -> Result<Self, ConfigError> {
-        creds
-            .get(&cfg.credential_name)
-            .map_err(|_| ConfigError::CredentialUnavailable)?;
+        Self::build(cfg, creds, budget, |b| b)
+    }
+
+    /// `new`, with a hook on the HTTP client builder (tests use it to keep a proxy in the environment out of the way).
+    fn build(
+        cfg: GeminiConfig,
+        creds: Arc<dyn CredentialSource>,
+        budget: Budget,
+        tweak: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    ) -> Result<Self, ConfigError> {
         let mut kinds = vec![RequestKind::TextGeneration];
         if cfg.embedding_model.is_some() {
             kinds.push(RequestKind::Embedding);
         }
-        let http = reqwest::Client::builder()
-            .timeout(cfg.timeout)
+        budget.validate(&kinds)?;
+        creds
+            .get(&cfg.credential_name)
+            .map_err(|_| ConfigError::CredentialUnavailable)?;
+        let http = tweak(super::http_builder(cfg.timeout, cfg.connect_timeout))
             .build()
             .map_err(|_| ConfigError::HttpClient)?;
         Ok(Self {
@@ -120,14 +141,43 @@ impl GeminiAdapter {
             .map_err(|_| ProviderError::Auth)
     }
 
+    fn close_failed(&self, r: crate::budget::Reservation, f: &PostFailure) {
+        if f.maybe_billed {
+            self.budget.ledger.settle_reserved(r);
+        } else {
+            self.budget.ledger.release(r);
+        }
+    }
+
+    /// `GET /v1beta/models`, ready to send. The key goes into a sensitive header (a seam so a test can inspect the built request).
+    fn models_request(&self, key: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(self
+            .http
+            .get(self.url("/v1beta/models"))
+            .header("x-goog-api-key", super::sensitive_header_value(key)?))
+    }
+
+    /// A `POST` to `path`, ready to send. The key goes into a sensitive header (a seam so a test can inspect the built request).
+    fn post_request(
+        &self,
+        path: &str,
+        key: &str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(self
+            .http
+            .post(self.url(path))
+            .header("x-goog-api-key", super::sensitive_header_value(key)?)
+            .header("content-type", "application/json")
+            .body(body))
+    }
+
     /// `GET /v1beta/models` as cards. A model that lists `generateContent` serves text, `embedContent` serves embeddings; capability flags the
     /// listing does not carry stay unknown. Only the first page is read. `today` is `YYYY-MM-DD`.
     pub async fn discover_models(&self, today: &str) -> Result<Vec<ModelCard>, ProviderError> {
         let key = self.key()?;
         let resp = self
-            .http
-            .get(self.url("/v1beta/models"))
-            .header("x-goog-api-key", key)
+            .models_request(&key)?
             .send()
             .await
             .map_err(transport_error)?;
@@ -141,25 +191,35 @@ impl GeminiAdapter {
         Ok(parse_models(&self.cfg.provider_id, &body, today))
     }
 
-    async fn post(&self, path: &str, body: &Value) -> Result<(u64, Value, u64), ProviderError> {
-        let key = self.key()?;
-        let bytes = serde_json::to_vec(body).map_err(|_| ProviderError::Other)?;
+    /// POST and parse. On failure the error says whether the request may have reached the vendor (`maybe_billed`).
+    async fn post(&self, path: &str, body: &Value) -> Result<(u64, Value, u64), PostFailure> {
+        let not_sent = |err| PostFailure {
+            err,
+            maybe_billed: false,
+        };
+        let key = self.key().map_err(not_sent)?;
+        let bytes = serde_json::to_vec(body).map_err(|_| not_sent(ProviderError::Other))?;
         let sent = bytes.len() as u64;
+        let transport_failure = |e: reqwest::Error| PostFailure {
+            maybe_billed: super::may_have_been_billed(&e),
+            err: transport_error(e),
+        };
         let resp = self
-            .http
-            .post(self.url(path))
-            .header("x-goog-api-key", key)
-            .header("content-type", "application/json")
-            .body(bytes)
+            .post_request(path, &key, bytes)
+            .map_err(not_sent)?
             .send()
             .await
-            .map_err(transport_error)?;
+            .map_err(transport_failure)?;
         let status = resp.status().as_u16();
         let retry = retry_after(resp.headers());
-        let text = resp.text().await.map_err(transport_error)?;
+        let text = resp.text().await.map_err(transport_failure)?;
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if status != 200 {
-            return Err(classify(status, retry, &parsed));
+            // an error status is not billed, except the few a gateway uses when it gave up on a call the vendor may have finished
+            return Err(PostFailure {
+                err: classify(status, retry, &parsed),
+                maybe_billed: super::status_may_have_been_billed(status),
+            });
         }
         Ok((sent, parsed, text.len() as u64))
     }
@@ -185,9 +245,9 @@ impl GeminiAdapter {
         let path = format!("/v1beta/models/{}:generateContent", self.cfg.model);
         let (sent, resp, received) = match self.post(&path, &body).await {
             Ok(r) => r,
-            Err(e) => {
-                self.budget.ledger.release(reservation);
-                return Err(e);
+            Err(f) => {
+                self.close_failed(reservation, &f);
+                return Err(f.err);
             }
         };
         let u = &resp["usageMetadata"];
@@ -204,9 +264,20 @@ impl GeminiAdapter {
             cache_read_tokens: cached,
             cache_write_tokens: 0,
         };
-        self.budget
-            .ledger
-            .settle(reservation, self.budget.pricing.cost(&usage));
+        // The usage is complete when both counts are there. A prompt the service blocked has no candidates and so no candidate count: its
+        // output is genuinely zero. Anything else with a count missing is a cost nobody told us, charged at the worst case.
+        let blocked_unanswered =
+            !resp["promptFeedback"]["blockReason"].is_null() && resp["candidates"][0].is_null();
+        if u["promptTokenCount"].is_u64()
+            && (u["candidatesTokenCount"].is_u64() || blocked_unanswered)
+        {
+            self.budget
+                .ledger
+                .settle(reservation, self.budget.pricing.cost(&usage));
+        } else {
+            // no usage in a billed reply: charge the worst case, never zero
+            self.budget.ledger.settle_reserved(reservation);
+        }
 
         let cand = &resp["candidates"][0];
         let parts = cand["content"]["parts"]
@@ -267,12 +338,26 @@ impl GeminiAdapter {
             .as_deref()
             .ok_or(ProviderError::Other)?;
         let requests: Vec<Value> = p.inputs.iter().map(|t| json!({"model": format!("models/{model}"), "content": {"parts": [{"text": t}]}})).collect();
-        let (sent, resp, received) = self
+        // a paid embedding call is reserved like a text call; refused before sending if it does not fit
+        let reservation = self
+            .budget
+            .ledger
+            .reserve(self.budget.embedding_worst_case(&p.inputs))?;
+        let (sent, resp, received) = match self
             .post(
                 &format!("/v1beta/models/{model}:batchEmbedContents"),
                 &json!({"requests": requests}),
             )
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(f) => {
+                self.close_failed(reservation, &f);
+                return Err(f.err);
+            }
+        };
+        // the batch endpoint reports no usage: the reserved estimate (input at the input rate) is what is charged
+        self.budget.ledger.settle_reserved(reservation);
         let mut vectors: Vec<Vec<f32>> = resp["embeddings"]
             .as_array()
             .map(|a| {
@@ -460,13 +545,14 @@ mod tests {
         let ledger = Arc::new(Ledger::new(budget));
         let mut cfg = GeminiConfig::new("gemini-api-key", "gemini-test");
         cfg.base_url = s.uri();
-        let a = GeminiAdapter::new(
+        let a = GeminiAdapter::build(
             cfg,
             Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
             Budget {
                 ledger: ledger.clone(),
                 pricing: PRICING,
             },
+            |b| b.no_proxy(), // a proxy in the environment must not decide these tests
         )
         .unwrap();
         (a, ledger)
@@ -500,6 +586,66 @@ mod tests {
             Output::Text(t) => t.completion.clone(),
             o => panic!("{o:?}"),
         }
+    }
+
+    /// Each place the key goes into a request header marks it sensitive, so the request's `Debug` output never prints it. (Reverting
+    /// one of these to a plain header leaves every wire-level test green, which is why the built request is inspected here.)
+    #[test]
+    fn every_request_the_adapter_builds_marks_the_key_header_sensitive() {
+        let mut cfg = GeminiConfig::new("gemini-api-key", "gemini-test");
+        cfg.base_url = "http://127.0.0.1:9".to_string();
+        let a = GeminiAdapter::new(
+            cfg,
+            Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
+            Budget {
+                ledger: Arc::new(Ledger::new(1)),
+                pricing: PRICING,
+            },
+        )
+        .unwrap();
+        for built in [
+            a.models_request(KEY).unwrap().build().unwrap(),
+            a.post_request("/v1beta/x", KEY, b"{}".to_vec())
+                .unwrap()
+                .build()
+                .unwrap(),
+        ] {
+            assert!(built
+                .headers()
+                .get("x-goog-api-key")
+                .unwrap()
+                .is_sensitive());
+            let shown = format!("{built:?} {:?}", built.headers());
+            assert!(!shown.contains(KEY), "{shown}");
+        }
+    }
+
+    /// A redirect would replay the key header and the prompt body to wherever it points: the client must not follow one.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_so_the_key_and_prompt_go_nowhere_else() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&elsewhere)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", elsewhere.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let (a, _ledger) = adapter(&origin, 10_000_000);
+        assert!(
+            a.call(&text("a private prompt")).await.is_err(),
+            "a 307 is not a success"
+        );
+        assert_eq!(origin.received_requests().await.unwrap().len(), 1);
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "the redirect target must receive nothing"
+        );
     }
 
     #[tokio::test]
@@ -687,11 +833,17 @@ mod tests {
             Mock::given(method("POST")).respond_with(t).mount(&s).await;
             let (a, ledger) = adapter(&s, 10_000_000);
             assert_eq!(a.call(&text("x")).await.unwrap_err(), want, "HTTP {status}");
-            assert_eq!(
-                (ledger.available(), ledger.spent()),
-                (10_000_000, 0),
-                "HTTP {status}: an unbilled failure releases the reservation"
-            );
+            if status == 504 {
+                // a gateway that gave up on a call the vendor may have finished: charged at the worst case
+                let worst = PRICING.worst_case("x".len() as u64 / 3 + 1, 100);
+                assert_eq!(ledger.spent(), worst, "HTTP {status}: may have been billed");
+            } else {
+                assert_eq!(
+                    (ledger.available(), ledger.spent()),
+                    (10_000_000, 0),
+                    "HTTP {status}: an unbilled failure releases the reservation"
+                );
+            }
         }
         let s = MockServer::start().await;
         serve(
@@ -758,7 +910,7 @@ mod tests {
             cfg,
             Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
             Budget {
-                ledger: Arc::new(Ledger::new(1)),
+                ledger: Arc::new(Ledger::new(10_000_000)),
                 pricing: PRICING,
             },
         )
@@ -805,7 +957,7 @@ mod tests {
             cfg2,
             Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
             Budget {
-                ledger: Arc::new(Ledger::new(1)),
+                ledger: Arc::new(Ledger::new(10_000_000)),
                 pricing: PRICING,
             },
         )
@@ -883,6 +1035,392 @@ mod tests {
                 .iter()
                 .all(|c| !c.image_input.is_yes() && !c.tool_use.is_yes()),
             "capabilities the listing does not carry stay unknown"
+        );
+    }
+
+    // ---- the ledger fails closed ----
+
+    fn gemini_with(
+        s: &MockServer,
+        ledger: &Arc<Ledger>,
+        pricing: Pricing,
+        timeout: Duration,
+    ) -> Result<GeminiAdapter, ConfigError> {
+        let mut cfg = GeminiConfig::new("gemini-api-key", "gemini-test");
+        cfg.base_url = s.uri();
+        cfg.embedding_model = Some("embed-test".into());
+        cfg.timeout = timeout;
+        GeminiAdapter::build(
+            cfg,
+            Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
+            Budget {
+                ledger: ledger.clone(),
+                pricing,
+            },
+            |b| b.no_proxy(),
+        )
+    }
+    fn worst_for_hi() -> u64 {
+        PRICING.worst_case("hi".len() as u64 / 3 + 1, 100)
+    }
+    fn embed_req(inputs: &[&str]) -> Request {
+        Request::Embedding(EmbeddingParams {
+            model_id: "x".into(),
+            inputs: inputs.iter().map(|s| (*s).to_string()).collect(),
+            normalize: false,
+            session_id: None,
+            request_id: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn embeddings_are_reserved_and_refused_before_anything_is_sent_when_they_do_not_fit() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"embeddings":[{"values":[1.0]}]})),
+            )
+            .expect(0)
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(1));
+        let a = gemini_with(&s, &ledger, PRICING, Duration::from_secs(5)).unwrap();
+        let long = "x".repeat(30_000_000);
+        assert_eq!(
+            a.call(&embed_req(&[&long])).await.unwrap_err(),
+            ProviderError::BudgetExceeded
+        );
+        assert_eq!(ledger.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn embeddings_are_charged_their_reserved_estimate_because_the_reply_has_no_usage() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"embeddings":[{"values":[1.0]}]})),
+            )
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = gemini_with(&s, &ledger, PRICING, Duration::from_secs(5)).unwrap();
+        a.call(&embed_req(&["a"])).await.unwrap();
+        let reserved = Budget {
+            ledger: ledger.clone(),
+            pricing: PRICING,
+        }
+        .embedding_worst_case(&["a".to_string()]);
+        assert!(reserved > 0, "an embedding call is not free");
+        assert_eq!(
+            ledger.spent(),
+            reserved,
+            "charged exactly what was reserved"
+        );
+        assert_eq!(ledger.available(), 10_000_000 - reserved);
+    }
+
+    #[tokio::test]
+    async fn a_200_without_usage_metadata_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        let mut b = ok("STOP", "hello");
+        b.as_object_mut().unwrap().remove("usageMetadata");
+        serve(&s, 200, b).await;
+        let (a, ledger) = adapter(&s, 10_000_000);
+        a.call(&text("hi")).await.unwrap();
+        assert_eq!(ledger.spent(), worst_for_hi());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_after_the_request_was_sent_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(ok("STOP", "late"))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&s)
+            .await;
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = gemini_with(&s, &ledger, PRICING, Duration::from_millis(200)).unwrap();
+        assert_eq!(
+            a.call(&text("hi")).await.unwrap_err(),
+            ProviderError::Timeout
+        );
+        assert_eq!(ledger.spent(), worst_for_hi());
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_was_never_made_is_released_at_no_charge() {
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let mut cfg = GeminiConfig::new("gemini-api-key", "gemini-test");
+        cfg.base_url = "http://127.0.0.1:1".into();
+        let a = GeminiAdapter::build(
+            cfg,
+            Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
+            Budget {
+                ledger: ledger.clone(),
+                pricing: PRICING,
+            },
+            |b| b.no_proxy(),
+        )
+        .unwrap();
+        assert!(a.call(&text("hi")).await.is_err());
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[tokio::test]
+    async fn an_adapter_whose_prices_cannot_cap_every_kind_it_offers_is_refused() {
+        let s = MockServer::start().await;
+        let ledger = Arc::new(Ledger::new(1_000_000));
+        let t = Duration::from_secs(5);
+        let cases = [
+            ("all zero", Pricing::default()),
+            (
+                "no input rate (embeddings would reserve nothing)",
+                Pricing {
+                    input_micro_per_mtok: 0,
+                    ..PRICING
+                },
+            ),
+            (
+                "no output rate",
+                Pricing {
+                    output_micro_per_mtok: 0,
+                    ..PRICING
+                },
+            ),
+        ];
+        for (name, pricing) in cases {
+            assert_eq!(
+                gemini_with(&s, &ledger, pricing, t).err(),
+                Some(ConfigError::UnpricedProvider),
+                "{name}"
+            );
+        }
+        assert!(gemini_with(&s, &ledger, PRICING, t).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_200_with_usage_but_no_prompt_count_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        let mut b = ok("STOP", "hello");
+        b["usageMetadata"] = json!({"candidatesTokenCount": 1});
+        serve(&s, 200, b).await;
+        let (a, ledger) = adapter(&s, 10_000_000);
+        a.call(&text("hi")).await.unwrap();
+        assert_eq!(
+            ledger.spent(),
+            worst_for_hi(),
+            "the prompt count is missing: the cost is unknown, so the worst case is charged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_timeout_is_a_request_never_sent_and_is_released_at_no_charge() {
+        let Some(addr) = super::super::test_support::blackholed_addr() else {
+            return;
+        };
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let mut cfg = GeminiConfig::new("gemini-api-key", "gemini-test");
+        cfg.base_url = format!("http://{addr}");
+        cfg.timeout = Duration::from_secs(20);
+        cfg.connect_timeout = Duration::from_millis(300);
+        let a = GeminiAdapter::build(
+            cfg,
+            Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
+            Budget {
+                ledger: ledger.clone(),
+                pricing: PRICING,
+            },
+            |b| b.no_proxy(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert!(a.call(&text("hi")).await.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the connect limit, not the overall one, ended the call"
+        );
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    fn gemini_at(
+        base: &str,
+        creds: Arc<dyn CredentialSource>,
+        ledger: &Arc<Ledger>,
+        timeout: Duration,
+        connect: Duration,
+    ) -> GeminiAdapter {
+        let mut cfg = GeminiConfig::new("gemini-api-key", "gemini-test");
+        cfg.base_url = base.into();
+        cfg.embedding_model = Some("embed-test".into());
+        cfg.timeout = timeout;
+        cfg.connect_timeout = connect;
+        GeminiAdapter::build(
+            cfg,
+            creds,
+            Budget {
+                ledger: ledger.clone(),
+                pricing: PRICING,
+            },
+            |b| b.no_proxy(),
+        )
+        .unwrap()
+    }
+    fn key_source() -> Arc<dyn CredentialSource> {
+        Arc::new(InMemoryCredentials::with("gemini-api-key", KEY))
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_only_the_prompt_count_is_settled_at_the_reserved_worst_case() {
+        let s = MockServer::start().await;
+        let mut b = ok("STOP", "hello");
+        b["usageMetadata"] = json!({"promptTokenCount": 3});
+        serve(&s, 200, b).await;
+        let (a, ledger) = adapter(&s, 10_000_000);
+        a.call(&text("hi")).await.unwrap();
+        assert_eq!(
+            ledger.spent(),
+            worst_for_hi(),
+            "the output count is missing: unknown, so the worst case"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_both_counts_is_settled_from_them() {
+        let s = MockServer::start().await;
+        let mut b = ok("STOP", "hello");
+        b["usageMetadata"] = json!({"promptTokenCount": 3, "candidatesTokenCount": 2});
+        serve(&s, 200, b).await;
+        let (a, ledger) = adapter(&s, 10_000_000);
+        a.call(&text("hi")).await.unwrap();
+        let used = Usage {
+            input_tokens: 3,
+            output_tokens: 2,
+            ..Usage::default()
+        };
+        assert_eq!(ledger.spent(), PRICING.cost(&used));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_the_service_blocked_has_no_candidates_and_is_charged_for_the_prompt_only() {
+        let s = MockServer::start().await;
+        serve(
+            &s,
+            200,
+            json!({"promptFeedback":{"blockReason":"SAFETY"},"usageMetadata":{"promptTokenCount":3}}),
+        )
+        .await;
+        let (a, ledger) = adapter(&s, 10_000_000);
+        let _ = a.call(&text("hi")).await;
+        let used = Usage {
+            input_tokens: 3,
+            ..Usage::default()
+        };
+        assert_eq!(
+            ledger.spent(),
+            PRICING.cost(&used),
+            "no output was produced, so none is charged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_breaks_while_its_body_is_read_is_charged_at_the_reserved_worst_case() {
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let base = format!(
+            "http://{}",
+            super::super::test_support::truncated_reply_server()
+        );
+        let a = gemini_at(
+            &base,
+            key_source(),
+            &ledger,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        assert!(a.call(&text("hi")).await.is_err());
+        assert_eq!(ledger.spent(), worst_for_hi());
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = gemini_at(
+            &base,
+            key_source(),
+            &ledger,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        assert!(a.call(&embed_req(&["a"])).await.is_err());
+        assert!(
+            ledger.spent() > 0,
+            "an embedding whose reply broke is charged too"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_statuses_a_gateway_uses_for_giving_up_are_charged_and_the_others_released() {
+        for (status, charged) in [
+            (408u16, true),
+            (502, true),
+            (504, true),
+            (500, false),
+            (503, false),
+            (400, false),
+            (429, false),
+        ] {
+            let s = MockServer::start().await;
+            serve(&s, status, json!({"error":{"status":"X"}})).await;
+            let (a, ledger) = adapter(&s, 10_000_000);
+            assert!(a.call(&text("hi")).await.is_err());
+            let want = if charged { worst_for_hi() } else { 0 };
+            assert_eq!(ledger.spent(), want, "HTTP {status}");
+            assert_eq!(ledger.available(), 10_000_000 - want, "HTTP {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credential_that_vanishes_after_the_reservation_releases_it() {
+        let s = MockServer::start().await;
+        let creds = super::super::test_support::Vanishing::new(KEY);
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = gemini_at(
+            &s.uri(),
+            creds.clone(),
+            &ledger,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        creds.vanish();
+        assert_eq!(a.call(&text("hi")).await.unwrap_err(), ProviderError::Auth);
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+        assert_eq!(
+            a.call(&embed_req(&["a"])).await.unwrap_err(),
+            ProviderError::Auth
+        );
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[tokio::test]
+    async fn a_connect_limit_longer_than_the_timeout_still_releases_a_hung_connection() {
+        let Some(addr) = super::super::test_support::blackholed_addr() else {
+            return;
+        };
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = gemini_at(
+            &format!("http://{addr}"),
+            key_source(),
+            &ledger,
+            Duration::from_millis(400),
+            Duration::from_secs(30),
+        );
+        assert!(a.call(&text("hi")).await.is_err());
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[test]
+    fn the_default_connect_timeout_is_applied() {
+        assert_eq!(
+            GeminiConfig::new("k", "m").connect_timeout,
+            Duration::from_secs(10)
         );
     }
 }

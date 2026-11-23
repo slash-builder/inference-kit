@@ -81,6 +81,20 @@ impl Pricing {
             + per_million(u.cache_write_tokens, self.cache_write_micro_per_mtok)
     }
 
+    /// Can a ledger enforce a cap on a request of this kind at these prices? (An all-zero price cannot cap anything.) Text needs both an input and an output rate (the worst case
+    /// is the whole prompt plus the whole output allowance); an embedding is reserved at the input rate, so it needs that one. A kind the
+    /// ledger does not price (images, audio) is never capped here, so it answers `false`: fail closed.
+    pub fn can_cap(&self, kind: crate::modality::RequestKind) -> bool {
+        use crate::modality::RequestKind;
+        match kind {
+            RequestKind::TextGeneration => {
+                self.input_micro_per_mtok > 0 && self.output_micro_per_mtok > 0
+            }
+            RequestKind::Embedding => self.input_micro_per_mtok > 0,
+            _ => false,
+        }
+    }
+
     /// The most a call could cost: every input token at the highest input rate (a cache write is the dearest) and the full output allowance.
     pub fn worst_case(&self, input_tokens: u64, max_output_tokens: u64) -> u64 {
         let in_rate = self
@@ -93,6 +107,12 @@ impl Pricing {
 }
 
 /// Money set aside for one in-flight call.
+///
+/// **A reservation that is dropped is neither settled nor released: it stays reserved** (fail closed, and permanent for the life of the
+/// ledger). So a call future that is cancelled between `reserve` and `settle`/`release` (a timeout around the whole call, a dropped task)
+/// leaks its reservation. A guard that released it on drop would fail open (the vendor may have billed a request that was already sent), and
+/// one that charged it would turn dropping a reservation on purpose into spend; neither is a change to make quietly to a public type. Do not put an outer
+/// timeout around a provider call unless a leaked reservation is acceptable.
 #[derive(Debug)]
 #[must_use = "settle or release a reservation, or the money stays reserved"]
 pub struct Reservation(u64);
@@ -186,6 +206,14 @@ impl Ledger {
         }
     }
 
+    /// The call may have been billed but the cost is not known (the reply carried no usage, or the connection timed out or broke after the
+    /// request was sent): charge the **whole reservation**, the worst case it was sized for. Charging nothing here would let a provider that
+    /// omits usage, or a network that drops replies, spend without limit.
+    pub fn settle_reserved(&self, r: Reservation) {
+        let amount = r.0;
+        self.settle(r, amount);
+    }
+
     /// The call failed without being billed: give the reservation back, charge nothing.
     pub fn release(&self, r: Reservation) {
         if let Ok(mut s) = self.0.lock() {
@@ -247,6 +275,30 @@ mod tests {
             Pricing::default().cost(&u),
             0,
             "an unpriced model costs nothing here (the caller must declare prices)"
+        );
+    }
+
+    #[test]
+    fn a_price_can_cap_a_kind_only_when_the_rates_that_kind_is_reserved_at_are_declared() {
+        use crate::modality::RequestKind::{Embedding, ImageGeneration, TextGeneration};
+        let only_output = Pricing {
+            output_micro_per_mtok: 5,
+            ..Pricing::default()
+        };
+        let only_input = Pricing {
+            input_micro_per_mtok: 5,
+            ..Pricing::default()
+        };
+        assert!(P.can_cap(TextGeneration) && P.can_cap(Embedding));
+        // an embedding is reserved at the input rate: a zero input rate reserves nothing
+        assert!(!only_output.can_cap(Embedding));
+        assert!(!only_output.can_cap(TextGeneration));
+        assert!(!only_input.can_cap(TextGeneration), "no output rate");
+        assert!(only_input.can_cap(Embedding));
+        assert!(!Pricing::default().can_cap(TextGeneration));
+        assert!(
+            !P.can_cap(ImageGeneration),
+            "a kind the ledger does not price"
         );
     }
 
