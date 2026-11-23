@@ -196,9 +196,9 @@ pub async fn run_chain_recorded(
                 blocked_by_policy = true;
                 let outcome = match reason {
                     DenyReason::RuleDenies => Outcome::DeniedPolicy,
-                    DenyReason::Unlabelled | DenyReason::CredentialsNeverLeave => {
-                        Outcome::BlockedLabel
-                    }
+                    DenyReason::Unlabelled
+                    | DenyReason::CredentialsNeverLeave
+                    | DenyReason::UnreadableName => Outcome::BlockedLabel,
                 };
                 attempts.push(mk(outcome, rules, None, 0, 0));
                 continue;

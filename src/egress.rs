@@ -16,14 +16,26 @@
 //! - **`credentials` never leaves the home**, whatever the rules say. The whole family is held back: a class name with a
 //!   `credentials` segment (`credentials`, `credentials.wifi`, `credentials/api`, `credentials:x`, `credentials-`, `wifi/credentials`)
 //!   in any spelling of case or edge whitespace. Not covered, because the class vocabulary has no such name: `credential`, `secrets`.
-//! - **One canonical class name.** Every comparison of class names (the label against the rules, a deny rule against a label, the
-//!   credentials check) is made on one canonical form, built by [`canonical_class`] inside [`Policy::decide`], the single place a
-//!   label meets the rules (so labels and rules that were deserialised or built by hand are covered too, not only those made by the
-//!   constructors). The form is: ASCII whitespace trimmed at both ends, ASCII letters lower-cased, and the rest must be ASCII
-//!   letters, digits or `_ - . : /`. A name outside that charset (inner whitespace, control, zero-width, directional or look-alike
-//!   characters, any non-ASCII letter such as `santé`, the empty name) is **refused, never rewritten**, and fails closed:
-//!   in a label it is held back from every provider that leaves the home as [`DenyReason::CredentialsNeverLeave`]; in an allow rule it
-//!   covers nothing; in a deny rule it matches every class (we cannot read what was meant to be denied, so we deny).
+//! - **One canonical name.** Every comparison of a class name, a person's subject id or a provider id (the label against the rules,
+//!   a rule against a label, the credentials check) is made on one canonical form, built by [`canonical_name`] inside
+//!   [`Policy::decide`], the single place a label meets the rules (so labels and rules that were deserialised or built by hand are
+//!   covered too, not only those made by the constructors). The form is: ASCII whitespace trimmed at both ends, ASCII letters
+//!   lower-cased, and the rest must be ASCII letters, digits or `_ - . : /`. A name outside that charset (inner whitespace, control,
+//!   zero-width, directional or look-alike characters, any non-ASCII letter such as `santé`, `tax records`, the empty name) is
+//!   **refused, never rewritten**, and fails closed:
+//!   - in a label (a class, or a person's id), the content is held back from every provider that leaves the home, as
+//!     [`DenyReason::UnreadableName`];
+//!   - in an allow rule it covers nothing;
+//!   - in a deny rule it matches everything it could have been about (any class, any subject, any provider), because we cannot read
+//!     what was meant to be denied, so we deny.
+//!
+//!   A provider id that cannot be read is matched by no allow rule that names a provider and by every deny rule that names one.
+//!   Person ids therefore follow the class charset; an id outside it (an email address, say) has to be mapped to one inside it by
+//!   whoever assigns labels.
+//! - **A deny covers the names under it; an allow is exact.** Class names have segments, split on `. : / - _`. A deny for class `X`
+//!   covers `X` and every class whose segments start with `X`'s segments (`health` covers `health.records`, `health/labs`,
+//!   `health-labs`, `health_labs`; it does not cover `healthcare`). An allow for `X` covers exactly `X`'s canonical name and nothing
+//!   under it, so a more specific class is never allowed by accident and a deny can never make an allow broader.
 //! - **Minors.** A subject whose age band is `minor` or `unknown` is covered only by an allow rule that sets `include_minors`.
 //!   (A deny matches them regardless.)
 //! - **Combining labels** (a multi-turn context, a tool result) is a union of classes and subjects, never a collapse to one value.
@@ -40,13 +52,13 @@ use std::sync::Mutex;
 /// The data class that can never leave the home.
 pub const CREDENTIALS_CLASS: &str = "credentials";
 
-/// The canonical form of a class name, or `None` if the name cannot be read.
+/// The canonical form of a class name, a person's subject id or a provider id, or `None` if the name cannot be read.
 ///
 /// ASCII whitespace is trimmed at both ends and ASCII letters are lower-cased; what remains must be non-empty and made only of ASCII
 /// letters, digits and `_ - . : /`. Anything else (inner whitespace, control, zero-width, directional or look-alike characters, any
 /// non-ASCII letter, the empty name) is refused rather than rewritten: normalising it would need a Unicode table and would still miss
 /// look-alikes. Callers treat `None` as the most restrictive case. See the module docs.
-pub(crate) fn canonical_class(raw: &str) -> Option<String> {
+pub(crate) fn canonical_name(raw: &str) -> Option<String> {
     let name = raw.trim_matches(|c: char| c.is_ascii_whitespace());
     let plain = !name.is_empty()
         && name
@@ -59,16 +71,25 @@ pub(crate) fn canonical_class(raw: &str) -> Option<String> {
 /// `credentials`. That covers a namespace prefix (`credentials.wifi`, `credentials/api`, `credentials:x`), a trailing separator
 /// (`credentials-`) and a path that ends in it (`wifi/credentials`). It is one word, the class the kit already has; no other word list.
 fn is_credentials_family(canonical: &str) -> bool {
-    canonical
-        .split(['.', ':', '/', '-', '_'])
-        .any(|seg| seg == CREDENTIALS_CLASS)
+    segments(canonical).any(|seg| seg == CREDENTIALS_CLASS)
+}
+
+/// The segments of a canonical name (`health/labs` is `health`, `labs`).
+fn segments(canonical: &str) -> impl Iterator<Item = &str> {
+    canonical.split(['.', ':', '/', '-', '_'])
+}
+
+/// True if `name` is `prefix` or lies under it: its segments start with the segments of `prefix`. Both are canonical.
+fn is_under(name: &str, prefix: &str) -> bool {
+    let mut name = segments(name);
+    segments(prefix).all(|p| name.next() == Some(p))
 }
 
 /// True if the never-leave rule must hold this raw class name back: it is in the credentials family once canonicalised, or it cannot
 /// be canonicalised at all (fails closed).
 #[cfg(test)]
 pub(crate) fn is_credentials_or_unreadable(raw: &str) -> bool {
-    canonical_class(raw).is_none_or(|c| is_credentials_family(&c))
+    canonical_name(raw).is_none_or(|c| is_credentials_family(&c))
 }
 
 /// Where a provider runs. Zero value (`Unspecified`) is treated as the strictest, [`Locality::Saas`].
@@ -291,31 +312,53 @@ impl Rule {
         !self.revoked && self.expires_at.is_none_or(|t| now < t)
     }
 
-    fn matches_context(&self, provider_id: &str, purpose: Purpose, kind: RequestKind) -> bool {
-        (match &self.provider {
+    /// Provider ids compare canonically. If either side cannot be read, an allow matches nothing and a deny matches (fail closed).
+    fn matches_provider(&self, provider_id: &str) -> bool {
+        match &self.provider {
             ProviderMatch::Any => true,
-            ProviderMatch::Id(id) => id == provider_id,
-        }) && (self.purposes.is_empty() || self.purposes.contains(&purpose))
+            ProviderMatch::Id(id) => match (canonical_name(id), canonical_name(provider_id)) {
+                (Some(a), Some(b)) => a == b,
+                _ => self.effect == Effect::Deny,
+            },
+        }
+    }
+
+    fn matches_context(&self, provider_id: &str, purpose: Purpose, kind: RequestKind) -> bool {
+        self.matches_provider(provider_id)
+            && (self.purposes.is_empty() || self.purposes.contains(&purpose))
             && (self.request_kinds.is_empty() || self.request_kinds.contains(&kind))
     }
 
-    /// Does this rule cover `class` (already canonical, see [`canonical_class`]) for `subject`? The rule's own class names are
-    /// canonicalised here, so a deny written `Health ` still denies `health`. A rule class name that cannot be read covers nothing in
-    /// an allow and every class in a deny (fail closed).
+    /// Does this rule cover `class` for `subject`? Both are already canonical (see [`canonical_name`]; [`Policy::decide`] makes them so);
+    /// the rule's own names are canonicalised here, so a deny written `Health ` still denies `health` and a deny for Person `Alice`
+    /// still denies Person `alice`. A deny for a class also covers the classes under it ([`is_under`]); an allow is exact. A rule
+    /// name that cannot be read covers nothing in an allow and everything in a deny (fail closed).
     fn matches_pair(&self, class: &str, subject: &Subject) -> bool {
+        let deny = self.effect == Effect::Deny;
         let class_ok =
             self.selector.classes.is_empty()
                 || self.selector.classes.iter().any(|rule_class| {
-                    match canonical_class(rule_class) {
+                    match canonical_name(rule_class) {
+                        Some(c) if deny => is_under(class, &c),
                         Some(c) => c == class,
-                        None => self.effect == Effect::Deny,
+                        None => deny,
                     }
                 });
-        let subject_ok = self
-            .selector
-            .subjects
-            .as_ref()
-            .is_none_or(|s| s.contains(&subject.scope));
+        let subject_ok = self.selector.subjects.as_ref().is_none_or(|wanted| {
+            wanted.iter().any(|w| match (w, &subject.scope) {
+                (SubjectScope::Household, SubjectScope::Household) => true,
+                (SubjectScope::Person(rule_id), SubjectScope::Person(id)) => {
+                    match canonical_name(rule_id) {
+                        Some(r) => r == *id,
+                        None => deny,
+                    }
+                }
+                (SubjectScope::Person(rule_id), SubjectScope::Household) => {
+                    deny && canonical_name(rule_id).is_none()
+                }
+                (SubjectScope::Household, SubjectScope::Person(_)) => false,
+            })
+        });
         // minors gate only allows; a deny always applies
         let minor_ok =
             self.effect == Effect::Deny || subject.is_adult() || self.selector.include_minors;
@@ -346,8 +389,11 @@ pub enum DenyReason {
     RuleDenies,
     /// The label says nothing about class or owner (or the purpose is unspecified).
     Unlabelled,
-    /// The content includes a class in the credentials family, or a class name that cannot be read as canonical ASCII (held back the same way).
+    /// The content includes a class in the credentials family.
     CredentialsNeverLeave,
+    /// The label carries a class name or a person's id that cannot be read as canonical ASCII (see the module docs), so it is held
+    /// back like private content. Added after the other reasons: match on it, or on `_`, when handling a verdict.
+    UnreadableName,
 }
 
 /// The engine's answer.
@@ -376,20 +422,45 @@ impl Policy {
         if !provider.locality.leaves_home() {
             return Verdict::Allow { rules: Vec::new() };
         }
-        // the one place label class names are read: canonical, or held back (credentials family, or unreadable)
+        // the one place label names are read: canonical, or held back (credentials family, or unreadable)
         let mut classes: BTreeSet<String> = BTreeSet::new();
+        let mut unreadable = false;
         for raw in &label.classes {
-            match canonical_class(raw) {
-                Some(c) if !is_credentials_family(&c) => {
-                    classes.insert(c);
-                }
-                _ => {
+            match canonical_name(raw) {
+                Some(c) if is_credentials_family(&c) => {
                     return Verdict::Deny {
                         reason: DenyReason::CredentialsNeverLeave,
                         rules: Vec::new(),
                     }
                 }
+                Some(c) => {
+                    classes.insert(c);
+                }
+                None => unreadable = true,
             }
+        }
+        let mut subjects: BTreeSet<Subject> = BTreeSet::new();
+        for subject in &label.subjects {
+            match &subject.scope {
+                SubjectScope::Household => {
+                    subjects.insert(subject.clone());
+                }
+                SubjectScope::Person(id) => match canonical_name(id) {
+                    Some(id) => {
+                        subjects.insert(Subject {
+                            scope: SubjectScope::Person(id),
+                            age: subject.age,
+                        });
+                    }
+                    None => unreadable = true,
+                },
+            }
+        }
+        if unreadable {
+            return Verdict::Deny {
+                reason: DenyReason::UnreadableName,
+                rules: Vec::new(),
+            };
         }
         if label.is_unlabelled() || purpose == Purpose::Unspecified {
             return Verdict::Deny {
@@ -405,7 +476,7 @@ impl Policy {
         let mut used: Vec<(String, u32)> = Vec::new();
         let mut uncovered = 0usize;
         for class in &classes {
-            for subject in &label.subjects {
+            for subject in &subjects {
                 let matching: Vec<&&Rule> = live
                     .iter()
                     .filter(|r| r.matches_pair(class, subject))
@@ -629,22 +700,60 @@ mod tests {
         ));
     }
 
-    /// The never-leave rule used to be an exact, case-sensitive string match, so a differently written class name fell through to the
-    /// ordinary rules, where an allow-everything rule would let it go. A name that is the credentials class once case and edge whitespace
-    /// are ignored, and any name that cannot be read as plain ASCII text at all, is held back from every provider that leaves the home.
-    #[test]
-    fn credentials_never_leave_however_the_class_is_written_or_disguised() {
-        let policy = Policy {
+    fn reason_of(v: &Verdict) -> Option<DenyReason> {
+        match v {
+            Verdict::Deny { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+    fn allow_all() -> Policy {
+        Policy {
             version: 1,
             rules: vec![Rule::allow("all", ProviderMatch::Any, &[]).including_minors()],
-        };
+        }
+    }
+
+    /// The never-leave rule used to be an exact, case-sensitive string match, so a differently written class name fell through to the
+    /// ordinary rules, where an allow-everything rule would let it go. A name that is in the credentials family once case and edge
+    /// whitespace are ignored is held back from every provider that leaves the home, with the credentials reason.
+    #[test]
+    fn credentials_never_leave_however_the_class_is_written() {
+        let policy = allow_all();
         for written in [
             "Credentials",
             "CREDENTIALS",
             " credentials",
             "credentials ",
             "\tcredentials\n",
-            // invisible, directional and look-alike characters: not readable as plain text, so held back
+            "credentials.wifi",
+            "Credentials.WiFi",
+            "credentials/api",
+            "credentials:token",
+            "credentials-",
+            "credentials_",
+            "credentials-wifi",
+            " credentials/api ",
+            "wifi/credentials",
+        ] {
+            assert_eq!(
+                reason_of(&decide(
+                    &policy,
+                    &lbl(&[written], &[alice()]),
+                    &saas("claude")
+                )),
+                Some(DenyReason::CredentialsNeverLeave),
+                "{written:?} must be held back like the credentials class"
+            );
+        }
+    }
+
+    /// Invisible, directional and look-alike characters, inner whitespace and the empty name cannot be canonicalised, so they are
+    /// refused rather than guessed at: held back from every provider that leaves the home, and reported truthfully as an unreadable
+    /// name, not as credentials. The same goes for ordinary names outside the charset.
+    #[test]
+    fn a_class_name_outside_the_charset_is_held_back_with_the_unreadable_reason() {
+        let policy = allow_all();
+        for written in [
             "cred\u{200b}entials",
             "credentials\u{feff}",
             "cre\u{00ad}dentials",
@@ -656,27 +765,67 @@ mod tests {
             "cre dentials",
             "",
             "   ",
-            // the namespaced and punctuated family
-            "credentials.wifi",
-            "Credentials.WiFi",
-            "credentials/api",
-            "credentials:token",
-            "credentials-",
-            "credentials_",
-            "credentials-wifi",
-            " credentials/api ",
-            "wifi/credentials",
+            "tax records",
+            "photos (2024)",
+            "sant\u{e9}",
+        ] {
+            assert_eq!(
+                reason_of(&decide(
+                    &policy,
+                    &lbl(&[written], &[alice()]),
+                    &saas("claude")
+                )),
+                Some(DenyReason::UnreadableName),
+                "{written:?} must be held back as unreadable"
+            );
+            // among readable classes, in any position
+            assert_eq!(
+                reason_of(&decide(
+                    &policy,
+                    &lbl(&["a-notes", written, "z-photos"], &[alice()]),
+                    &saas("claude")
+                )),
+                Some(DenyReason::UnreadableName),
+            );
+            // a provider that does not leave the home still gets it
+            let home = ProviderInfo {
+                locality: Locality::Home,
+                ..saas("home")
+            };
+            assert!(allowed(&decide(
+                &Policy::default(),
+                &lbl(&[written], &[alice()]),
+                &home
+            )));
+        }
+        // credentials wins over unreadable when both are there
+        assert_eq!(
+            reason_of(&decide(
+                &policy,
+                &lbl(&["sant\u{e9}", "credentials"], &[alice()]),
+                &saas("claude")
+            )),
+            Some(DenyReason::CredentialsNeverLeave)
+        );
+    }
+
+    /// `/` and the other separators are part of the charset: a name like `photos/2024` is an ordinary class, not credentials-like and
+    /// not unreadable. (Removing `/` from the charset made it unreadable and no other test noticed.)
+    #[test]
+    fn separators_are_in_the_charset_so_namespaced_ordinary_names_are_readable() {
+        let policy = allow_all();
+        for name in [
+            "photos/2024",
+            "photos.2024",
+            "photos:2024",
+            "photos-2024",
+            "photos_2024",
         ] {
             assert!(
-                matches!(
-                    decide(&policy, &lbl(&[written], &[alice()]), &saas("claude")),
-                    Verdict::Deny {
-                        reason: DenyReason::CredentialsNeverLeave,
-                        ..
-                    }
-                ),
-                "{written:?} must be held back like the credentials class"
+                allowed(&decide(&policy, &lbl(&[name], &[alice()]), &saas("claude"))),
+                "{name:?} is an ordinary readable class"
             );
+            assert_eq!(canonical_name(name).as_deref(), Some(name));
         }
     }
 
@@ -832,7 +981,6 @@ mod tests {
             &["a-notes", "credentials", "z-photos"][..],
             &["notes", "photos", "credentials"][..],
             &["notes", "photos", "Credentials.wifi"][..],
-            &["notes", "photos", "x\u{200b}y"][..],
         ] {
             assert!(
                 matches!(
@@ -867,6 +1015,298 @@ mod tests {
             &lbl(&["credentials.wifi", "x\u{200b}y"], &[alice()]),
             &local
         )));
+    }
+
+    fn deny_policy(rule: Rule) -> Policy {
+        Policy {
+            version: 1,
+            rules: vec![
+                Rule::allow("all", ProviderMatch::Any, &[]).including_minors(),
+                rule,
+            ],
+        }
+    }
+    fn person(id: &str) -> Subject {
+        Subject::person(id, AgeBand::Adult)
+    }
+
+    /// A deny for a person must hold however the id is written, in the label or in the rule.
+    #[test]
+    fn deny_rules_match_person_ids_in_every_spelling() {
+        for (label_id, rule_id) in [
+            ("alice", "alice"),
+            ("Alice", "alice"),
+            ("ALICE", "alice"),
+            ("alice ", "alice"),
+            (" \talice\n", "alice"),
+            ("alice", "Alice"),
+            ("alice", " alice "),
+        ] {
+            let policy = deny_policy(
+                Rule::deny("no-alice", ProviderMatch::Any, &[])
+                    .for_subjects(&[SubjectScope::Person(rule_id.into())]),
+            );
+            assert_eq!(
+                reason_of(&decide(
+                    &policy,
+                    &lbl(&["notes"], &[person(label_id)]),
+                    &saas("claude")
+                )),
+                Some(DenyReason::RuleDenies),
+                "label {label_id:?} must be denied by a deny for {rule_id:?}"
+            );
+        }
+        // another person is not caught by it
+        let policy = deny_policy(
+            Rule::deny("no-alice", ProviderMatch::Any, &[])
+                .for_subjects(&[SubjectScope::Person("alice".into())]),
+        );
+        assert!(allowed(&decide(
+            &policy,
+            &lbl(&["notes"], &[person("bob")]),
+            &saas("claude")
+        )));
+    }
+
+    /// An allow for a person is canonical too (it grants no more and no less than the plain spelling), and an unreadable id never
+    /// slips through: in a label it holds the content back, in a deny it denies every subject, in an allow it covers nothing.
+    #[test]
+    fn person_ids_that_cannot_be_read_fail_closed() {
+        let allow_alice = |id: &str| Policy {
+            version: 1,
+            rules: vec![Rule::allow("a", ProviderMatch::Any, &[])
+                .for_subjects(&[SubjectScope::Person(id.into())])],
+        };
+        assert!(allowed(&decide(
+            &allow_alice(" Alice "),
+            &lbl(&["notes"], &[person("alice")]),
+            &saas("claude")
+        )));
+        for bad in ["al\u{200b}ice", "\u{0430}lice", "ali ce", "", "alic\u{e9}"] {
+            assert_eq!(
+                reason_of(&decide(
+                    &allow_all(),
+                    &lbl(&["notes"], &[person(bad)]),
+                    &saas("claude")
+                )),
+                Some(DenyReason::UnreadableName),
+                "label subject {bad:?}"
+            );
+            // household next to an unreadable person: still held back
+            assert_eq!(
+                reason_of(&decide(
+                    &allow_all(),
+                    &lbl(&["notes"], &[Subject::household(), person(bad)]),
+                    &saas("claude")
+                )),
+                Some(DenyReason::UnreadableName),
+            );
+            let deny = deny_policy(
+                Rule::deny("d", ProviderMatch::Any, &[])
+                    .for_subjects(&[SubjectScope::Person(bad.into())]),
+            );
+            for who in [person("alice"), Subject::household()] {
+                assert_eq!(
+                    reason_of(&decide(&deny, &lbl(&["notes"], &[who]), &saas("claude"))),
+                    Some(DenyReason::RuleDenies),
+                    "a deny for the unreadable id {bad:?} denies every subject"
+                );
+            }
+            assert!(
+                !allowed(&decide(
+                    &allow_alice(bad),
+                    &lbl(&["notes"], &[person("alice")]),
+                    &saas("claude")
+                )),
+                "an allow for the unreadable id {bad:?} covers nothing"
+            );
+        }
+    }
+
+    /// A deny for a provider must hold however its id is written, in the rule or on the provider.
+    #[test]
+    fn deny_rules_match_provider_ids_in_every_spelling() {
+        for (provider, rule_id) in [
+            ("claude", "claude"),
+            ("claude", "Claude"),
+            ("claude", "CLAUDE"),
+            ("claude", " claude "),
+            ("Claude", "claude"),
+            ("claude ", "claude"),
+        ] {
+            let policy = deny_policy(Rule::deny(
+                "no-claude",
+                ProviderMatch::Id(rule_id.into()),
+                &[],
+            ));
+            assert_eq!(
+                reason_of(&decide(
+                    &policy,
+                    &lbl(&["notes"], &[alice()]),
+                    &saas(provider)
+                )),
+                Some(DenyReason::RuleDenies),
+                "provider {provider:?} must be denied by a deny for {rule_id:?}"
+            );
+        }
+        // a different provider is not caught
+        let policy = deny_policy(Rule::deny("d", ProviderMatch::Id("Claude".into()), &[]));
+        assert!(allowed(&decide(
+            &policy,
+            &lbl(&["notes"], &[alice()]),
+            &saas("gemini")
+        )));
+        // an allow for a provider is canonical too
+        let only_claude = Policy {
+            version: 1,
+            rules: vec![Rule::allow("a", ProviderMatch::Id(" Claude ".into()), &[])],
+        };
+        assert!(allowed(&decide(
+            &only_claude,
+            &lbl(&["notes"], &[alice()]),
+            &saas("claude")
+        )));
+        assert!(!allowed(&decide(
+            &only_claude,
+            &lbl(&["notes"], &[alice()]),
+            &saas("gemini")
+        )));
+    }
+
+    /// An id that cannot be read fails closed: a deny that names an unreadable provider denies every provider, an allow that names one
+    /// allows none, and an unreadable provider id is denied by any deny that names a provider and allowed by no allow that does.
+    #[test]
+    fn provider_ids_that_cannot_be_read_fail_closed() {
+        for bad in [
+            "cla\u{200b}ude",
+            "cl\u{0430}ude",
+            "clau de",
+            "",
+            "claud\u{e9}",
+        ] {
+            let deny = deny_policy(Rule::deny("d", ProviderMatch::Id(bad.into()), &[]));
+            for provider in ["claude", "gemini"] {
+                assert_eq!(
+                    reason_of(&decide(
+                        &deny,
+                        &lbl(&["notes"], &[alice()]),
+                        &saas(provider)
+                    )),
+                    Some(DenyReason::RuleDenies),
+                    "a deny for the unreadable provider {bad:?}"
+                );
+            }
+            let allow = Policy {
+                version: 1,
+                rules: vec![Rule::allow("a", ProviderMatch::Id(bad.into()), &[])],
+            };
+            for provider in ["claude", bad] {
+                assert!(
+                    !allowed(&decide(
+                        &allow,
+                        &lbl(&["notes"], &[alice()]),
+                        &saas(provider)
+                    )),
+                    "an allow for the unreadable provider {bad:?} covers nothing"
+                );
+            }
+            // the provider itself is the unreadable one
+            let deny_claude = deny_policy(Rule::deny("d", ProviderMatch::Id("claude".into()), &[]));
+            assert_eq!(
+                reason_of(&decide(
+                    &deny_claude,
+                    &lbl(&["notes"], &[alice()]),
+                    &saas(bad)
+                )),
+                Some(DenyReason::RuleDenies)
+            );
+        }
+    }
+
+    /// A deny for a class covers the classes under it, so the namespaced children of a denied class cannot be used to get around the
+    /// deny. It does not cover a name that merely starts with the same letters.
+    #[test]
+    fn a_deny_covers_the_classes_under_it() {
+        let policy = deny_policy(Rule::deny("no-health", ProviderMatch::Any, &["health"]));
+        for child in [
+            "health",
+            "Health",
+            "health.records",
+            "health/labs",
+            "health:labs",
+            "health-labs",
+            "health_labs",
+            "Health/Labs.2024",
+            "health.",
+            "health-",
+        ] {
+            assert_eq!(
+                reason_of(&decide(
+                    &policy,
+                    &lbl(&[child], &[alice()]),
+                    &saas("claude")
+                )),
+                Some(DenyReason::RuleDenies),
+                "{child:?} is under health"
+            );
+        }
+        for other in ["healthcare", "wealth", "mental-health", "notes", "healt"] {
+            assert!(
+                allowed(&decide(
+                    &policy,
+                    &lbl(&[other], &[alice()]),
+                    &saas("claude")
+                )),
+                "{other:?} is not under health"
+            );
+        }
+        // a deny with a longer name covers its own children, and not its parent
+        let deep = deny_policy(Rule::deny("d", ProviderMatch::Any, &["health.labs"]));
+        assert!(!allowed(&decide(
+            &deep,
+            &lbl(&["health_labs/2024"], &[alice()]),
+            &saas("claude")
+        )));
+        assert!(allowed(&decide(
+            &deep,
+            &lbl(&["health"], &[alice()]),
+            &saas("claude")
+        )));
+    }
+
+    /// An allow is exact: allowing `health` does not allow anything under it, so a deny covering more names can never leave an allow
+    /// covering more than it was written for.
+    #[test]
+    fn an_allow_is_exact_and_covers_nothing_under_the_class() {
+        let policy = Policy {
+            version: 1,
+            rules: vec![Rule::allow("a-health", ProviderMatch::Any, &["health"])],
+        };
+        assert!(allowed(&decide(
+            &policy,
+            &lbl(&["Health "], &[alice()]),
+            &saas("claude")
+        )));
+        for child in [
+            "health.records",
+            "health/labs",
+            "health-labs",
+            "health_labs",
+        ] {
+            assert!(
+                matches!(
+                    decide(&policy, &lbl(&[child], &[alice()]), &saas("claude")),
+                    Verdict::AskUser { .. }
+                ),
+                "{child:?} is not covered by an allow for health"
+            );
+            // and mixed with the allowed class, the label is still not covered
+            assert!(!allowed(&decide(
+                &policy,
+                &lbl(&["health", child], &[alice()]),
+                &saas("claude")
+            )));
+        }
     }
 
     #[test]
@@ -1028,7 +1468,7 @@ mod tests {
                                         RequestKind::TextGeneration
                                     )
                                     && r.matches_pair(
-                                        &canonical_class(c).expect("the universe is readable"),
+                                        &canonical_name(c).expect("the universe is readable"),
                                         s
                                     )),
                                 "a deny matched but content was allowed: {label:?} {rmask}"
@@ -1045,7 +1485,7 @@ mod tests {
                                         || r.selector
                                             .classes
                                             .iter()
-                                            .any(|rc| canonical_class(rc) == canonical_class(c)))
+                                            .any(|rc| canonical_name(rc) == canonical_name(c)))
                                     && (s.age == AgeBand::Adult || r.selector.include_minors)
                             });
                             assert!(covering, "uncovered pair {c}/{s:?} was sent: {rmask}");
