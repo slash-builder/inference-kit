@@ -8,6 +8,7 @@
 //! The maths mirrors Candle's `z_image::text_encoder` exactly (RMSNorm on q and k per head, RoPE with theta 1e6, grouped-query
 //! attention with 8 KV heads, SwiGLU); `streaming_matches_candles_full_encoder` checks that on real weights.
 
+use crate::backends::common::VerifiedMaps;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{linear_no_bias, rms_norm, RmsNorm, VarBuilder};
 use candle_transformers::models::z_image::TextEncoderConfig;
@@ -104,11 +105,26 @@ pub(crate) fn encode_streaming(
     device: &Device,
     dtype: DType,
 ) -> Result<Tensor> {
+    // Called once per request, long after `load_model` hashed the shards: open each once, check that handle against the hash taken at
+    // load, and map from that same handle (see `VerifiedMaps`). Both builders share the mappings, which live only for this call.
+    let maps = VerifiedMaps::open(shards).map_err(|e| candle_core::Error::msg(e.to_string()))?;
+    let out = encode_mapped(ids, &maps, device, dtype);
+    // a write during use is reported in preference to whatever the work returned (a truncation cannot be reported: the process takes SIGBUS on the next access to the missing pages)
+    maps.recheck()
+        .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+    out
+}
+
+fn encode_mapped(
+    ids: &[u32],
+    maps: &VerifiedMaps,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
     let cfg = TextEncoderConfig::z_image();
     let l = ids.len();
-    // SAFETY: the shards were BLAKE3-verified immediately before and are not modified while mapped.
-    let on_cpu = unsafe { VarBuilder::from_mmaped_safetensors(shards, dtype, &Device::Cpu)? };
-    let on_dev = unsafe { VarBuilder::from_mmaped_safetensors(shards, dtype, device)? };
+    let on_cpu = maps.var_builder(dtype, &Device::Cpu)?;
+    let on_dev = maps.var_builder(dtype, device)?;
 
     // embedding lookup on the CPU: only the prompt's rows are copied to the device
     let table = on_cpu

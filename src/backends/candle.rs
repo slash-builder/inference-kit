@@ -73,6 +73,7 @@ struct LoadedCandleModel {
 /// Real local inference backend using Candle. See module docs.
 pub struct CandleInferenceService {
     registry: ModelRegistry,
+    commercial_only: bool,
     device_pref: DevicePreference,
     loaded: RwLock<HashMap<String, Arc<LoadedCandleModel>>>,
     model_cache: Mutex<ModelCache>,
@@ -95,6 +96,7 @@ impl CandleInferenceService {
         let registry = ModelRegistry::load_from_file(catalog_path)?;
         Ok(Self {
             registry,
+            commercial_only: false,
             device_pref: device,
             loaded: RwLock::new(HashMap::new()),
             model_cache: Mutex::new(ModelCache::new()),
@@ -122,13 +124,26 @@ impl CandleInferenceService {
         device_for(self.device_pref).map_err(fail)
     }
 
+    /// Refuse to load any model that is not known to permit commercial use ([`crate::types::LicenceClass::Commercial`]). Off by default;
+    /// the default-model rule in the registry does not apply to a model a caller names, so a product that must ship only commercial
+    /// models turns this on.
+    pub fn with_commercial_only(mut self) -> Self {
+        self.commercial_only = true;
+        self
+    }
+
     fn model_meta(&self, model_id: &str) -> Result<ModelMetadata> {
-        self.registry
+        let m = self
+            .registry
             .get(model_id)
             .cloned()
             .ok_or_else(|| AiKitError::ModelNotFound {
                 model_id: model_id.to_string(),
-            })
+            })?;
+        if self.commercial_only {
+            self.registry.check_licence(model_id, false)?;
+        }
+        Ok(m)
     }
 
     fn tokenizer_path_for(model: &ModelMetadata) -> Result<String> {
@@ -141,6 +156,30 @@ impl CandleInferenceService {
                 model_id: model.id.clone(),
                 reason: "catalog entry missing metadata.custom.tokenizer_path".to_string(),
             })
+    }
+
+    /// The tokenizer's bytes, read once so the bytes that are checked are the bytes that are parsed.
+    ///
+    /// If the catalog lists a `tokenizer` file (`files:`, with a hash), it is read once and its BLAKE3 must match, like the weights; a
+    /// mismatch is `IntegrityCheckFailed`. Otherwise the path in `metadata.custom.tokenizer_path` is used, and **nothing verifies it**:
+    /// the catalog carries no hash for that form. List the tokenizer under `files:` to have it verified.
+    fn read_tokenizer(model: &ModelMetadata) -> Result<Vec<u8>> {
+        let strip = |l: &str| l.strip_prefix("file://").unwrap_or(l).to_string();
+        match model.files.iter().find(|f| f.role == "tokenizer") {
+            Some(f) => {
+                let bytes = std::fs::read(strip(&f.location))?;
+                let actual = blake3::hash(&bytes).to_hex().to_string();
+                if actual != f.hash {
+                    return Err(AiKitError::IntegrityCheckFailed {
+                        model_id: model.id.clone(),
+                        expected: f.hash.clone(),
+                        actual,
+                    });
+                }
+                Ok(bytes)
+            }
+            None => Ok(std::fs::read(Self::tokenizer_path_for(model)?)?),
+        }
     }
 
     /// Parse a fresh `ModelWeights` from an in-memory GGUF byte buffer.
@@ -372,12 +411,12 @@ impl InferenceService for CandleInferenceService {
         // fail-fast "does it parse" check and the instance every `infer()` reuses.
         let weights = Self::build_model_weights(&bytes, &device, model_id)?;
 
-        let tokenizer_path = Self::tokenizer_path_for(&model)?;
-        let tokenizer =
-            Tokenizer::from_file(&tokenizer_path).map_err(|e| AiKitError::ModelLoadFailed {
+        let tokenizer = Tokenizer::from_bytes(Self::read_tokenizer(&model)?).map_err(|e| {
+            AiKitError::ModelLoadFailed {
                 model_id: model_id.to_string(),
                 reason: format!("tokenizer load failed: {e}"),
-            })?;
+            }
+        })?;
         let eos_token_ids = end_token_ids(&tokenizer);
         if eos_token_ids.is_empty() {
             return Err(AiKitError::ModelLoadFailed {
@@ -420,6 +459,9 @@ impl InferenceService for CandleInferenceService {
                 reason: "loaded-model lock poisoned".to_string(),
             })?
             .remove(model_id);
+        // `model_meta` fails for an id that is not in the catalog and, on a commercial-only service, for a model refused for its licence.
+        // Neither can have been loaded or cached, so there is nothing to evict and the error is deliberately ignored: unloading stays
+        // idempotent and never reports a licence refusal for something that is not there.
         if let Ok(model) = self.model_meta(model_id) {
             let mut cache = self.model_cache.lock().map_err(|_| AiKitError::Internal {
                 reason: "model-cache lock poisoned".to_string(),
@@ -482,4 +524,160 @@ fn end_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
     .iter()
     .filter_map(|t| tokenizer.token_to_id(t))
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ModelFile, ModelMetadataExtended};
+    use std::collections::HashMap;
+
+    fn model(files: Vec<ModelFile>, tokenizer_path: Option<&str>) -> ModelMetadata {
+        let mut custom = HashMap::new();
+        if let Some(p) = tokenizer_path {
+            custom.insert("tokenizer_path".to_string(), p.to_string());
+        }
+        ModelMetadata {
+            id: "t".into(),
+            version: "1".into(),
+            os_arch: vec![],
+            quantization_variants: vec![],
+            default_quantization: String::new(),
+            hash: "0".into(),
+            size_bytes: 0,
+            location: String::new(),
+            metadata: ModelMetadataExtended {
+                parameters: 0,
+                context_window: 0,
+                vram_required_mb: 0,
+                inference_latency_ms: 0,
+                framework: String::new(),
+                custom,
+            },
+            files,
+        }
+    }
+
+    fn tokenizer_file(path: &str, hash: &str) -> ModelFile {
+        ModelFile {
+            role: "tokenizer".into(),
+            location: format!("file://{path}"),
+            hash: hash.into(),
+            size_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn a_tokenizer_listed_in_the_catalog_is_hashed_and_a_mismatch_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("tokenizer.json");
+        std::fs::write(&p, b"the tokenizer").unwrap();
+        let p = p.to_str().unwrap();
+        let good = blake3::hash(b"the tokenizer").to_hex().to_string();
+        let m = model(vec![tokenizer_file(p, &good)], None);
+        assert_eq!(
+            CandleInferenceService::read_tokenizer(&m).unwrap(),
+            b"the tokenizer"
+        );
+        // the content changed since the catalog was written
+        std::fs::write(p, b"another tokenizer").unwrap();
+        assert!(matches!(
+            CandleInferenceService::read_tokenizer(&m),
+            Err(AiKitError::IntegrityCheckFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_listed_tokenizer_wins_over_tokenizer_path_and_the_old_form_still_loads_unverified() {
+        let d = tempfile::tempdir().unwrap();
+        let listed = d.path().join("listed.json");
+        let legacy = d.path().join("legacy.json");
+        std::fs::write(&listed, b"listed").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        let hash = blake3::hash(b"listed").to_hex().to_string();
+        let both = model(
+            vec![tokenizer_file(listed.to_str().unwrap(), &hash)],
+            Some(legacy.to_str().unwrap()),
+        );
+        assert_eq!(
+            CandleInferenceService::read_tokenizer(&both).unwrap(),
+            b"listed"
+        );
+        let old = model(vec![], Some(legacy.to_str().unwrap()));
+        assert_eq!(
+            CandleInferenceService::read_tokenizer(&old).unwrap(),
+            b"legacy"
+        );
+        assert!(CandleInferenceService::read_tokenizer(&model(vec![], None)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod licence_tests {
+    use super::*;
+
+    /// A one-model catalog on disk. The file the entry points at does not exist, so any load that gets past the licence check fails
+    /// with something else, which is how these tests tell "refused for the licence" from "got as far as the weights".
+    fn catalog(license: &str) -> (tempfile::TempDir, String) {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("catalog.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"version: "1.0"
+models:
+  - id: "m"
+    version: "1.0.0"
+    os_arch: ["x86_64"]
+    quantization_variants: ["q4"]
+    default_quantization: "q4"
+    hash: "blake3-abcd1234"
+    size_bytes: 1
+    location: "file:///does-not-exist"
+    metadata:
+      parameters: 1
+      context_window: 1
+      vram_required_mb: 1
+      inference_latency_ms: 1
+      custom:
+        license: "{license}"
+"#
+            ),
+        )
+        .unwrap();
+        let p = path.to_str().unwrap().to_string();
+        (d, p)
+    }
+
+    fn refused_for_licence<T: std::fmt::Debug>(r: Result<T>) -> bool {
+        matches!(r, Err(AiKitError::ModelLoadFailed { reason, .. }) if reason.contains("licence"))
+    }
+
+    #[tokio::test]
+    async fn a_commercial_only_service_refuses_a_model_that_is_not_known_to_permit_commercial_use()
+    {
+        for l in ["CC-BY-NC-4.0", "GPL-3.0", ""] {
+            let (_d, path) = catalog(l);
+            let svc = CandleInferenceService::with_device(&path, DevicePreference::Cpu)
+                .unwrap()
+                .with_commercial_only();
+            assert!(refused_for_licence(svc.load_model("m").await), "{l:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_commercial_only_the_licence_does_not_stop_a_load_and_a_permissive_model_passes_it(
+    ) {
+        let (_d, path) = catalog("CC-BY-NC-4.0");
+        let svc = CandleInferenceService::with_device(&path, DevicePreference::Cpu).unwrap();
+        assert!(
+            !refused_for_licence(svc.load_model("m").await),
+            "the library default is unchanged: no licence check"
+        );
+        let (_d, path) = catalog("Apache-2.0");
+        let svc = CandleInferenceService::with_device(&path, DevicePreference::Cpu)
+            .unwrap()
+            .with_commercial_only();
+        assert!(!refused_for_licence(svc.load_model("m").await));
+    }
 }

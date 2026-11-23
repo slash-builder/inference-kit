@@ -70,6 +70,7 @@ pub mod credentials;
 pub mod egress;
 pub mod error;
 pub mod hybrid;
+mod licence;
 pub mod modality;
 pub mod model_card;
 pub mod planner;

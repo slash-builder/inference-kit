@@ -6,7 +6,12 @@
 
 use crate::error::{AiKitError, Result};
 use crate::types::ModelMetadata;
-use candle_core::Device;
+use candle_core::safetensors::SliceSafetensors;
+use candle_core::{DType, Device, Tensor};
+use candle_nn::var_builder::SimpleBackend;
+use candle_nn::VarBuilder;
+use std::fs::File;
+use std::io::Read;
 use std::str::FromStr;
 
 /// Where a model runs. The default for [`CandleInferenceService::new`] is
@@ -65,12 +70,421 @@ pub(crate) fn device_for(pref: DevicePreference) -> std::result::Result<(Device,
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Verified model files
+//
+// A model file is hashed against the catalog once, at load. Everything after that (image weights are re-opened on every request)
+// must use **the file that was hashed**, not whatever the path names by then. So nothing in this module checks a path and then
+// opens it: [`VerifiedFile::open`] opens the path once and checks the open handle (`fstat`) against what was recorded when that
+// file was hashed, and every later read or mapping goes through that same handle. Renaming a different file over the path between
+// the check and the read therefore cannot change what is read.
+// ---------------------------------------------------------------------------------------------------------------------------------
+
+/// Unix identity of a file, read from an open handle. `ctime` is the one that matters: only the kernel sets it, to the time of the last
+/// write or metadata change, so restoring an old modification time (`utimensat`) after a rewrite still moves it.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixIdentity {
+    dev: u64,
+    ino: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+/// What identifies a file on disk without reading it, taken from an open handle: size and modification time everywhere; on Unix also
+/// device, inode and change time.
+///
+/// What this cannot see: a same-size rewrite in place by a principal who can write the file, made within one timestamp tick of the
+/// moment the file was hashed (coarse-timestamp filesystems tick in milliseconds to seconds), or on a filesystem that does not
+/// maintain `ctime`. Hashing is the only way to see those, and re-hashing gigabytes per request is not affordable, so the remaining
+/// assumption is that nothing with write access to the model directory modifies a model file while the process runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    #[cfg(unix)]
+    unix: UnixIdentity,
+    #[cfg(not(unix))]
+    mtime: Option<std::time::SystemTime>,
+}
+
+/// `fstat` of an open file (never of a path).
+fn stamp_of(file: &File) -> std::io::Result<FileStamp> {
+    let m = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(FileStamp {
+            len: m.len(),
+            unix: UnixIdentity {
+                dev: m.dev(),
+                ino: m.ino(),
+                mtime: m.mtime(),
+                mtime_nsec: m.mtime_nsec(),
+                ctime: m.ctime(),
+                ctime_nsec: m.ctime_nsec(),
+            },
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(FileStamp {
+            len: m.len(),
+            mtime: m.modified().ok(),
+        })
+    }
+}
+
+/// The files this process has hashed against the catalog, with the stamp the hashed handle had.
+fn verified() -> &'static std::sync::Mutex<std::collections::HashMap<String, FileStamp>> {
+    static V: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, FileStamp>>> =
+        std::sync::OnceLock::new();
+    V.get_or_init(Default::default)
+}
+
+fn forget(path: &str) {
+    if let Ok(mut v) = verified().lock() {
+        v.remove(path);
+    }
+}
+
 #[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
-/// BLAKE3 of a file, streamed (model files can be gigabytes).
-pub(crate) fn hash_file(path: &str) -> Result<String> {
+fn changed_since_verified(path: &str) -> AiKitError {
+    AiKitError::Internal {
+        reason: format!(
+            "model file changed since it was verified against the catalog: {path}. A loaded model keeps using only the file it \
+             verified, so it refuses this one, even if the new file has identical content. If the replacement was intentional, restart \
+             the process (or create a new service) so the file is hashed against the catalog again; otherwise restore the original file"
+        ),
+    }
+}
+
+/// BLAKE3 of an open file from its start, streamed (model files can be gigabytes). The caller keeps the handle, so it can stamp the very
+/// file that was hashed.
+fn hash_handle(file: &mut File) -> std::io::Result<String> {
     let mut h = blake3::Hasher::new();
-    h.update_reader(std::fs::File::open(path)?)?;
+    h.update_reader(file)?;
     Ok(h.finalize().to_hex().to_string())
+}
+
+/// Hash an already-open handle and, when it equals `expected`, record **that handle's** stamp as the trusted one for `path`. Fails if the
+/// handle changed while it was being hashed. The stamp comes from the handle that was hashed, never from a second look at the path, so a
+/// path swapped for a bad file and back during the hash cannot make the bad file's stamp trusted.
+fn hash_and_record_handle(path: &str, file: &mut File, expected: &str) -> Result<String> {
+    let before = stamp_of(file)?;
+    let actual = hash_handle(file)?;
+    if stamp_of(file)? != before {
+        forget(path);
+        return Err(AiKitError::Internal {
+            reason: format!("model file changed while it was being verified: {path}"),
+        });
+    }
+    if actual == expected {
+        if let Ok(mut v) = verified().lock() {
+            v.insert(path.to_string(), before);
+        }
+    } else {
+        // a previous good verification of this path no longer describes it
+        forget(path);
+    }
+    Ok(actual)
+}
+
+#[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
+fn hash_and_record(path: &str, expected: &str) -> Result<String> {
+    let mut file = File::open(path)?;
+    hash_and_record_handle(path, &mut file, expected)
+}
+
+/// A model file opened once and checked, through the open handle, to be the file [`verify_model_files`] hashed: same size, modification
+/// time, change time, device and inode. Read or map it through this handle and nothing else; a path that is swapped afterwards is not
+/// consulted again. A file that was never verified in this process is refused.
+///
+/// What this gives you: a file replaced (rename) or rewritten (size, mtime, ctime change) after load is refused, without re-hashing
+/// gigabytes per request. What it does not: see [`FileStamp`] for the undetectable same-tick in-place rewrite, and note that a mapping is
+/// still undefined behaviour if the file is modified while mapped; the assumption, repeated at each mapping, is that nothing with write
+/// access to the model directory touches a model file while it is in use.
+#[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
+pub(crate) struct VerifiedFile {
+    file: File,
+    path: String,
+    stamp: FileStamp,
+}
+
+#[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
+impl VerifiedFile {
+    pub(crate) fn open(path: &str) -> Result<Self> {
+        let recorded = verified().lock().ok().and_then(|v| v.get(path).copied());
+        let Some(was) = recorded else {
+            return Err(AiKitError::Internal {
+                reason: format!(
+                    "model file was never verified against the catalog in this process: {path} (load the model first)"
+                ),
+            });
+        };
+        let file = File::open(path)?;
+        let now = stamp_of(&file)?;
+        if now != was {
+            return Err(changed_since_verified(path));
+        }
+        #[cfg(test)]
+        seam::fire(seam::Point::AfterOpenCheck, path);
+        Ok(Self {
+            file,
+            path: path.to_string(),
+            stamp: now,
+        })
+    }
+
+    /// The handle, for `Read`/`Seek` consumers (GGUF parsing).
+    #[cfg_attr(not(feature = "image"), allow(dead_code))]
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    /// Fail if the handle changed since it was opened (a writer touched it while it was being read or mapped).
+    pub(crate) fn recheck(&self) -> Result<()> {
+        #[cfg(test)]
+        seam::fire(seam::Point::BeforeRecheck, &self.path);
+        if stamp_of(&self.file)? == self.stamp {
+            Ok(())
+        } else {
+            Err(changed_since_verified(&self.path))
+        }
+    }
+
+    /// The whole file, read through the verified handle (for small files such as a tokenizer).
+    pub(crate) fn read_all(mut self) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(usize::try_from(self.stamp.len).unwrap_or(0));
+        self.file.read_to_end(&mut buf)?;
+        self.recheck()?;
+        Ok(buf)
+    }
+}
+
+/// Safetensors files mapped from verified handles. Each file is opened once, checked through that handle, and mapped from that same
+/// handle, so a path swapped at any point cannot change what is mapped. Build a `VarBuilder` over them with [`Self::var_builder`]; the
+/// mappings live as long as this value.
+#[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
+pub(crate) struct VerifiedMaps {
+    maps: Vec<memmap2::Mmap>,
+    files: Vec<VerifiedFile>,
+}
+
+#[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
+impl VerifiedMaps {
+    pub(crate) fn open<P: AsRef<str>>(paths: &[P]) -> Result<Self> {
+        let mut maps = Vec::with_capacity(paths.len());
+        let mut files = Vec::with_capacity(paths.len());
+        for p in paths {
+            let f = VerifiedFile::open(p.as_ref())?;
+            // SAFETY: mapping a file is unsafe because behaviour is undefined if the file is modified while it is mapped. Relied on:
+            // (1) the handle mapped here is the one just checked against the stamp recorded when this process hashed the file against
+            // the catalog (`VerifiedFile::open`), and it is checked again after the map call, so a swap by rename or a rewrite that
+            // moved size, mtime or ctime is refused, and the path is never consulted again; (2) nothing with write access to the model
+            // directory modifies the file while it is mapped. (2) is not enforced here: models are immutable OS resources and the
+            // directory is not writable by other principals. A same-tick in-place rewrite by such a principal is not detectable (see
+            // `FileStamp`).
+            let map = unsafe { memmap2::Mmap::map(&f.file) }?;
+            f.recheck()?;
+            maps.push(map);
+            files.push(f);
+        }
+        Ok(Self { maps, files })
+    }
+
+    /// Call after the work that read the mappings: fails if any file changed while it was mapped, so a write during use is reported
+    /// instead of silently producing output from torn data. This is detection after the fact, not protection: a file *truncated* while
+    /// mapped makes the process take SIGBUS on the next access to the missing pages, before this can run. Callers should prefer this
+    /// error to whatever the work itself returned, since a changed file explains most failures in the work.
+    pub(crate) fn recheck(&self) -> Result<()> {
+        self.files.iter().try_for_each(VerifiedFile::recheck)
+    }
+
+    /// A `VarBuilder` over every mapped file. A tensor name present in several files resolves to the last one, as Candle's own multi-file
+    /// loader does.
+    pub(crate) fn var_builder(
+        &self,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_core::Result<VarBuilder<'_>> {
+        let files = self
+            .maps
+            .iter()
+            .map(|m| SliceSafetensors::new(m))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Ok(VarBuilder::from_backend(
+            Box::new(Shards(files)),
+            dtype,
+            device.clone(),
+        ))
+    }
+}
+
+/// Several safetensors buffers behind one `VarBuilder` backend.
+#[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
+struct Shards<'a>(Vec<SliceSafetensors<'a>>);
+
+#[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
+impl Shards<'_> {
+    fn load(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+        match self.0.iter().rev().find(|s| s.get(name).is_ok()) {
+            Some(s) => s.load(name, dev)?.to_dtype(dtype),
+            None => Err(candle_core::Error::CannotFindTensor {
+                path: name.to_string(),
+            }
+            .bt()),
+        }
+    }
+}
+
+#[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
+impl SimpleBackend for Shards<'_> {
+    fn get(
+        &self,
+        s: candle_core::Shape,
+        name: &str,
+        _: candle_nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_core::Result<Tensor> {
+        let t = self.load(name, dtype, dev)?;
+        if t.shape() != &s {
+            Err(candle_core::Error::UnexpectedShape {
+                msg: format!("shape mismatch for {name}"),
+                expected: s,
+                got: t.shape().clone(),
+            }
+            .bt())?
+        }
+        Ok(t)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+        self.load(name, dtype, dev)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.0.iter().any(|s| s.get(name).is_ok())
+    }
+}
+
+/// Test-only injection points, so a test can do what a racing writer would do at exactly the moment that matters (after a file's
+/// identity was checked, before it is read or mapped; or after the work, before the closing re-check). Thread-local: tests that
+/// install a hook must run the code under test on their own thread.
+#[cfg(test)]
+#[allow(dead_code)] // which helpers a build uses depends on the enabled kinds
+pub(crate) mod seam {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// In `VerifiedFile::open`, after the identity check passed and before anything is read or mapped.
+        AfterOpenCheck,
+        /// At the start of every `recheck`.
+        BeforeRecheck,
+    }
+
+    type Hook = Box<dyn FnMut(&str)>;
+    thread_local! {
+        static HOOKS: RefCell<Vec<(Point, Hook)>> = const { RefCell::new(Vec::new()) };
+        static MOVED: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Removes the hooks installed on this thread when dropped.
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOKS.with(|h| h.borrow_mut().clear());
+            MOVED.with(|m| {
+                for d in m.borrow_mut().drain(..) {
+                    let _ = std::fs::remove_dir_all(d);
+                }
+            });
+        }
+    }
+
+    /// Run `f(path)` every time `point` is reached on this thread, until the guard drops.
+    #[must_use]
+    pub(crate) fn on(point: Point, f: impl FnMut(&str) + 'static) -> Guard {
+        HOOKS.with(|h| h.borrow_mut().push((point, Box::new(f))));
+        Guard
+    }
+
+    /// The first time `target` passes its identity check, make the path name a different file, as a racing writer would. The directory
+    /// is moved aside and a new one with a garbage file at the same name takes its place, so the original inode is not touched (a
+    /// rename-over or unlink would move its ctime, which the closing re-check reports). Code that reads the *path* afterwards sees the
+    /// garbage; code that reads the checked handle still sees the original.
+    #[must_use]
+    pub(crate) fn swap_once_after_check(target: &str) -> Guard {
+        let target = target.to_string();
+        let mut done = false;
+        on(Point::AfterOpenCheck, move |p| {
+            if p == target && !done {
+                done = true;
+                let path = std::path::Path::new(p);
+                let dir = path.parent().unwrap();
+                let moved = dir.with_extension("moved");
+                std::fs::rename(dir, &moved).unwrap();
+                std::fs::create_dir(dir).unwrap();
+                // siblings stay reachable (as symlinks, which do not touch the target inode) so later opens of them still verify
+                for e in std::fs::read_dir(&moved).unwrap() {
+                    let e = e.unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(e.path(), dir.join(e.file_name())).unwrap();
+                }
+                std::fs::remove_file(path).unwrap();
+                std::fs::write(path, b"garbage, not a model file").unwrap();
+                MOVED.with(|m| m.borrow_mut().push(moved));
+            }
+        })
+    }
+
+    /// The `nth` time (1-based) `target` is re-checked, rewrite it in place with the same length first, as a writer active during use
+    /// would. (`VerifiedMaps::open` re-checks once itself, so the re-check after the work is the second.)
+    #[must_use]
+    pub(crate) fn rewrite_on_recheck(target: &str, nth: usize) -> Guard {
+        let target = target.to_string();
+        let mut seen = 0;
+        on(Point::BeforeRecheck, move |p| {
+            if p == target {
+                seen += 1;
+                if seen == nth {
+                    let mut b = std::fs::read(p).unwrap();
+                    *b.last_mut().unwrap() ^= 0xff;
+                    std::fs::write(p, b).unwrap();
+                }
+            }
+        })
+    }
+
+    pub(crate) fn fire(point: Point, path: &str) {
+        // taken out while it runs, so a hook that touches model files cannot re-enter itself
+        let taken = HOOKS.with(|h| std::mem::take(&mut *h.borrow_mut()));
+        let mut taken = taken;
+        for (p, f) in taken.iter_mut() {
+            if *p == point {
+                f(path);
+            }
+        }
+        HOOKS.with(|h| {
+            let mut h = h.borrow_mut();
+            taken.append(&mut h);
+            *h = taken;
+        });
+    }
+}
+
+/// Test fixtures point at weights that were not verified through a catalog entry: record their current stamp as the trusted one.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn trust_for_test(path: &str) {
+    if let (Ok(f), Ok(mut v)) = (File::open(path), verified().lock()) {
+        if let Ok(st) = stamp_of(&f) {
+            v.insert(path.to_string(), st);
+        }
+    }
 }
 
 #[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
@@ -86,7 +500,7 @@ pub(crate) fn verify_model_files(model: &ModelMetadata) -> Result<String> {
             .map(|f| (strip(&f.location), f.hash.clone())),
     );
     for (path, expected) in checks {
-        let actual = hash_file(&path)?;
+        let actual = hash_and_record(&path, &expected)?;
         if actual != expected {
             return Err(AiKitError::IntegrityCheckFailed {
                 model_id: model.id.clone(),
@@ -281,6 +695,254 @@ mod tests {
             },
             files: Vec::new(),
         }
+    }
+
+    /// Write `bytes` to `name` in `dir`, let the filesystem's timestamp tick pass, and verify it against the hash of `bytes`.
+    /// Returns the path. The pause matters: without it a rewrite made straight afterwards can land in the same tick as the stamp.
+    fn verified_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let p = path.to_str().unwrap().to_string();
+        let mut m = model(1, 1);
+        m.location = format!("file://{p}");
+        m.hash = blake3::hash(bytes).to_hex().to_string();
+        verify_model_files(&m).unwrap();
+        p
+    }
+
+    fn refused(r: Result<VerifiedFile>, what: &str) {
+        match r {
+            Err(AiKitError::Internal { reason }) => {
+                assert!(
+                    reason.contains("changed since it was verified"),
+                    "{what}: {reason}"
+                );
+                assert!(
+                    reason.contains("restart"),
+                    "{what}: the error says what to do: {reason}"
+                );
+            }
+            Err(e) => panic!("{what}: wrong error {e}"),
+            Ok(_) => panic!("{what}: was accepted"),
+        }
+    }
+
+    #[test]
+    fn a_never_verified_file_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("w.safetensors");
+        std::fs::write(&path, b"the weights").unwrap();
+        let r = VerifiedFile::open(path.to_str().unwrap());
+        assert!(
+            matches!(r, Err(AiKitError::Internal { reason }) if reason.contains("never verified"))
+        );
+    }
+
+    #[test]
+    fn a_verified_file_that_is_untouched_opens_and_reads_back_what_was_hashed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = verified_file(d.path(), "w", b"the weights");
+        assert_eq!(
+            VerifiedFile::open(&p).unwrap().read_all().unwrap(),
+            b"the weights"
+        );
+    }
+
+    #[test]
+    fn a_file_swapped_for_a_same_size_file_by_rename_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = verified_file(d.path(), "w", b"the weights");
+        let other = d.path().join("other");
+        std::fs::write(&other, b"evil weight").unwrap(); // same length
+        std::fs::rename(&other, &p).unwrap();
+        refused(VerifiedFile::open(&p), "rename swap");
+    }
+
+    #[test]
+    fn a_same_size_in_place_rewrite_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = verified_file(d.path(), "w", b"the weights");
+        std::fs::write(&p, b"evil weight").unwrap(); // same inode, same length
+        refused(VerifiedFile::open(&p), "same-size rewrite");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_the_modification_time_after_a_rewrite_does_not_hide_it() {
+        let d = tempfile::tempdir().unwrap();
+        let p = verified_file(d.path(), "w", b"the weights");
+        let before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        std::io::Write::write_all(&mut &f, b"evil weight").unwrap();
+        f.set_modified(before).unwrap(); // size and mtime are now exactly as they were; only ctime moved
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), before);
+        refused(VerifiedFile::open(&p), "mtime restored");
+    }
+
+    #[test]
+    fn a_file_rewritten_with_a_different_size_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = verified_file(d.path(), "w", b"the weights");
+        std::fs::write(&p, b"longer replacement bytes").unwrap();
+        refused(VerifiedFile::open(&p), "resized");
+    }
+
+    #[test]
+    fn re_verifying_changed_content_trusts_the_new_stamp_and_a_wrong_hash_forgets_the_old_one() {
+        let d = tempfile::tempdir().unwrap();
+        let p = verified_file(d.path(), "w", b"the weights");
+        std::fs::write(&p, b"evil weight").unwrap();
+        refused(VerifiedFile::open(&p), "changed");
+        let mut m = model(1, 1);
+        m.location = format!("file://{p}");
+        m.hash = blake3::hash(b"evil weight").to_hex().to_string();
+        verify_model_files(&m).unwrap();
+        VerifiedFile::open(&p).expect("re-verified");
+        m.hash = "0".into();
+        assert!(verify_model_files(&m).is_err());
+        assert!(
+            VerifiedFile::open(&p).is_err(),
+            "a failed verification forgets the earlier good one"
+        );
+    }
+
+    #[test]
+    fn the_recorded_stamp_is_the_hashed_handles_even_if_the_path_is_swapped_during_the_hash() {
+        // The path held the good file when it was opened for hashing, then a bad file of the same size was put at the path (and the
+        // hash read, in the old by-path code, would have seen either). The stamp that gets trusted must be the hashed handle's.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("w");
+        std::fs::write(&path, b"the weights").unwrap();
+        let p = path.to_str().unwrap();
+        let mut good = File::open(&path).unwrap();
+        let bad = d.path().join("bad");
+        std::fs::write(&bad, b"evil weight").unwrap();
+        std::fs::rename(&bad, &path).unwrap();
+        let expected = blake3::hash(b"the weights").to_hex().to_string();
+        assert_eq!(
+            hash_and_record_handle(p, &mut good, &expected).unwrap(),
+            expected
+        );
+        refused(
+            VerifiedFile::open(p),
+            "the swapped-in file must not inherit the good file's trust",
+        );
+    }
+
+    #[test]
+    fn maps_open_only_verified_unchanged_files_and_read_the_handle_they_checked() {
+        let d = tempfile::tempdir().unwrap();
+        let t = Tensor::new(&[1f32, 2.0, 3.0], &Device::Cpu).unwrap();
+        let file = d.path().join("a.safetensors");
+        candle_core::safetensors::save(&HashMap::from([("t".to_string(), t)]), &file).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        let p = verified_file(d.path(), "a.safetensors", &bytes);
+        let maps = VerifiedMaps::open(&[p.as_str()]).unwrap();
+        let vb = maps.var_builder(DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(
+            vb.get(3, "t").unwrap().to_vec1::<f32>().unwrap(),
+            [1.0, 2.0, 3.0]
+        );
+        assert!(vb.get(4, "t").is_err(), "shape is checked");
+        assert!(vb.get(3, "missing").is_err());
+        drop(vb);
+        // swapped by rename for a same-size file: refused, and the first mapping is unaffected
+        let other = d.path().join("other");
+        std::fs::write(&other, &bytes).unwrap();
+        std::fs::rename(&other, &p).unwrap();
+        assert!(matches!(
+            VerifiedMaps::open(&[p.as_str()]),
+            Err(AiKitError::Internal { reason }) if reason.contains("changed since it was verified")
+        ));
+        assert!(VerifiedMaps::open(&["/nonexistent/x"]).is_err());
+    }
+
+    #[test]
+    fn several_files_behave_as_one_builder_with_the_last_file_winning() {
+        let d = tempfile::tempdir().unwrap();
+        let save = |name: &str, tensors: &[(&str, &[f32])]| {
+            let m: HashMap<String, Tensor> = tensors
+                .iter()
+                .map(|(n, v)| (n.to_string(), Tensor::new(*v, &Device::Cpu).unwrap()))
+                .collect();
+            let path = d.path().join(name);
+            candle_core::safetensors::save(&m, &path).unwrap();
+            verified_file(d.path(), name, &std::fs::read(path).unwrap())
+        };
+        let a = save("a", &[("t", &[1.0, 1.0, 1.0]), ("only_a", &[7.0])]);
+        let b = save("b", &[("t", &[2.0, 2.0, 2.0]), ("only_b", &[9.0])]);
+        let maps = VerifiedMaps::open(&[a.as_str(), b.as_str()]).unwrap();
+        let vb = maps.var_builder(DType::F32, &Device::Cpu).unwrap();
+        let v = |name: &str, n: usize| vb.get(n, name).unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            v("t", 3),
+            [2.0; 3],
+            "a name in both files resolves to the last"
+        );
+        assert_eq!(v("only_a", 1), [7.0]);
+        assert_eq!(v("only_b", 1), [9.0]);
+        assert!(
+            vb.contains_tensor("only_a") && vb.contains_tensor("only_b") && vb.contains_tensor("t")
+        );
+        assert!(!vb.contains_tensor("nope"));
+        assert!(vb.get_unchecked("only_a").is_ok());
+        assert!(vb.get_unchecked("nope").is_err());
+        // the same files in the other order: now the other file's `t` wins
+        let maps = VerifiedMaps::open(&[b.as_str(), a.as_str()]).unwrap();
+        let vb = maps.var_builder(DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(vb.get(3, "t").unwrap().to_vec1::<f32>().unwrap(), [1.0; 3]);
+    }
+
+    #[test]
+    fn tensors_are_converted_to_the_dtype_asked_for() {
+        let d = tempfile::tempdir().unwrap();
+        let t = Tensor::new(&[1.5f32, 2.5], &Device::Cpu).unwrap();
+        let path = d.path().join("f");
+        candle_core::safetensors::save(&HashMap::from([("t".to_string(), t)]), &path).unwrap();
+        let p = verified_file(d.path(), "f", &std::fs::read(&path).unwrap());
+        let maps = VerifiedMaps::open(&[p.as_str()]).unwrap();
+        for dt in [DType::F16, DType::BF16, DType::F32] {
+            let vb = maps.var_builder(dt, &Device::Cpu).unwrap();
+            assert_eq!(vb.get(2, "t").unwrap().dtype(), dt);
+            assert_eq!(vb.get_unchecked("t").unwrap().dtype(), dt);
+        }
+    }
+
+    #[test]
+    fn a_write_while_mapped_is_reported_by_recheck_and_not_before() {
+        let d = tempfile::tempdir().unwrap();
+        let t = Tensor::new(&[1f32, 2.0], &Device::Cpu).unwrap();
+        let path = d.path().join("w");
+        candle_core::safetensors::save(&HashMap::from([("t".to_string(), t)]), &path).unwrap();
+        let p = verified_file(d.path(), "w", &std::fs::read(&path).unwrap());
+        let maps = VerifiedMaps::open(&[p.as_str()]).unwrap();
+        maps.recheck().expect("untouched");
+        let mut b = std::fs::read(&p).unwrap();
+        *b.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&p, b).unwrap();
+        assert!(matches!(
+            maps.recheck(),
+            Err(AiKitError::Internal { reason }) if reason.contains("changed since it was verified")
+        ));
+    }
+
+    #[test]
+    fn a_wrong_hash_is_still_an_integrity_failure_and_records_nothing_it_trusts() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("w2.safetensors");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut m = model(1, 1);
+        m.location = format!("file://{}", path.to_str().unwrap());
+        m.hash = "0".into();
+        assert!(matches!(
+            verify_model_files(&m),
+            Err(AiKitError::IntegrityCheckFailed { .. })
+        ));
+        assert!(
+            VerifiedFile::open(path.to_str().unwrap()).is_err(),
+            "a file whose hash did not match is never trusted"
+        );
     }
 
     #[test]
