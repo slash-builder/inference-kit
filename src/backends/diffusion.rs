@@ -74,6 +74,7 @@ enum LoadedImage {
 
 pub struct CandleImageService {
     registry: ModelRegistry,
+    commercial_only: bool,
     device_pref: DevicePreference,
     loaded: RwLock<HashMap<String, Arc<Mutex<LoadedImage>>>>,
 }
@@ -88,9 +89,18 @@ impl LoadedImage {
 }
 
 impl CandleImageService {
+    /// Refuse to load any model that is not known to permit commercial use ([`crate::types::LicenceClass::Commercial`]). Off by default;
+    /// the default-model rule in the registry does not apply to a model a caller names, so a product that must ship only commercial
+    /// models turns this on.
+    pub fn with_commercial_only(mut self) -> Self {
+        self.commercial_only = true;
+        self
+    }
+
     pub fn new(catalog_path: &str, device: DevicePreference) -> Result<Self> {
         Ok(Self {
             registry: ModelRegistry::load_from_file(catalog_path)?,
+            commercial_only: false,
             device_pref: device,
             loaded: RwLock::new(HashMap::new()),
         })
@@ -109,6 +119,9 @@ impl CandleImageService {
             .ok_or_else(|| AiKitError::ModelNotFound {
                 model_id: id.to_string(),
             })?;
+        if self.commercial_only {
+            self.registry.check_licence(id, false)?;
+        }
         if m.kind() != RequestKind::ImageGeneration {
             return Err(AiKitError::ModelLoadFailed {
                 model_id: id.to_string(),
@@ -534,6 +547,44 @@ fn sd_unet_config() -> UNet2DConditionModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_commercial_only_service_refuses_a_named_non_commercial_model_before_loading_anything() {
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("catalog.yaml");
+        std::fs::write(
+            &cat,
+            r#"version: "1.0"
+models:
+  - id: "dev-model"
+    version: "1.0.0"
+    os_arch: ["x86_64"]
+    quantization_variants: ["q4"]
+    default_quantization: "q4"
+    hash: "blake3-abcd1234"
+    size_bytes: 1
+    location: "file:///does-not-exist"
+    metadata:
+      parameters: 1
+      context_window: 1
+      vram_required_mb: 1
+      inference_latency_ms: 1
+      custom:
+        kind: "image_generation"
+        license: "CC-BY-NC-4.0"
+"#,
+        )
+        .unwrap();
+        let svc = CandleImageService::new(cat.to_str().unwrap(), DevicePreference::Cpu)
+            .unwrap()
+            .with_commercial_only();
+        match svc.load_model("dev-model") {
+            Err(AiKitError::ModelLoadFailed { reason, .. }) => {
+                assert!(reason.contains("licence"), "{reason}")
+            }
+            other => panic!("expected a licence refusal, got {other:?}"),
+        }
+    }
 
     #[test]
     fn seeded_noise_is_deterministic_and_roughly_standard_normal() {
