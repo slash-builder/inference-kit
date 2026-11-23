@@ -8,16 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **Breaking (remote provider adapters, `provider-*` features): the spend ledger fails closed.** A call whose cost is unknown is charged its reserved worst case, never zero (a 200 with no usage, or with only part of it;
-  a timeout or a broken reply after the request was sent). A connection that was never made, including one that hit the new connect timeout, is released at no charge. Embeddings on a remote OpenAI-compatible
-  or Gemini adapter are reserved and capped like chat. API changes:
+- **Breaking (remote provider adapters, `provider-*` features): the spend ledger fails closed.** A call whose cost is unknown is charged its reserved worst case, never zero: a 200 whose usage is missing or incomplete
+  (all three adapters; Gemini's blocked prompt, which has no candidates, is the one exception and is charged for the prompt only), a timeout or a broken reply after the request was sent, and an HTTP 408, 502 or 504 (what a gateway
+  says when it gave up on a call the vendor may have finished). Released at no charge: a connection that was never made (including one that hit the connect timeout), a request that could not be built, a credential that could not be read,
+  and every other error status (4xx, 500, 503, 529). Embeddings on a remote OpenAI-compatible or Gemini adapter are reserved and capped like chat. API changes:
   - `OpenAiCompatAdapter::new` and `GeminiAdapter::new` now return `ConfigError::UnpricedProvider` when the adapter leaves the home (for OpenAI-compatible: `Locality::Saas` and `Locality::Unspecified`; Gemini is always remote)
     and its prices cannot cap every kind of request it offers: text needs an input and an output rate, embeddings (when an embedding model is set) need the input rate. A zero rate is refused, not read as "free".
     `Device` and `Home` providers are not asked for prices.
   - `AnthropicAdapter::new` returns `Result<Self, ConfigError>` instead of `Result<Self, CredentialError>` (an unreadable credential is `ConfigError::CredentialUnavailable`) and refuses an input or output rate of zero.
-  - `ConfigError` gains the variant `UnpricedProvider`.
-  - `AnthropicConfig`, `GeminiConfig` and `OpenAiCompatConfig` gain the field `connect_timeout` (default 10 s); `timeout` still limits the whole request. Code that builds these structs with a literal must set it.
-  - Added: `Pricing::can_cap(RequestKind)`.
+  - `ConfigError` gains the variant `UnpricedProvider` (the enum is `non_exhaustive`).
+  - `AnthropicConfig`, `GeminiConfig` and `OpenAiCompatConfig` gain the public field `connect_timeout` (default 10 s); `timeout` still limits the whole request. Code that builds these structs with a literal must set it.
+    A `connect_timeout` that is not shorter than `timeout` is clamped to half of `timeout`, so the connect limit always ends a hung connection first.
+  - Added: `Ledger::settle_reserved` (charge the whole reservation), `Pricing::can_cap(RequestKind)`.
+  - Documented, not changed: a `Reservation` that is dropped without `settle`/`release` stays reserved (fail closed); a call future cancelled mid-flight leaks its reservation.
 - Candle 0.9.2 -> **0.11** (verified: KV isolation A/B/A on CPU and CUDA, real-weights multimodal tests).
 - `AiKitError::to_error_code()` is **deprecated**: its numbers (20-24, 13, 90) collide with the fabric `ErrorCode` space (a remote peer could trigger an ops alert). Use `to_inference_error_code()`.
 - The router keeps the original typed error when a call fails (an out-of-memory error used to become `Internal`).
