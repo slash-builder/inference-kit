@@ -732,7 +732,8 @@ mod tests {
     ) -> Result<ProviderReply, ProviderError> {
         let mut c = cfg(s);
         c.context_tokens = ctx;
-        OpenAiCompatAdapter::new(c, None, None)
+        // `no_proxy`: a proxy in the environment must not stand between the test and its loopback mock
+        OpenAiCompatAdapter::build(c, None, None, |b| b.no_proxy())
             .unwrap()
             .call(&text(prompt))
             .await
