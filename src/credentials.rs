@@ -128,8 +128,20 @@ impl CredentialSource for DirCredentialSource {
 }
 
 /// An in-memory source. **For tests and development only** (the `DEV_` exception): production never uses it.
-#[derive(Debug, Default, Clone)]
+///
+/// `Debug` prints the credential **names** and never the values, so a stray `{:?}` in a log line or a failed assertion cannot leak a key.
+#[derive(Default, Clone)]
 pub struct InMemoryCredentials(pub HashMap<String, String>);
+
+impl fmt::Debug for InMemoryCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut names: Vec<&String> = self.0.keys().collect();
+        names.sort();
+        f.debug_map()
+            .entries(names.into_iter().map(|n| (n, "<redacted>")))
+            .finish()
+    }
+}
 
 impl InMemoryCredentials {
     pub fn with(name: &str, value: &str) -> Self {
@@ -171,6 +183,15 @@ mod tests {
         assert!(!format!("{s:?}").contains("REAL"));
         let e = CredentialError::Empty("anthropic-api-key".into());
         assert!(!e.to_string().contains("sk-"));
+    }
+
+    #[test]
+    fn in_memory_credentials_do_not_print_their_values_in_debug_output() {
+        let c = InMemoryCredentials::with("anthropic-api-key", "sk-ant-REAL-LOOKING-VALUE");
+        let shown = format!("{c:?} {c:#?}");
+        assert!(!shown.contains("REAL-LOOKING"), "{shown}");
+        assert!(shown.contains("anthropic-api-key"), "names may be shown");
+        assert!(shown.contains("redacted"));
     }
 
     #[cfg(unix)]
