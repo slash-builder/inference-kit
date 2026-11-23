@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Egress: class names, a person's subject id and provider ids are compared in one canonical form (ASCII-trimmed, lower-cased; letters, digits and `_ - . : /` only) inside `Policy::decide`, so a deny for `health`, for Person `alice` or for provider `claude` also denies `Health `, `Alice` and `Claude`. A name outside that charset is refused, not rewritten, and fails closed (held back from every provider that leaves the home; in a deny rule it matches everything it could name; in an allow rule it covers nothing). A deny for a class also covers the classes under it (`health` covers `health.records`, `health/labs`, `health-labs`); an allow stays exact. Any class with a `credentials` segment (`credentials.wifi`, `credentials/api`, `credentials-`) is held back like `credentials`.
+- **Behaviour change:** a class name or person id outside the charset (for example `santé`, `tax records`, an email address) can no longer be sent to a remote provider.
+- **API addition:** `DenyReason::UnreadableName` (the enum is not `#[non_exhaustive]`, so an exhaustive `match` on `DenyReason` needs a new arm). It is the reason for the names above; before, such labels were reported as `CredentialsNeverLeave`.
+
 ### Changed
 - Candle 0.9.2 -> **0.11** (verified: KV isolation A/B/A on CPU and CUDA, real-weights multimodal tests).
 - `AiKitError::to_error_code()` is **deprecated**: its numbers (20-24, 13, 90) collide with the fabric `ErrorCode` space (a remote peer could trigger an ops alert). Use `to_inference_error_code()`.

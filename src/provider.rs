@@ -196,9 +196,9 @@ pub async fn run_chain_recorded(
                 blocked_by_policy = true;
                 let outcome = match reason {
                     DenyReason::RuleDenies => Outcome::DeniedPolicy,
-                    DenyReason::Unlabelled | DenyReason::CredentialsNeverLeave => {
-                        Outcome::BlockedLabel
-                    }
+                    DenyReason::Unlabelled
+                    | DenyReason::CredentialsNeverLeave
+                    | DenyReason::UnreadableName => Outcome::BlockedLabel,
                 };
                 attempts.push(mk(outcome, rules, None, 0, 0));
                 continue;
@@ -579,6 +579,10 @@ mod tests {
             vec!["notes"],
             vec!["notes", "photos"],
             vec!["credentials"],
+            vec!["Credentials "],
+            vec!["notes", "credentials/api"],
+            vec!["notes", "Photos "],
+            vec!["notes", "ph\u{200b}otos"],
             vec![],
         ];
         let subjects = [
@@ -621,7 +625,10 @@ mod tests {
                             "called without an allow: {c:?} {s:?} v{}",
                             pol.version
                         );
-                        assert!(!l.classes.contains(crate::egress::CREDENTIALS_CLASS));
+                        assert!(!l
+                            .classes
+                            .iter()
+                            .any(|c| crate::egress::is_credentials_or_unreadable(c)));
                         assert!(r.is_ok());
                     } else {
                         assert!(r.is_err(), "no call and no error");

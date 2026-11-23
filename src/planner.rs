@@ -515,9 +515,9 @@ impl ProviderSet {
                 Verdict::Deny { reason, rules } => {
                     let outcome = match reason {
                         DenyReason::RuleDenies => Outcome::DeniedPolicy,
-                        DenyReason::Unlabelled | DenyReason::CredentialsNeverLeave => {
-                            Outcome::BlockedLabel
-                        }
+                        DenyReason::Unlabelled
+                        | DenyReason::CredentialsNeverLeave
+                        | DenyReason::UnreadableName => Outcome::BlockedLabel,
                     };
                     push(e, outcome, rules);
                 }
