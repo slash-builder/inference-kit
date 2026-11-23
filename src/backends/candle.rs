@@ -143,6 +143,30 @@ impl CandleInferenceService {
             })
     }
 
+    /// The tokenizer's bytes, read once so the bytes that are checked are the bytes that are parsed.
+    ///
+    /// If the catalog lists a `tokenizer` file (`files:`, with a hash), it is read once and its BLAKE3 must match, like the weights; a
+    /// mismatch is `IntegrityCheckFailed`. Otherwise the path in `metadata.custom.tokenizer_path` is used, and **nothing verifies it**:
+    /// the catalog carries no hash for that form. List the tokenizer under `files:` to have it verified.
+    fn read_tokenizer(model: &ModelMetadata) -> Result<Vec<u8>> {
+        let strip = |l: &str| l.strip_prefix("file://").unwrap_or(l).to_string();
+        match model.files.iter().find(|f| f.role == "tokenizer") {
+            Some(f) => {
+                let bytes = std::fs::read(strip(&f.location))?;
+                let actual = blake3::hash(&bytes).to_hex().to_string();
+                if actual != f.hash {
+                    return Err(AiKitError::IntegrityCheckFailed {
+                        model_id: model.id.clone(),
+                        expected: f.hash.clone(),
+                        actual,
+                    });
+                }
+                Ok(bytes)
+            }
+            None => Ok(std::fs::read(Self::tokenizer_path_for(model)?)?),
+        }
+    }
+
     /// Parse a fresh `ModelWeights` from an in-memory GGUF byte buffer.
     /// Shared between `load_model` (fail-fast validation) and `infer` (see
     /// [`LoadedCandleModel`]'s doc comment for why this reparses per call).
@@ -372,12 +396,12 @@ impl InferenceService for CandleInferenceService {
         // fail-fast "does it parse" check and the instance every `infer()` reuses.
         let weights = Self::build_model_weights(&bytes, &device, model_id)?;
 
-        let tokenizer_path = Self::tokenizer_path_for(&model)?;
-        let tokenizer =
-            Tokenizer::from_file(&tokenizer_path).map_err(|e| AiKitError::ModelLoadFailed {
+        let tokenizer = Tokenizer::from_bytes(Self::read_tokenizer(&model)?).map_err(|e| {
+            AiKitError::ModelLoadFailed {
                 model_id: model_id.to_string(),
                 reason: format!("tokenizer load failed: {e}"),
-            })?;
+            }
+        })?;
         let eos_token_ids = end_token_ids(&tokenizer);
         if eos_token_ids.is_empty() {
             return Err(AiKitError::ModelLoadFailed {
@@ -482,4 +506,90 @@ fn end_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
     .iter()
     .filter_map(|t| tokenizer.token_to_id(t))
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ModelFile, ModelMetadataExtended};
+    use std::collections::HashMap;
+
+    fn model(files: Vec<ModelFile>, tokenizer_path: Option<&str>) -> ModelMetadata {
+        let mut custom = HashMap::new();
+        if let Some(p) = tokenizer_path {
+            custom.insert("tokenizer_path".to_string(), p.to_string());
+        }
+        ModelMetadata {
+            id: "t".into(),
+            version: "1".into(),
+            os_arch: vec![],
+            quantization_variants: vec![],
+            default_quantization: String::new(),
+            hash: "0".into(),
+            size_bytes: 0,
+            location: String::new(),
+            metadata: ModelMetadataExtended {
+                parameters: 0,
+                context_window: 0,
+                vram_required_mb: 0,
+                inference_latency_ms: 0,
+                framework: String::new(),
+                custom,
+            },
+            files,
+        }
+    }
+
+    fn tokenizer_file(path: &str, hash: &str) -> ModelFile {
+        ModelFile {
+            role: "tokenizer".into(),
+            location: format!("file://{path}"),
+            hash: hash.into(),
+            size_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn a_tokenizer_listed_in_the_catalog_is_hashed_and_a_mismatch_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("tokenizer.json");
+        std::fs::write(&p, b"the tokenizer").unwrap();
+        let p = p.to_str().unwrap();
+        let good = blake3::hash(b"the tokenizer").to_hex().to_string();
+        let m = model(vec![tokenizer_file(p, &good)], None);
+        assert_eq!(
+            CandleInferenceService::read_tokenizer(&m).unwrap(),
+            b"the tokenizer"
+        );
+        // the content changed since the catalog was written
+        std::fs::write(p, b"another tokenizer").unwrap();
+        assert!(matches!(
+            CandleInferenceService::read_tokenizer(&m),
+            Err(AiKitError::IntegrityCheckFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_listed_tokenizer_wins_over_tokenizer_path_and_the_old_form_still_loads_unverified() {
+        let d = tempfile::tempdir().unwrap();
+        let listed = d.path().join("listed.json");
+        let legacy = d.path().join("legacy.json");
+        std::fs::write(&listed, b"listed").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        let hash = blake3::hash(b"listed").to_hex().to_string();
+        let both = model(
+            vec![tokenizer_file(listed.to_str().unwrap(), &hash)],
+            Some(legacy.to_str().unwrap()),
+        );
+        assert_eq!(
+            CandleInferenceService::read_tokenizer(&both).unwrap(),
+            b"listed"
+        );
+        let old = model(vec![], Some(legacy.to_str().unwrap()));
+        assert_eq!(
+            CandleInferenceService::read_tokenizer(&old).unwrap(),
+            b"legacy"
+        );
+        assert!(CandleInferenceService::read_tokenizer(&model(vec![], None)).is_err());
+    }
 }

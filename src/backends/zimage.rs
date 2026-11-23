@@ -292,6 +292,13 @@ impl ZImagePipeline {
         // Called once per request, long after `load_model` hashed the file: open it once, check that handle against the hash taken at
         // load, and map from that same handle (see `VerifiedMaps`). The mapping lives only for this call.
         let maps = VerifiedMaps::open(&[self.files.vae.as_str()])?;
+        let out = self.decode_mapped(&maps, latents);
+        // a write during use is reported in preference to whatever the work returned (a truncation cannot be reported: the process takes SIGBUS on the next access to the missing pages)
+        maps.recheck()?;
+        out
+    }
+
+    fn decode_mapped(&self, maps: &VerifiedMaps, latents: &Tensor) -> Result<Vec<u8>> {
         let vb = maps
             .var_builder(self.dtype, &self.device)
             .map_err(|e| internal("vae weights", e))?;
@@ -429,7 +436,22 @@ impl Weights {
     fn open(gguf: &str, device: &Device, dtype: DType) -> Result<Self> {
         // re-opened per request: open once, check that handle against the hash taken at load, and read everything from it
         let mut verified = VerifiedFile::open(gguf)?;
-        let file = verified.file_mut();
+        let read = Self::read_tensors(verified.file_mut(), device, dtype);
+        // nothing may have written to the file while it was being read; reported in preference to whatever the read returned
+        verified.recheck()?;
+        let map = read?;
+        Ok(Self {
+            map,
+            device: device.clone(),
+            dtype,
+        })
+    }
+
+    fn read_tensors(
+        file: &mut std::fs::File,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<HashMap<String, Weight>> {
         let content = gguf_file::Content::read(file).map_err(|e| internal("gguf header", e))?;
         let mut map = HashMap::new();
         for (name, info) in &content.tensor_infos {
@@ -452,13 +474,7 @@ impl Weights {
             };
             map.insert(name.clone(), w);
         }
-        // nothing wrote to the file while it was being read
-        verified.recheck()?;
-        Ok(Self {
-            map,
-            device: device.clone(),
-            dtype,
-        })
+        Ok(map)
     }
 
     fn get(&self, name: &str) -> Result<Tensor> {
@@ -759,16 +775,22 @@ mod tests {
         std::fs::read(p).unwrap()
     }
 
+    /// A valid GGUF with one small F32 tensor.
+    fn tiny_gguf_bytes() -> Vec<u8> {
+        use candle_core::quantized::QTensor;
+        let t = Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap();
+        let q = QTensor::quantize(&t, GgmlDType::F32).unwrap();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        gguf_file::write(&mut buf, &[], &[("w", &q)]).unwrap();
+        buf.into_inner()
+    }
+
     fn verified_fixture() -> Verified {
         use crate::types::{ModelFile, ModelMetadata, ModelMetadataExtended};
         let dir = tempfile::tempdir().unwrap();
         let st = safetensors_bytes();
         let content: [(&str, &str, Vec<u8>); 4] = [
-            (
-                "gguf",
-                "m.gguf",
-                b"not a real gguf, just bytes to hash".to_vec(),
-            ),
+            ("gguf", "m.gguf", tiny_gguf_bytes()),
             ("text_encoder", "te.safetensors", st.clone()),
             ("vae", "vae.safetensors", st),
             (
@@ -866,18 +888,59 @@ mod tests {
         }
     }
 
+    fn open_gguf(v: &Verified) -> Result<Weights> {
+        Weights::open(&v.files.gguf, &Device::Cpu, DType::F32)
+    }
+
     #[test]
     fn weights_open_refuses_a_gguf_replaced_after_verification() {
         for swap in [swap_by_rename, rewrite_in_place] {
             let v = verified_fixture();
-            let err = |v: &Verified| match Weights::open(&v.files.gguf, &Device::Cpu, DType::F32) {
-                Err(e) => e.to_string(),
-                Ok(_) => panic!("a file that is not a GGUF opened"),
-            };
-            not_the_check(err(&v));
+            let w = open_gguf(&v).expect("the untouched file opens and reads");
+            assert!(w.map.contains_key("w"));
             swap(&v.files.gguf);
-            assert!(err(&v).contains(CHANGED));
+            let e = open_gguf(&v).err().expect("a swapped file is refused");
+            assert!(e.to_string().contains(CHANGED), "{e}");
         }
+    }
+
+    #[test]
+    fn weights_open_reads_the_handle_it_checked_not_the_path() {
+        let v = verified_fixture();
+        // a different file lands on the path right after the check: the checked handle is still what gets read
+        let _swap = crate::backends::common::seam::swap_once_after_check(&v.files.gguf);
+        let w = open_gguf(&v).expect("read from the checked handle");
+        assert!(w.map.contains_key("w"));
+    }
+
+    #[test]
+    fn weights_open_reports_a_write_that_happens_while_the_file_is_read() {
+        let v = verified_fixture();
+        // the only re-check in `Weights::open` is the one after the read
+        let _write = crate::backends::common::seam::rewrite_on_recheck(&v.files.gguf, 1);
+        let e = open_gguf(&v)
+            .err()
+            .expect("a write during the read is reported");
+        assert!(e.to_string().contains(CHANGED), "{e}");
+    }
+
+    #[test]
+    fn decode_reads_the_handle_it_checked_not_the_path() {
+        let v = verified_fixture();
+        let baseline = v.pipe.decode(&latents()).unwrap_err().to_string();
+        assert!(baseline.contains("cannot find tensor"), "{baseline}");
+        let v = verified_fixture();
+        let _swap = crate::backends::common::seam::swap_once_after_check(&v.files.vae);
+        assert_eq!(v.pipe.decode(&latents()).unwrap_err().to_string(), baseline);
+    }
+
+    #[test]
+    fn decode_reports_a_write_that_happens_while_the_vae_is_mapped() {
+        let v = verified_fixture();
+        // re-check #1 is inside `VerifiedMaps::open`; #2 is the one after the work, which here fails for another reason first
+        let _write = crate::backends::common::seam::rewrite_on_recheck(&v.files.vae, 2);
+        let e = v.pipe.decode(&latents()).unwrap_err();
+        assert!(e.to_string().contains(CHANGED), "{e}");
     }
 
     #[test]
@@ -897,6 +960,42 @@ mod tests {
             swap(shards[0]);
             assert!(run().unwrap_err().to_string().contains(CHANGED));
         }
+    }
+
+    #[test]
+    fn encode_streaming_reads_the_handle_it_checked_and_reports_a_write_during_use() {
+        let run = |v: &Verified| {
+            let shards = [v.files.text_encoder_shards[0].as_str()];
+            crate::backends::zimage_text::encode_streaming(&[1], &shards, &Device::Cpu, DType::F32)
+                .unwrap_err()
+                .to_string()
+        };
+        let v = verified_fixture();
+        let baseline = run(&v);
+        assert!(baseline.contains("cannot find tensor"), "{baseline}");
+        let v = verified_fixture();
+        {
+            let _swap = crate::backends::common::seam::swap_once_after_check(
+                &v.files.text_encoder_shards[0],
+            );
+            assert_eq!(run(&v), baseline);
+        }
+        let v = verified_fixture();
+        let _write =
+            crate::backends::common::seam::rewrite_on_recheck(&v.files.text_encoder_shards[0], 2);
+        assert!(run(&v).contains(CHANGED));
+    }
+
+    #[test]
+    fn the_tokenizer_is_read_from_the_handle_it_checked_not_the_path() {
+        let v = verified_fixture();
+        let baseline = v.pipe.prompt_ids("a cat").unwrap_err().to_string();
+        let v = verified_fixture();
+        let _swap = crate::backends::common::seam::swap_once_after_check(&v.files.tokenizer);
+        assert_eq!(
+            v.pipe.prompt_ids("a cat").unwrap_err().to_string(),
+            baseline
+        );
     }
 
     #[test]

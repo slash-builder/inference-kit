@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Candle 0.9.2 -> **0.11** (verified: KV isolation A/B/A on CPU and CUDA, real-weights multimodal tests).
 - `AiKitError::to_error_code()` is **deprecated**: its numbers (20-24, 13, 90) collide with the fabric `ErrorCode` space (a remote peer could trigger an ops alert). Use `to_inference_error_code()`.
+- The text backend reads a catalog-listed `tokenizer` file (`files:`) once and checks its BLAKE3; `metadata.custom.tokenizer_path` still works but has no hash to check, so nothing verifies it. The Stable Diffusion path (`sd_turbo`) builds its CLIP, VAE and UNet from verified handles instead of letting Candle re-open paths.
 - Image and embedding weights, GGUF, tokenizer and config are opened once and checked against the identity (size, mtime, ctime, device, inode) recorded when they were hashed at load; the check, the read and any memory map use the same open handle, so a file swapped after load is refused instead of used. A loaded model whose file was replaced (even with identical content) fails its requests with an error that says to restart or build a new service.
 - The router keeps the original typed error when a call fails (an out-of-memory error used to become `Internal`).
 

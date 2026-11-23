@@ -228,6 +228,8 @@ impl VerifiedFile {
         if now != was {
             return Err(changed_since_verified(path));
         }
+        #[cfg(test)]
+        seam::fire(seam::Point::AfterOpenCheck, path);
         Ok(Self {
             file,
             path: path.to_string(),
@@ -243,6 +245,8 @@ impl VerifiedFile {
 
     /// Fail if the handle changed since it was opened (a writer touched it while it was being read or mapped).
     pub(crate) fn recheck(&self) -> Result<()> {
+        #[cfg(test)]
+        seam::fire(seam::Point::BeforeRecheck, &self.path);
         if stamp_of(&self.file)? == self.stamp {
             Ok(())
         } else {
@@ -265,12 +269,14 @@ impl VerifiedFile {
 #[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
 pub(crate) struct VerifiedMaps {
     maps: Vec<memmap2::Mmap>,
+    files: Vec<VerifiedFile>,
 }
 
 #[cfg_attr(not(any(feature = "image", feature = "embedding")), allow(dead_code))]
 impl VerifiedMaps {
     pub(crate) fn open<P: AsRef<str>>(paths: &[P]) -> Result<Self> {
         let mut maps = Vec::with_capacity(paths.len());
+        let mut files = Vec::with_capacity(paths.len());
         for p in paths {
             let f = VerifiedFile::open(p.as_ref())?;
             // SAFETY: mapping a file is unsafe because behaviour is undefined if the file is modified while it is mapped. Relied on:
@@ -283,8 +289,17 @@ impl VerifiedMaps {
             let map = unsafe { memmap2::Mmap::map(&f.file) }?;
             f.recheck()?;
             maps.push(map);
+            files.push(f);
         }
-        Ok(Self { maps })
+        Ok(Self { maps, files })
+    }
+
+    /// Call after the work that read the mappings: fails if any file changed while it was mapped, so a write during use is reported
+    /// instead of silently producing output from torn data. This is detection after the fact, not protection: a file *truncated* while
+    /// mapped makes the process take SIGBUS on the next access to the missing pages, before this can run. Callers should prefer this
+    /// error to whatever the work itself returned, since a changed file explains most failures in the work.
+    pub(crate) fn recheck(&self) -> Result<()> {
+        self.files.iter().try_for_each(VerifiedFile::recheck)
     }
 
     /// A `VarBuilder` over every mapped file. A tensor name present in several files resolves to the last one, as Candle's own multi-file
@@ -352,6 +367,112 @@ impl SimpleBackend for Shards<'_> {
 
     fn contains_tensor(&self, name: &str) -> bool {
         self.0.iter().any(|s| s.get(name).is_ok())
+    }
+}
+
+/// Test-only injection points, so a test can do what a racing writer would do at exactly the moment that matters (after a file's
+/// identity was checked, before it is read or mapped; or after the work, before the closing re-check). Thread-local: tests that
+/// install a hook must run the code under test on their own thread.
+#[cfg(test)]
+#[allow(dead_code)] // which helpers a build uses depends on the enabled kinds
+pub(crate) mod seam {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// In `VerifiedFile::open`, after the identity check passed and before anything is read or mapped.
+        AfterOpenCheck,
+        /// At the start of every `recheck`.
+        BeforeRecheck,
+    }
+
+    type Hook = Box<dyn FnMut(&str)>;
+    thread_local! {
+        static HOOKS: RefCell<Vec<(Point, Hook)>> = const { RefCell::new(Vec::new()) };
+        static MOVED: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Removes the hooks installed on this thread when dropped.
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOKS.with(|h| h.borrow_mut().clear());
+            MOVED.with(|m| {
+                for d in m.borrow_mut().drain(..) {
+                    let _ = std::fs::remove_dir_all(d);
+                }
+            });
+        }
+    }
+
+    /// Run `f(path)` every time `point` is reached on this thread, until the guard drops.
+    #[must_use]
+    pub(crate) fn on(point: Point, f: impl FnMut(&str) + 'static) -> Guard {
+        HOOKS.with(|h| h.borrow_mut().push((point, Box::new(f))));
+        Guard
+    }
+
+    /// The first time `target` passes its identity check, make the path name a different file, as a racing writer would. The directory
+    /// is moved aside and a new one with a garbage file at the same name takes its place, so the original inode is not touched (a
+    /// rename-over or unlink would move its ctime, which the closing re-check reports). Code that reads the *path* afterwards sees the
+    /// garbage; code that reads the checked handle still sees the original.
+    #[must_use]
+    pub(crate) fn swap_once_after_check(target: &str) -> Guard {
+        let target = target.to_string();
+        let mut done = false;
+        on(Point::AfterOpenCheck, move |p| {
+            if p == target && !done {
+                done = true;
+                let path = std::path::Path::new(p);
+                let dir = path.parent().unwrap();
+                let moved = dir.with_extension("moved");
+                std::fs::rename(dir, &moved).unwrap();
+                std::fs::create_dir(dir).unwrap();
+                // siblings stay reachable (as symlinks, which do not touch the target inode) so later opens of them still verify
+                for e in std::fs::read_dir(&moved).unwrap() {
+                    let e = e.unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(e.path(), dir.join(e.file_name())).unwrap();
+                }
+                std::fs::remove_file(path).unwrap();
+                std::fs::write(path, b"garbage, not a model file").unwrap();
+                MOVED.with(|m| m.borrow_mut().push(moved));
+            }
+        })
+    }
+
+    /// The `nth` time (1-based) `target` is re-checked, rewrite it in place with the same length first, as a writer active during use
+    /// would. (`VerifiedMaps::open` re-checks once itself, so the re-check after the work is the second.)
+    #[must_use]
+    pub(crate) fn rewrite_on_recheck(target: &str, nth: usize) -> Guard {
+        let target = target.to_string();
+        let mut seen = 0;
+        on(Point::BeforeRecheck, move |p| {
+            if p == target {
+                seen += 1;
+                if seen == nth {
+                    let mut b = std::fs::read(p).unwrap();
+                    *b.last_mut().unwrap() ^= 0xff;
+                    std::fs::write(p, b).unwrap();
+                }
+            }
+        })
+    }
+
+    pub(crate) fn fire(point: Point, path: &str) {
+        // taken out while it runs, so a hook that touches model files cannot re-enter itself
+        let taken = HOOKS.with(|h| std::mem::take(&mut *h.borrow_mut()));
+        let mut taken = taken;
+        for (p, f) in taken.iter_mut() {
+            if *p == point {
+                f(path);
+            }
+        }
+        HOOKS.with(|h| {
+            let mut h = h.borrow_mut();
+            taken.append(&mut h);
+            *h = taken;
+        });
     }
 }
 
@@ -735,6 +856,75 @@ mod tests {
             Err(AiKitError::Internal { reason }) if reason.contains("changed since it was verified")
         ));
         assert!(VerifiedMaps::open(&["/nonexistent/x"]).is_err());
+    }
+
+    #[test]
+    fn several_files_behave_as_one_builder_with_the_last_file_winning() {
+        let d = tempfile::tempdir().unwrap();
+        let save = |name: &str, tensors: &[(&str, &[f32])]| {
+            let m: HashMap<String, Tensor> = tensors
+                .iter()
+                .map(|(n, v)| (n.to_string(), Tensor::new(*v, &Device::Cpu).unwrap()))
+                .collect();
+            let path = d.path().join(name);
+            candle_core::safetensors::save(&m, &path).unwrap();
+            verified_file(d.path(), name, &std::fs::read(path).unwrap())
+        };
+        let a = save("a", &[("t", &[1.0, 1.0, 1.0]), ("only_a", &[7.0])]);
+        let b = save("b", &[("t", &[2.0, 2.0, 2.0]), ("only_b", &[9.0])]);
+        let maps = VerifiedMaps::open(&[a.as_str(), b.as_str()]).unwrap();
+        let vb = maps.var_builder(DType::F32, &Device::Cpu).unwrap();
+        let v = |name: &str, n: usize| vb.get(n, name).unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            v("t", 3),
+            [2.0; 3],
+            "a name in both files resolves to the last"
+        );
+        assert_eq!(v("only_a", 1), [7.0]);
+        assert_eq!(v("only_b", 1), [9.0]);
+        assert!(
+            vb.contains_tensor("only_a") && vb.contains_tensor("only_b") && vb.contains_tensor("t")
+        );
+        assert!(!vb.contains_tensor("nope"));
+        assert!(vb.get_unchecked("only_a").is_ok());
+        assert!(vb.get_unchecked("nope").is_err());
+        // the same files in the other order: now the other file's `t` wins
+        let maps = VerifiedMaps::open(&[b.as_str(), a.as_str()]).unwrap();
+        let vb = maps.var_builder(DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(vb.get(3, "t").unwrap().to_vec1::<f32>().unwrap(), [1.0; 3]);
+    }
+
+    #[test]
+    fn tensors_are_converted_to_the_dtype_asked_for() {
+        let d = tempfile::tempdir().unwrap();
+        let t = Tensor::new(&[1.5f32, 2.5], &Device::Cpu).unwrap();
+        let path = d.path().join("f");
+        candle_core::safetensors::save(&HashMap::from([("t".to_string(), t)]), &path).unwrap();
+        let p = verified_file(d.path(), "f", &std::fs::read(&path).unwrap());
+        let maps = VerifiedMaps::open(&[p.as_str()]).unwrap();
+        for dt in [DType::F16, DType::BF16, DType::F32] {
+            let vb = maps.var_builder(dt, &Device::Cpu).unwrap();
+            assert_eq!(vb.get(2, "t").unwrap().dtype(), dt);
+            assert_eq!(vb.get_unchecked("t").unwrap().dtype(), dt);
+        }
+    }
+
+    #[test]
+    fn a_write_while_mapped_is_reported_by_recheck_and_not_before() {
+        let d = tempfile::tempdir().unwrap();
+        let t = Tensor::new(&[1f32, 2.0], &Device::Cpu).unwrap();
+        let path = d.path().join("w");
+        candle_core::safetensors::save(&HashMap::from([("t".to_string(), t)]), &path).unwrap();
+        let p = verified_file(d.path(), "w", &std::fs::read(&path).unwrap());
+        let maps = VerifiedMaps::open(&[p.as_str()]).unwrap();
+        maps.recheck().expect("untouched");
+        let mut b = std::fs::read(&p).unwrap();
+        *b.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&p, b).unwrap();
+        assert!(matches!(
+            maps.recheck(),
+            Err(AiKitError::Internal { reason }) if reason.contains("changed since it was verified")
+        ));
     }
 
     #[test]

@@ -102,7 +102,10 @@ impl CandleEmbeddingService {
         let vb = maps
             .var_builder(DType::F32, &device)
             .map_err(|e| fail(format!("weights: {e}")))?;
-        let bert = BertModel::load(vb, &config).map_err(|e| fail(format!("model: {e}")))?;
+        let bert = BertModel::load(vb, &config).map_err(|e| fail(format!("model: {e}")));
+        // a write while the weights were being read is reported in preference to whatever the load returned
+        maps.recheck()?;
+        let bert = bert?;
         self.loaded
             .write()
             .map_err(|_| AiKitError::Internal {
@@ -321,6 +324,38 @@ models:
             })
             .unwrap();
         assert_eq!(out.dimensions, 8);
+    }
+
+    #[test]
+    fn weights_config_and_tokenizer_are_each_read_from_the_handle_that_was_checked() {
+        // after a file's identity check, a different file takes its path; the load must still use the original bytes
+        for name in ["model.safetensors", "config.json", "tokenizer.json"] {
+            let d = tempfile::tempdir().unwrap();
+            let svc =
+                CandleEmbeddingService::new(&tiny_catalog(d.path(), false), DevicePreference::Cpu)
+                    .unwrap();
+            let target = d.path().join(name).to_str().unwrap().to_string();
+            let _swap = crate::backends::common::seam::swap_once_after_check(&target);
+            svc.load_model("tiny")
+                .unwrap_or_else(|e| panic!("{name} was read by path: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_write_while_the_weights_are_being_read_fails_the_load() {
+        let d = tempfile::tempdir().unwrap();
+        let svc =
+            CandleEmbeddingService::new(&tiny_catalog(d.path(), false), DevicePreference::Cpu)
+                .unwrap();
+        let w = d.path().join("model.safetensors");
+        // re-check #1 is inside `VerifiedMaps::open`; #2 is the one after the load
+        let _w = crate::backends::common::seam::rewrite_on_recheck(w.to_str().unwrap(), 2);
+        let e = svc.load_model("tiny").unwrap_err();
+        assert!(
+            e.to_string().contains("changed since it was verified"),
+            "{e}"
+        );
+        assert!(!svc.loaded.read().unwrap().contains_key("tiny"));
     }
 
     #[test]

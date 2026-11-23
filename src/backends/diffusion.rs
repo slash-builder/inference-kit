@@ -26,7 +26,7 @@
 //! on the CPU. With `steps = 1` (no extra noise) the same seed gives the same image everywhere. No img2img, inpainting or LoRA. One request at a time per model.
 
 use crate::backends::common::{
-    check_vram, device_for, verify_model_files, DevicePreference, VerifiedFile,
+    check_vram, device_for, verify_model_files, DevicePreference, VerifiedFile, VerifiedMaps,
 };
 use crate::backends::zimage::{ZImageFiles, ZImagePipeline};
 use crate::error::{AiKitError, Result};
@@ -38,13 +38,11 @@ use crate::types::ModelMetadata;
 use async_trait::async_trait;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_transformers::models::stable_diffusion::{
-    self,
     clip::{ClipTextTransformer, Config as ClipConfig},
     euler_ancestral_discrete::EulerAncestralDiscreteSchedulerConfig,
     schedulers::{SchedulerConfig, TimestepSpacing},
-    unet_2d::UNet2DConditionModel,
-    vae::AutoEncoderKL,
-    StableDiffusionConfig,
+    unet_2d::{BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig},
+    vae::{AutoEncoderKL, AutoEncoderKLConfig},
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -190,25 +188,20 @@ impl CandleImageService {
         } else {
             DType::F32
         };
-        let cfg = StableDiffusionConfig::v2_1(None, Some(512), Some(512));
         let clip_cfg = ClipConfig::v2_1();
-        let wrap = |what: &str, e: candle_core::Error| fail(format!("{what}: {e}"));
-        // Candle's SD builders take paths, so these three cannot be handed the checked handle. Best available: check each file against
-        // its recorded hash-time identity immediately before it is opened. A swap in the gap between that check and Candle's open is not
-        // closed here (unlike the Z-Image path, which maps from the checked handle); this runs once at load, not per request.
-        for p in [&clip_path, &vae_path, &unet_path] {
-            VerifiedFile::open(p)?;
-        }
+        // Each component is built from a handle opened once and checked against the hash taken at load (see `from_verified`), not from
+        // a path Candle would open again. The tokenizer is read through the handle too.
         let tokenizer = Tokenizer::from_bytes(VerifiedFile::open(&tok_path)?.read_all()?)
             .map_err(|e| fail(format!("tokenizer: {e}")))?;
-        let clip = stable_diffusion::build_clip_transformer(&clip_cfg, &clip_path, &device, dtype)
-            .map_err(|e| wrap("text encoder", e))?;
-        let vae = cfg
-            .build_vae(&vae_path, &device, dtype)
-            .map_err(|e| wrap("vae", e))?;
-        let unet = cfg
-            .build_unet(&unet_path, &device, 4, false, dtype)
-            .map_err(|e| wrap("unet", e))?;
+        let clip = from_verified(id, &clip_path, &device, dtype, "text encoder", |vb| {
+            ClipTextTransformer::new(vb, &clip_cfg)
+        })?;
+        let vae = from_verified(id, &vae_path, &device, dtype, "vae", |vb| {
+            AutoEncoderKL::new(vb, 3, 3, sd_vae_config())
+        })?;
+        let unet = from_verified(id, &unet_path, &device, dtype, "unet", |vb| {
+            UNet2DConditionModel::new(vb, 4, 4, false, sd_unet_config())
+        })?;
         self.loaded
             .write()
             .map_err(|_| AiKitError::Internal {
@@ -471,6 +464,73 @@ pub(crate) fn encode_png(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>>
     Ok(out)
 }
 
+/// Build one model component from a safetensors file. The file is opened once, checked against the identity recorded when it was
+/// hashed, and mapped from that same handle (Candle's own `build_*` helpers take a path and open it again, which would leave a gap for a
+/// swap). The tensors are copied out by `build`, so the mapping is dropped when this returns; the handle is re-checked first, and a file
+/// that changed during the build is reported in preference to whatever the build returned.
+fn from_verified<T>(
+    model_id: &str,
+    path: &str,
+    device: &Device,
+    dtype: DType,
+    what: &str,
+    build: impl FnOnce(candle_nn::VarBuilder<'_>) -> candle_core::Result<T>,
+) -> Result<T> {
+    let fail = |e: candle_core::Error| AiKitError::ModelLoadFailed {
+        model_id: model_id.to_string(),
+        reason: format!("{what}: {e}"),
+    };
+    let maps = VerifiedMaps::open(&[path])?;
+    let built = maps
+        .var_builder(dtype, device)
+        .and_then(build)
+        .map_err(fail);
+    maps.recheck()?;
+    built
+}
+
+/// The SD-2.1 VAE configuration. `StableDiffusionConfig` keeps its component configs private and only offers path-taking builders, so
+/// the values `StableDiffusionConfig::v2_1` uses are repeated here; a test compares them with what that constructor produces, so a
+/// Candle upgrade that changes them fails loudly.
+fn sd_vae_config() -> AutoEncoderKLConfig {
+    AutoEncoderKLConfig {
+        block_out_channels: vec![128, 256, 512, 512],
+        layers_per_block: 2,
+        latent_channels: 4,
+        norm_num_groups: 32,
+        use_quant_conv: true,
+        use_post_quant_conv: true,
+    }
+}
+
+/// The SD-2.1 UNet configuration (see [`sd_vae_config`]).
+fn sd_unet_config() -> UNet2DConditionModelConfig {
+    let bc = |out_channels, use_cross_attn, attention_head_dim| BlockConfig {
+        out_channels,
+        use_cross_attn,
+        attention_head_dim,
+    };
+    UNet2DConditionModelConfig {
+        blocks: vec![
+            bc(320, Some(1), 5),
+            bc(640, Some(1), 10),
+            bc(1280, Some(1), 20),
+            bc(1280, None, 20),
+        ],
+        center_input_sample: false,
+        cross_attention_dim: 1024,
+        downsample_padding: 1,
+        flip_sin_to_cos: true,
+        freq_shift: 0.,
+        layers_per_block: 2,
+        mid_block_scale_factor: 1.,
+        norm_eps: 1e-5,
+        norm_num_groups: 32,
+        sliced_attention_size: None,
+        use_linear_projection: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +553,187 @@ mod tests {
         let rgb = vec![128u8; 16 * 8 * 3];
         let png = encode_png(&rgb, 16, 8).unwrap();
         assert_eq!(crate::modality::png_dims(&png), Some((16, 8)));
+    }
+
+    // ---- Stable Diffusion components are built from verified handles ----------------------------------------------------------------
+
+    /// Write `vars` (what a VarMap-built module registered) as a verified safetensors file in `dir`.
+    fn verified_weights(dir: &std::path::Path, name: &str, vm: &candle_nn::VarMap) -> String {
+        let path = dir.join(name);
+        vm.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // let the timestamp tick pass so a later in-place rewrite cannot share the stamp's tick
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let p = path.to_str().unwrap().to_string();
+        let mut m = ModelMetadata {
+            id: "sd".into(),
+            version: "1".into(),
+            os_arch: vec![],
+            quantization_variants: vec![],
+            default_quantization: String::new(),
+            hash: blake3::hash(&bytes).to_hex().to_string(),
+            size_bytes: bytes.len() as u64,
+            location: format!("file://{p}"),
+            metadata: crate::types::ModelMetadataExtended {
+                parameters: 0,
+                context_window: 0,
+                vram_required_mb: 0,
+                inference_latency_ms: 0,
+                framework: String::new(),
+                custom: HashMap::new(),
+            },
+            files: vec![],
+        };
+        m.id = name.into();
+        crate::backends::common::verify_model_files(&m).unwrap();
+        p
+    }
+
+    fn tiny_vae_cfg() -> AutoEncoderKLConfig {
+        AutoEncoderKLConfig {
+            block_out_channels: vec![32],
+            layers_per_block: 1,
+            ..AutoEncoderKLConfig::default()
+        }
+    }
+
+    fn tiny_unet_cfg() -> UNet2DConditionModelConfig {
+        let bc = |c, x, h| BlockConfig {
+            out_channels: c,
+            use_cross_attn: x,
+            attention_head_dim: h,
+        };
+        UNet2DConditionModelConfig {
+            blocks: vec![bc(32, Some(1), 2), bc(32, None, 2)],
+            layers_per_block: 1,
+            cross_attention_dim: 32,
+            ..UNet2DConditionModelConfig::default()
+        }
+    }
+
+    fn tiny_vae_file(dir: &std::path::Path) -> String {
+        let vm = candle_nn::VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
+        AutoEncoderKL::new(vb, 3, 3, tiny_vae_cfg()).unwrap();
+        verified_weights(dir, "vae.safetensors", &vm)
+    }
+
+    fn tiny_unet_file(dir: &std::path::Path) -> String {
+        let vm = candle_nn::VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
+        UNet2DConditionModel::new(vb, 4, 4, false, tiny_unet_cfg()).unwrap();
+        verified_weights(dir, "unet.safetensors", &vm)
+    }
+
+    fn build_vae(p: &str) -> Result<AutoEncoderKL> {
+        from_verified("sd", p, &Device::Cpu, DType::F32, "vae", |vb| {
+            AutoEncoderKL::new(vb, 3, 3, tiny_vae_cfg())
+        })
+    }
+
+    fn build_unet(p: &str) -> Result<UNet2DConditionModel> {
+        from_verified("sd", p, &Device::Cpu, DType::F32, "unet", |vb| {
+            UNet2DConditionModel::new(vb, 4, 4, false, tiny_unet_cfg())
+        })
+    }
+
+    #[test]
+    fn the_sd_v21_component_configs_are_what_candle_builds_for_v2_1() {
+        use candle_transformers::models::stable_diffusion::StableDiffusionConfig;
+        let shown = format!(
+            "{:?}",
+            StableDiffusionConfig::v2_1(None, Some(512), Some(512))
+        );
+        assert!(
+            shown.contains(&format!("autoencoder: {:?}", sd_vae_config())),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!("unet: {:?}", sd_unet_config())),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn vae_and_unet_build_from_verified_files_and_refuse_a_swapped_one() {
+        let d = tempfile::tempdir().unwrap();
+        let (vae, unet) = (tiny_vae_file(d.path()), tiny_unet_file(d.path()));
+        build_vae(&vae).unwrap();
+        build_unet(&unet).unwrap();
+        for (path, build) in [
+            (
+                &vae,
+                (|p: &str| build_vae(p).map(drop)) as fn(&str) -> Result<()>,
+            ),
+            (&unet, |p: &str| build_unet(p).map(drop)),
+        ] {
+            let mut b = std::fs::read(path).unwrap();
+            *b.last_mut().unwrap() ^= 0xff;
+            std::fs::write(path, b).unwrap(); // same size, in place
+            let e = build(path).unwrap_err();
+            assert!(
+                e.to_string().contains("changed since it was verified"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn vae_and_unet_are_built_from_the_handle_that_was_checked_not_the_path() {
+        for which in ["vae", "unet"] {
+            let d = tempfile::tempdir().unwrap();
+            let p = if which == "vae" {
+                tiny_vae_file(d.path())
+            } else {
+                tiny_unet_file(d.path())
+            };
+            let _swap = crate::backends::common::seam::swap_once_after_check(&p);
+            if which == "vae" {
+                build_vae(&p).unwrap_or_else(|e| panic!("read by path: {e}"));
+            } else {
+                build_unet(&p).unwrap_or_else(|e| panic!("read by path: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_write_while_a_component_is_built_is_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let p = tiny_vae_file(d.path());
+        // re-check #1 is inside `VerifiedMaps::open`, #2 the one after the build
+        let _w = crate::backends::common::seam::rewrite_on_recheck(&p, 2);
+        let e = build_vae(&p).map(drop).expect_err("reported");
+        assert!(
+            e.to_string().contains("changed since it was verified"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn the_clip_builder_reads_the_checked_handle_too() {
+        // the real CLIP config is far too large for a fixture, so this only shows which bytes are read: the original (valid
+        // safetensors, missing the CLIP tensors) and not the garbage that replaced it
+        let d = tempfile::tempdir().unwrap();
+        let vm = candle_nn::VarMap::new();
+        vm.get(
+            (1,),
+            "x",
+            candle_nn::Init::Const(0.),
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let p = verified_weights(d.path(), "clip.safetensors", &vm);
+        let build = |p: &str| {
+            from_verified("sd", p, &Device::Cpu, DType::F32, "text encoder", |vb| {
+                ClipTextTransformer::new(vb, &ClipConfig::v2_1())
+            })
+            .map(drop)
+            .expect_err("the tensors are not there")
+            .to_string()
+        };
+        let _swap = crate::backends::common::seam::swap_once_after_check(&p);
+        let e = build(&p);
+        assert!(e.contains("cannot find tensor"), "{e}");
     }
 }

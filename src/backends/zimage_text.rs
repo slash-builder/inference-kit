@@ -105,11 +105,24 @@ pub(crate) fn encode_streaming(
     device: &Device,
     dtype: DType,
 ) -> Result<Tensor> {
-    let cfg = TextEncoderConfig::z_image();
-    let l = ids.len();
     // Called once per request, long after `load_model` hashed the shards: open each once, check that handle against the hash taken at
     // load, and map from that same handle (see `VerifiedMaps`). Both builders share the mappings, which live only for this call.
     let maps = VerifiedMaps::open(shards).map_err(|e| candle_core::Error::msg(e.to_string()))?;
+    let out = encode_mapped(ids, &maps, device, dtype);
+    // a write during use is reported in preference to whatever the work returned (a truncation cannot be reported: the process takes SIGBUS on the next access to the missing pages)
+    maps.recheck()
+        .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+    out
+}
+
+fn encode_mapped(
+    ids: &[u32],
+    maps: &VerifiedMaps,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let cfg = TextEncoderConfig::z_image();
+    let l = ids.len();
     let on_cpu = maps.var_builder(dtype, &Device::Cpu)?;
     let on_dev = maps.var_builder(dtype, device)?;
 
