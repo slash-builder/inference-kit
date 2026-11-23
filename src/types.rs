@@ -136,35 +136,54 @@ pub struct ModelFile {
     pub size_bytes: u64,
 }
 
-/// What a model's licence allows, from `metadata.custom["license"]`. Only used to keep non-commercial models from becoming a default.
+/// What a model's licence allows, from `metadata.custom["license"]` (and the optional `commercial_use` override). Used to keep a model
+/// that is not known to permit commercial use from becoming a default, and to refuse it by name when a caller asks for that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LicenceClass {
-    /// Permits commercial use (for example Apache-2.0, MIT).
+    /// Known to permit commercial use: a recognised permissive licence (for example Apache-2.0, MIT), or the catalog author said so with
+    /// `commercial_use: "true"`.
     Commercial,
-    /// Development or research only (`non-commercial...`, `research...`).
+    /// Development or research only: the licence name says non-commercial, research, academic, evaluation or personal use (including the
+    /// Creative Commons `NC` family), or the catalog author said `commercial_use: "false"`.
     NonCommercial,
-    /// Not stated. Treated as usable; a catalog author who knows better must say so.
+    /// Not stated, or a name this crate does not recognise. **Not assumed usable**: it is excluded exactly like `NonCommercial` from
+    /// default selection and from a commercial-only check. A catalog author who knows better sets `commercial_use`.
     Unknown,
 }
 
 impl ModelMetadata {
-    /// Commercial / non-commercial / unknown, from `custom.license`.
+    /// Commercial / non-commercial / unknown, from `custom.license` and the optional `custom.commercial_use`.
+    ///
+    /// A licence name that says non-commercial always wins (a contradicting `commercial_use: "true"` fails closed). Otherwise an explicit
+    /// `commercial_use` of `true` or `false` decides; otherwise a recognised permissive name is `Commercial` and anything else, including
+    /// a missing licence, is `Unknown`. How names are read, and what is deliberately **not** recognised (copyleft, RAIL, community
+    /// licences), is in the `licence` module.
     pub fn licence_class(&self) -> LicenceClass {
+        use crate::licence::{classify, NameClass};
+        let name = classify(
+            self.metadata
+                .custom
+                .get("license")
+                .map_or("", String::as_str),
+        );
+        if name == NameClass::NonCommercial {
+            return LicenceClass::NonCommercial;
+        }
         match self
             .metadata
             .custom
-            .get("license")
-            .map(|l| l.trim().to_ascii_lowercase())
+            .get("commercial_use")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
         {
-            None => LicenceClass::Unknown,
-            Some(l)
-                if l.starts_with("non-commercial")
-                    || l.starts_with("noncommercial")
-                    || l.starts_with("research") =>
-            {
-                LicenceClass::NonCommercial
-            }
-            Some(_) => LicenceClass::Commercial,
+            Some("true" | "yes") => return LicenceClass::Commercial,
+            Some("false" | "no") => return LicenceClass::NonCommercial,
+            _ => {}
+        }
+        if name == NameClass::Permissive {
+            LicenceClass::Commercial
+        } else {
+            LicenceClass::Unknown
         }
     }
 
