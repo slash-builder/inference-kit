@@ -119,6 +119,30 @@ impl AnthropicAdapter {
         })
     }
 
+    /// `GET /v1/models`, ready to send. The key goes into a sensitive header (a seam so a test can inspect the built request).
+    fn models_request(&self, key: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(self
+            .http
+            .get(self.url("/v1/models"))
+            .header("x-api-key", super::sensitive_header_value(key)?)
+            .header("anthropic-version", API_VERSION))
+    }
+
+    /// `POST /v1/messages`, ready to send. The key goes into a sensitive header (a seam so a test can inspect the built request).
+    fn messages_request(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(self
+            .http
+            .post(self.url("/v1/messages"))
+            .header("x-api-key", super::sensitive_header_value(key)?)
+            .header("anthropic-version", API_VERSION)
+            .header("content-type", "application/json")
+            .body(body))
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.cfg.base_url.trim_end_matches('/'), path)
     }
@@ -130,10 +154,7 @@ impl AnthropicAdapter {
             .get(&self.cfg.credential_name)
             .map_err(|_| ProviderError::Auth)?;
         let resp = self
-            .http
-            .get(self.url("/v1/models"))
-            .header("x-api-key", key.expose())
-            .header("anthropic-version", API_VERSION)
+            .models_request(key.expose())?
             .send()
             .await
             .map_err(transport_error)?;
@@ -267,13 +288,6 @@ impl ProviderAdapter for AnthropicAdapter {
         } else {
             p.max_tokens
         };
-        // worst case: ~1 token per 3 bytes of prompt (conservative), and the whole output allowance
-        let worst = self
-            .cfg
-            .pricing
-            .worst_case(p.prompt.len() as u64 / 3 + 1, u64::from(max_tokens));
-        let reservation = self.ledger.reserve(worst)?;
-
         let body = json!({
             "model": self.cfg.model,
             "max_tokens": max_tokens,
@@ -282,15 +296,16 @@ impl ProviderAdapter for AnthropicAdapter {
         });
         let bytes = serde_json::to_vec(&body).map_err(|_| ProviderError::Other)?;
         let bytes_sent = bytes.len() as u64;
-        let sent = self
-            .http
-            .post(self.url("/v1/messages"))
-            .header("x-api-key", key.expose())
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
-            .body(bytes)
-            .send()
-            .await;
+        // built before the reservation, so a key that is not a valid header value leaves nothing reserved
+        let request = self.messages_request(key.expose(), bytes)?;
+        // worst case: ~1 token per 3 bytes of prompt (conservative), and the whole output allowance
+        let worst = self
+            .cfg
+            .pricing
+            .worst_case(p.prompt.len() as u64 / 3 + 1, u64::from(max_tokens));
+        let reservation = self.ledger.reserve(worst)?;
+
+        let sent = request.send().await;
         let resp = match sent {
             Ok(r) => r,
             Err(e) => {
@@ -318,7 +333,12 @@ impl ProviderAdapter for AnthropicAdapter {
         };
         let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if status != 200 {
-            self.ledger.release(reservation);
+            // an error status is released, except the few a gateway uses when it gave up on a call the vendor may have finished
+            if super::status_may_have_been_billed(status) {
+                self.ledger.settle_reserved(reservation);
+            } else {
+                self.ledger.release(reservation);
+            }
             return Err(classify(status, retry, &body));
         }
 
@@ -478,6 +498,60 @@ mod tests {
         assert!(r.bytes_sent > 0 && r.bytes_received > 0);
     }
 
+    /// Each place the key goes into a request header marks it sensitive, so the request's `Debug` output never prints it. (Reverting
+    /// one of these to a plain header leaves every wire-level test green, which is why the built request is inspected here.)
+    #[test]
+    fn every_request_the_adapter_builds_marks_the_key_header_sensitive() {
+        let s_uri = "http://127.0.0.1:9";
+        let mut cfg = AnthropicConfig::new("anthropic-api-key", "claude-test-model", PRICING);
+        cfg.base_url = s_uri.to_string();
+        let a = AnthropicAdapter::new(
+            cfg,
+            Arc::new(InMemoryCredentials::with("anthropic-api-key", KEY)),
+            Arc::new(Ledger::new(1)),
+        )
+        .unwrap();
+        for built in [
+            a.models_request(KEY).unwrap().build().unwrap(),
+            a.messages_request(KEY, b"{}".to_vec())
+                .unwrap()
+                .build()
+                .unwrap(),
+        ] {
+            assert!(built.headers().get("x-api-key").unwrap().is_sensitive());
+            let shown = format!("{built:?} {:?}", built.headers());
+            assert!(!shown.contains(KEY), "{shown}");
+        }
+    }
+
+    /// A redirect would replay the key header and the prompt body to wherever it points: the client must not follow one.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_so_the_key_and_prompt_go_nowhere_else() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&elsewhere)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", elsewhere.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let (a, _ledger) = adapter(&origin, 10_000_000);
+        assert!(
+            a.call(&req("a private prompt")).await.is_err(),
+            "a 307 is not a success"
+        );
+        assert_eq!(origin.received_requests().await.unwrap().len(), 1);
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "the redirect target must receive nothing"
+        );
+    }
+
     #[tokio::test]
     async fn a_refusal_is_a_billed_result_not_an_error() {
         let s = MockServer::start().await;
@@ -615,12 +689,18 @@ mod tests {
             let (a, ledger) = adapter(&s, 10_000_000);
             let got = a.call(&req("x")).await.unwrap_err();
             assert_eq!(got, want, "HTTP {status}");
-            assert_eq!(
-                ledger.available(),
-                10_000_000,
-                "HTTP {status}: an unbilled failure must release the reservation"
-            );
-            assert_eq!(ledger.spent(), 0);
+            if status == 504 {
+                // a gateway that gave up on a call the vendor may have finished: charged at the worst case
+                let worst = PRICING.worst_case("x".len() as u64 / 3 + 1, 100);
+                assert_eq!(ledger.spent(), worst, "HTTP {status}: may have been billed");
+            } else {
+                assert_eq!(
+                    ledger.available(),
+                    10_000_000,
+                    "HTTP {status}: an unbilled failure must release the reservation"
+                );
+                assert_eq!(ledger.spent(), 0);
+            }
         }
     }
 
@@ -956,5 +1036,108 @@ mod tests {
             "the connect limit, not the overall one, ended the call"
         );
         assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    fn adapter_at(
+        base: &str,
+        creds: Arc<dyn CredentialSource>,
+        ledger: &Arc<Ledger>,
+        timeout: Duration,
+        connect: Duration,
+    ) -> AnthropicAdapter {
+        let mut cfg = AnthropicConfig::new("anthropic-api-key", "claude-test-model", PRICING);
+        cfg.base_url = base.into();
+        cfg.timeout = timeout;
+        cfg.connect_timeout = connect;
+        AnthropicAdapter::build(cfg, creds, ledger.clone(), |b| b.no_proxy()).unwrap()
+    }
+    fn key_source() -> Arc<dyn CredentialSource> {
+        Arc::new(InMemoryCredentials::with("anthropic-api-key", KEY))
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_breaks_while_its_body_is_read_is_charged_at_the_reserved_worst_case() {
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let base = format!(
+            "http://{}",
+            super::super::test_support::truncated_reply_server()
+        );
+        let a = adapter_at(
+            &base,
+            key_source(),
+            &ledger,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        assert!(a.call(&req("hi")).await.is_err());
+        assert_eq!(
+            ledger.spent(),
+            worst_for_hi(),
+            "the request was accepted: it may have been billed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_statuses_a_gateway_uses_for_giving_up_are_charged_and_the_others_released() {
+        for (status, charged) in [
+            (408u16, true),
+            (502, true),
+            (504, true),
+            (500, false),
+            (503, false),
+            (529, false),
+            (400, false),
+            (429, false),
+        ] {
+            let s = MockServer::start().await;
+            serve(&s, status, json!({"error":{"type":"x","message":"x"}})).await;
+            let (a, ledger) = adapter(&s, 10_000_000);
+            assert!(a.call(&req("hi")).await.is_err());
+            let want = if charged { worst_for_hi() } else { 0 };
+            assert_eq!(ledger.spent(), want, "HTTP {status}");
+            assert_eq!(ledger.available(), 10_000_000 - want, "HTTP {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credential_that_vanishes_before_the_call_costs_nothing() {
+        let s = MockServer::start().await;
+        let creds = super::super::test_support::Vanishing::new(KEY);
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = adapter_at(
+            &s.uri(),
+            creds.clone(),
+            &ledger,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        creds.vanish();
+        assert_eq!(a.call(&req("hi")).await.unwrap_err(), ProviderError::Auth);
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[tokio::test]
+    async fn a_connect_limit_longer_than_the_timeout_still_releases_a_hung_connection() {
+        let Some(addr) = super::super::test_support::blackholed_addr() else {
+            return;
+        };
+        let ledger = Arc::new(Ledger::new(10_000_000));
+        let a = adapter_at(
+            &format!("http://{addr}"),
+            key_source(),
+            &ledger,
+            Duration::from_millis(400),
+            Duration::from_secs(30),
+        );
+        assert!(a.call(&req("hi")).await.is_err());
+        assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
+    }
+
+    #[test]
+    fn the_default_connect_timeout_is_applied() {
+        assert_eq!(
+            AnthropicConfig::new("k", "m", PRICING).connect_timeout,
+            Duration::from_secs(10)
+        );
     }
 }
