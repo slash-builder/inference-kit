@@ -57,8 +57,15 @@ fn junk_catalog(dir: &tempfile::TempDir, hash_ok: bool) -> String {
             .iter()
             .map(|(role, i)| format!("      - {{role: {role}, location: \"file://{}\", hash: \"{}\", size_bytes: 6}}\n", l(*i), h(*i)))
             .collect();
+        // An entry with no further files must say `files: []`. A bare `files:` is a null, and the strict YAML reader
+        // (#14) does not read a null as an empty list.
+        let files = if extras.is_empty() {
+            " []\n".to_string()
+        } else {
+            format!("\n{extras}")
+        };
         format!(
-            "  - id: {id}\n    version: \"1.0.0\"\n    os_arch: [x86_64]\n    quantization_variants: [default]\n    default_quantization: default\n    hash: \"{}\"\n    size_bytes: 4\n    location: \"file://{}\"\n    files:\n{extras}    metadata:\n      parameters: 1\n      context_window: 77\n      vram_required_mb: 1\n      inference_latency_ms: 0\n      framework: candle\n      custom: {{kind: {cap}, architecture: sd_turbo}}\n",
+            "  - id: {id}\n    version: \"1.0.0\"\n    os_arch: [x86_64]\n    quantization_variants: [default]\n    default_quantization: default\n    hash: \"{}\"\n    size_bytes: 4\n    location: \"file://{}\"\n    files:{files}    metadata:\n      parameters: 1\n      context_window: 77\n      vram_required_mb: 1\n      inference_latency_ms: 0\n      framework: candle\n      custom: {{kind: {cap}, architecture: sd_turbo}}\n",
             h(main),
             l(main)
         )

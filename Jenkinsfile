@@ -90,6 +90,45 @@ pipeline {
           }
         }
 
+        stage('linux-amd64 (features)') {
+          // `default = []`, so the leg above compiles and tests only the core crate. Every provider adapter and
+          // every Candle backend sits behind a feature and was never built, linted or tested by CI. This leg runs
+          // them, in the same pinned container and with the same relative CARGO_HOME. It is a gate like the leg
+          // above, not an optional leg.
+          //   - provider-*, claude-proxy, conformance: tested against in-process mock servers (wiremock); no network,
+          //     no key.
+          //   - candle: the unit tests, the CLI tests and the tests/ targets. The `#[ignore]`d tests need model
+          //     weights and stay out (they are run by hand, see tests/multimodal.rs).
+          //   - NOT covered: `cuda` (needs nvcc and a GPU).
+          // Its own target dir: this leg runs beside the legs above in one workspace (`reuseNode true`), and cargo
+          // serialises two builds on one target dir with a lock, which would make the stages wait for each other.
+          // (The same reason as the arm64 leg's `target-arm64`.)
+          agent { docker { image RUST_IMAGE; reuseNode true } }
+          steps {
+            timeout(time: 30, unit: 'MINUTES') {
+              sh '''
+                rustup component add clippy
+                export CARGO_TARGET_DIR="$PWD/target-features"
+                # This leg is a fourth cargo tree on a node with three executors, and cargo defaults to one job
+                # per core. Cap it so it cannot starve the legs beside it. Raise it if it becomes the slow leg.
+                export CARGO_BUILD_JOBS=4
+                # The provider tests talk to a mock server on 127.0.0.1. With a proxy in the environment, reqwest
+                # sends that traffic to the proxy instead and the tests fail. Exempt loopback, and keep whatever
+                # either spelling of the variable already held.
+                export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}${no_proxy:+,$no_proxy}"
+                export no_proxy="$NO_PROXY"
+
+                PROVIDERS=provider-anthropic,provider-openai-compat,provider-gemini,claude-proxy,conformance
+                cargo clippy --all-targets --features "$PROVIDERS" -- -D warnings
+                cargo test --features "$PROVIDERS"
+
+                cargo clippy --all-targets --features candle -- -D warnings
+                cargo test --features candle
+              '''
+            }
+          }
+        }
+
         stage('linux-arm64 (cross-compile)') {
           // No native Linux arm64 agent exists yet. AI Kit has no ML-framework
           // native deps wired in today — Candle/TFLite/ONNX are all still

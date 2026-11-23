@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- A catalog entry with a bare `files:` key (a YAML null) is refused by the strict YAML reader introduced in #14 (`expected sequence start`); write `files: []` for none. Only the test fixture in `tests/multimodal.rs` changed, not the product code.
 - Candle 0.9.2 -> **0.11** (verified: KV isolation A/B/A on CPU and CUDA, real-weights multimodal tests).
 - `AiKitError::to_error_code()` is **deprecated**: its numbers (20-24, 13, 90) collide with the fabric `ErrorCode` space (a remote peer could trigger an ops alert). Use `to_inference_error_code()`.
 - The router keeps the original typed error when a call fails (an out-of-memory error used to become `Internal`).
