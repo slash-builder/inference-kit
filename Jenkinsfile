@@ -109,9 +109,13 @@ pipeline {
               sh '''
                 rustup component add clippy
                 export CARGO_TARGET_DIR="$PWD/target-features"
+                # This leg is a fourth cargo tree on a node with three executors, and cargo defaults to one job
+                # per core. Cap it so it cannot starve the legs beside it. Raise it if it becomes the slow leg.
+                export CARGO_BUILD_JOBS=4
                 # The provider tests talk to a mock server on 127.0.0.1. With a proxy in the environment, reqwest
-                # sends that traffic to the proxy instead and the tests fail. Exempt loopback.
-                export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+                # sends that traffic to the proxy instead and the tests fail. Exempt loopback, and keep whatever
+                # either spelling of the variable already held.
+                export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}${no_proxy:+,$no_proxy}"
                 export no_proxy="$NO_PROXY"
 
                 PROVIDERS=provider-anthropic,provider-openai-compat,provider-gemini,claude-proxy,conformance

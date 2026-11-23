@@ -8,6 +8,9 @@ repository = "https://github.com/slash-builder/ai-kit"
 license = "Apache-2.0"
 keywords = ["inference", "llm", "household", "hearth", "kit"]
 categories = ["machine-learning", "command-line-utilities"]
+# CI scratch that lands in the workspace (see .gitignore). `cargo publish --allow-dirty` would otherwise package it,
+# and `.cargo/` holds registry credentials during Publish.
+exclude = ["/.cargo/", "/target-*/"]
 
 [lib]
 path = "src/lib.rs"

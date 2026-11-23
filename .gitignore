@@ -1,6 +1,12 @@
 target/
 Cargo.lock
 
+# CI scratch, written into the workspace by the Jenkinsfile: the relative CARGO_HOME (it also holds the registry
+# credentials during Publish) and the per-leg target dirs (target-arm64, target-features). Publish runs
+# `cargo publish --allow-dirty` in the same workspace, so none of this may ever be packaged.
+/.cargo/
+/target-*/
+
 # POC-only: model weights fetched by scripts/fetch-model.sh for local dev
 # inference (see README "Local Dev Inference (POC)"). Never committed —
 # production ships models signed in the OS image (invariant #2), this is a
