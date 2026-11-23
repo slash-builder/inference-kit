@@ -119,6 +119,30 @@ impl AnthropicAdapter {
         })
     }
 
+    /// `GET /v1/models`, ready to send. The key goes into a sensitive header (a seam so a test can inspect the built request).
+    fn models_request(&self, key: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(self
+            .http
+            .get(self.url("/v1/models"))
+            .header("x-api-key", super::sensitive_header_value(key)?)
+            .header("anthropic-version", API_VERSION))
+    }
+
+    /// `POST /v1/messages`, ready to send. The key goes into a sensitive header (a seam so a test can inspect the built request).
+    fn messages_request(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(self
+            .http
+            .post(self.url("/v1/messages"))
+            .header("x-api-key", super::sensitive_header_value(key)?)
+            .header("anthropic-version", API_VERSION)
+            .header("content-type", "application/json")
+            .body(body))
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.cfg.base_url.trim_end_matches('/'), path)
     }
@@ -130,10 +154,7 @@ impl AnthropicAdapter {
             .get(&self.cfg.credential_name)
             .map_err(|_| ProviderError::Auth)?;
         let resp = self
-            .http
-            .get(self.url("/v1/models"))
-            .header("x-api-key", key.expose())
-            .header("anthropic-version", API_VERSION)
+            .models_request(key.expose())?
             .send()
             .await
             .map_err(transport_error)?;
@@ -267,13 +288,6 @@ impl ProviderAdapter for AnthropicAdapter {
         } else {
             p.max_tokens
         };
-        // worst case: ~1 token per 3 bytes of prompt (conservative), and the whole output allowance
-        let worst = self
-            .cfg
-            .pricing
-            .worst_case(p.prompt.len() as u64 / 3 + 1, u64::from(max_tokens));
-        let reservation = self.ledger.reserve(worst)?;
-
         let body = json!({
             "model": self.cfg.model,
             "max_tokens": max_tokens,
@@ -282,15 +296,16 @@ impl ProviderAdapter for AnthropicAdapter {
         });
         let bytes = serde_json::to_vec(&body).map_err(|_| ProviderError::Other)?;
         let bytes_sent = bytes.len() as u64;
-        let sent = self
-            .http
-            .post(self.url("/v1/messages"))
-            .header("x-api-key", key.expose())
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
-            .body(bytes)
-            .send()
-            .await;
+        // built before the reservation, so a key that is not a valid header value leaves nothing reserved
+        let request = self.messages_request(key.expose(), bytes)?;
+        // worst case: ~1 token per 3 bytes of prompt (conservative), and the whole output allowance
+        let worst = self
+            .cfg
+            .pricing
+            .worst_case(p.prompt.len() as u64 / 3 + 1, u64::from(max_tokens));
+        let reservation = self.ledger.reserve(worst)?;
+
+        let sent = request.send().await;
         let resp = match sent {
             Ok(r) => r,
             Err(e) => {
@@ -476,6 +491,60 @@ mod tests {
             "the reservation is gone"
         );
         assert!(r.bytes_sent > 0 && r.bytes_received > 0);
+    }
+
+    /// Each place the key goes into a request header marks it sensitive, so the request's `Debug` output never prints it. (Reverting
+    /// one of these to a plain header leaves every wire-level test green, which is why the built request is inspected here.)
+    #[test]
+    fn every_request_the_adapter_builds_marks_the_key_header_sensitive() {
+        let s_uri = "http://127.0.0.1:9";
+        let mut cfg = AnthropicConfig::new("anthropic-api-key", "claude-test-model", PRICING);
+        cfg.base_url = s_uri.to_string();
+        let a = AnthropicAdapter::new(
+            cfg,
+            Arc::new(InMemoryCredentials::with("anthropic-api-key", KEY)),
+            Arc::new(Ledger::new(1)),
+        )
+        .unwrap();
+        for built in [
+            a.models_request(KEY).unwrap().build().unwrap(),
+            a.messages_request(KEY, b"{}".to_vec())
+                .unwrap()
+                .build()
+                .unwrap(),
+        ] {
+            assert!(built.headers().get("x-api-key").unwrap().is_sensitive());
+            let shown = format!("{built:?} {:?}", built.headers());
+            assert!(!shown.contains(KEY), "{shown}");
+        }
+    }
+
+    /// A redirect would replay the key header and the prompt body to wherever it points: the client must not follow one.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_so_the_key_and_prompt_go_nowhere_else() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&elsewhere)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", elsewhere.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let (a, _ledger) = adapter(&origin, 10_000_000);
+        assert!(
+            a.call(&req("a private prompt")).await.is_err(),
+            "a 307 is not a success"
+        );
+        assert_eq!(origin.received_requests().await.unwrap().len(), 1);
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "the redirect target must receive nothing"
+        );
     }
 
     #[tokio::test]

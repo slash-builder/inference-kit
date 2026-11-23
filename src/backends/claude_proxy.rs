@@ -125,13 +125,14 @@ impl ClaudeProxyInferenceService {
             });
         }
 
-        let client =
-            reqwest::Client::builder()
-                .build()
-                .map_err(|e| AiKitError::RemoteBackendError {
-                    backend: "claude".to_string(),
-                    reason: format!("failed to build HTTP client: {e}"),
-                })?;
+        // no redirects: the request carries the key and the prompt, and a redirect would replay both to wherever it points
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| AiKitError::RemoteBackendError {
+                backend: "claude".to_string(),
+                reason: format!("failed to build HTTP client: {e}"),
+            })?;
 
         Ok(Self {
             api_key: config.api_key,
@@ -140,6 +141,26 @@ impl ClaudeProxyInferenceService {
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             client,
         })
+    }
+}
+
+impl ClaudeProxyInferenceService {
+    /// `POST url` with the key in a sensitive header, ready to send (a seam so a test can inspect the built request).
+    fn request(&self, url: &str, body: &MessagesRequest<'_>) -> Result<reqwest::RequestBuilder> {
+        let key =
+            crate::sensitive_header::sensitive_header_value(&self.api_key).ok_or_else(|| {
+                AiKitError::RemoteBackendError {
+                    backend: "claude".to_string(),
+                    reason: "the API key is not a valid HTTP header value".to_string(),
+                }
+            })?;
+        Ok(self
+            .client
+            .post(url)
+            .header("x-api-key", key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(body))
     }
 }
 
@@ -227,19 +248,12 @@ impl InferenceService for ClaudeProxyInferenceService {
         let url = format!("{}/v1/messages", self.base_url);
 
         let start = std::time::Instant::now();
-        let response = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AiKitError::RemoteBackendError {
+        let response = self.request(&url, &body)?.send().await.map_err(|e| {
+            AiKitError::RemoteBackendError {
                 backend: "claude".to_string(),
                 reason: format!("HTTP request to {url} failed: {e}"),
-            })?;
+            }
+        })?;
         let inference_ms = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
 
         let status = response.status();
@@ -381,6 +395,59 @@ mod tests {
             base_url: Some(mock.uri()),
         })
         .expect("valid config should construct")
+    }
+
+    /// The key header is marked sensitive at the call site, so the request's `Debug` output never prints the key.
+    #[test]
+    fn the_key_header_is_sensitive_and_does_not_show_in_debug_output() {
+        let service = ClaudeProxyInferenceService::new(ClaudeProxyConfig {
+            api_key: "sk-test-DEBUG-KEY".to_string(),
+            base_url: None,
+        })
+        .unwrap();
+        let body = MessagesRequest {
+            model: "m",
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            messages: vec![],
+        };
+        let req = service
+            .request("http://127.0.0.1:9/v1/messages", &body)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(req.headers().get("x-api-key").unwrap().is_sensitive());
+        let shown = format!("{req:?} {:?}", req.headers());
+        assert!(!shown.contains("sk-test-DEBUG-KEY"), "{shown}");
+    }
+
+    /// A redirect would replay the key header and the prompt body to wherever it points: the client must not follow one.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_so_the_key_and_prompt_go_nowhere_else() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&elsewhere)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/v1/messages", elsewhere.uri())),
+            )
+            .mount(&origin)
+            .await;
+
+        let service = service_for(&origin, "sk-test-key");
+        let result = service.infer(params("a private prompt")).await;
+        assert!(result.is_err(), "a 307 is not a success");
+        assert_eq!(origin.received_requests().await.unwrap().len(), 1);
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "the redirect target must receive nothing"
+        );
     }
 
     #[test]

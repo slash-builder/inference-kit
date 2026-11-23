@@ -99,6 +99,7 @@ pub(crate) fn http_builder(
     reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(connect_timeout)
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 #[cfg(any(feature = "provider-openai-compat", feature = "provider-gemini"))]
@@ -157,6 +158,16 @@ pub(crate) mod test_support {
             }
         }
     }
+}
+
+/// The key header value, marked sensitive (see `crate::sensitive_header`). A key that is not a valid header value is an
+/// authentication failure, and the key is not in the error.
+#[cfg(any(feature = "provider-anthropic", feature = "provider-gemini"))]
+pub(crate) fn sensitive_header_value(
+    secret: &str,
+) -> Result<reqwest::header::HeaderValue, crate::provider::ProviderError> {
+    crate::sensitive_header::sensitive_header_value(secret)
+        .ok_or(crate::provider::ProviderError::Auth)
 }
 
 #[cfg(feature = "provider-anthropic")]

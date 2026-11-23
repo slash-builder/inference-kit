@@ -149,14 +149,35 @@ impl GeminiAdapter {
         }
     }
 
+    /// `GET /v1beta/models`, ready to send. The key goes into a sensitive header (a seam so a test can inspect the built request).
+    fn models_request(&self, key: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(self
+            .http
+            .get(self.url("/v1beta/models"))
+            .header("x-goog-api-key", super::sensitive_header_value(key)?))
+    }
+
+    /// A `POST` to `path`, ready to send. The key goes into a sensitive header (a seam so a test can inspect the built request).
+    fn post_request(
+        &self,
+        path: &str,
+        key: &str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::RequestBuilder, ProviderError> {
+        Ok(self
+            .http
+            .post(self.url(path))
+            .header("x-goog-api-key", super::sensitive_header_value(key)?)
+            .header("content-type", "application/json")
+            .body(body))
+    }
+
     /// `GET /v1beta/models` as cards. A model that lists `generateContent` serves text, `embedContent` serves embeddings; capability flags the
     /// listing does not carry stay unknown. Only the first page is read. `today` is `YYYY-MM-DD`.
     pub async fn discover_models(&self, today: &str) -> Result<Vec<ModelCard>, ProviderError> {
         let key = self.key()?;
         let resp = self
-            .http
-            .get(self.url("/v1beta/models"))
-            .header("x-goog-api-key", key)
+            .models_request(&key)?
             .send()
             .await
             .map_err(transport_error)?;
@@ -184,11 +205,8 @@ impl GeminiAdapter {
             err: transport_error(e),
         };
         let resp = self
-            .http
-            .post(self.url(path))
-            .header("x-goog-api-key", key)
-            .header("content-type", "application/json")
-            .body(bytes)
+            .post_request(path, &key, bytes)
+            .map_err(not_sent)?
             .send()
             .await
             .map_err(transport_failure)?;
@@ -559,6 +577,66 @@ mod tests {
             Output::Text(t) => t.completion.clone(),
             o => panic!("{o:?}"),
         }
+    }
+
+    /// Each place the key goes into a request header marks it sensitive, so the request's `Debug` output never prints it. (Reverting
+    /// one of these to a plain header leaves every wire-level test green, which is why the built request is inspected here.)
+    #[test]
+    fn every_request_the_adapter_builds_marks_the_key_header_sensitive() {
+        let mut cfg = GeminiConfig::new("gemini-api-key", "gemini-test");
+        cfg.base_url = "http://127.0.0.1:9".to_string();
+        let a = GeminiAdapter::new(
+            cfg,
+            Arc::new(InMemoryCredentials::with("gemini-api-key", KEY)),
+            Budget {
+                ledger: Arc::new(Ledger::new(1)),
+                pricing: PRICING,
+            },
+        )
+        .unwrap();
+        for built in [
+            a.models_request(KEY).unwrap().build().unwrap(),
+            a.post_request("/v1beta/x", KEY, b"{}".to_vec())
+                .unwrap()
+                .build()
+                .unwrap(),
+        ] {
+            assert!(built
+                .headers()
+                .get("x-goog-api-key")
+                .unwrap()
+                .is_sensitive());
+            let shown = format!("{built:?} {:?}", built.headers());
+            assert!(!shown.contains(KEY), "{shown}");
+        }
+    }
+
+    /// A redirect would replay the key header and the prompt body to wherever it points: the client must not follow one.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_so_the_key_and_prompt_go_nowhere_else() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&elsewhere)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", elsewhere.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let (a, _ledger) = adapter(&origin, 10_000_000);
+        assert!(
+            a.call(&text("a private prompt")).await.is_err(),
+            "a 307 is not a success"
+        );
+        assert_eq!(origin.received_requests().await.unwrap().len(), 1);
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "the redirect target must receive nothing"
+        );
     }
 
     #[tokio::test]
