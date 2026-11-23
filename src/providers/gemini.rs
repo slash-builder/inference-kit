@@ -1245,6 +1245,19 @@ mod tests {
         assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
     }
 
+    #[tokio::test]
+    async fn a_redirect_is_an_error_and_the_prompt_never_reaches_the_other_origin() {
+        use super::super::test_support::{received, redirector_and_trap};
+        for status in [301u16, 302, 307, 308] {
+            let (redirector, trap) = redirector_and_trap(status).await;
+            let (a, _) = adapter(&redirector, 10_000_000);
+            assert!(a.call(&text("a private prompt")).await.is_err(), "{status}");
+            assert_eq!(received(&trap).await, 0, "{status}");
+            assert!(a.discover_models("2026-01-01").await.is_err(), "{status}");
+            assert_eq!(received(&trap).await, 0, "{status}");
+        }
+    }
+
     fn gemini_at(
         base: &str,
         creds: Arc<dyn CredentialSource>,

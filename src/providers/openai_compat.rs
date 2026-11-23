@@ -72,6 +72,8 @@ impl OpenAiCompatConfig {
 pub struct OpenAiCompatAdapter {
     info: ProviderInfo,
     cfg: OpenAiCompatConfig,
+    /// The base URL as parsed once, when the adapter was built; the only form requests are built from.
+    base: reqwest::Url,
     creds: Option<Arc<dyn CredentialSource>>,
     budget: Option<Budget>,
     http: reqwest::Client,
@@ -93,35 +95,143 @@ struct PostFailure {
     maybe_billed: bool,
 }
 
-fn host_of(url: &str) -> Option<String> {
-    let rest = url.split("://").nth(1)?;
-    let authority = rest.split('/').next()?;
-    let authority = authority.rsplit('@').next()?;
-    // [::1]:11434, 127.0.0.1:11434, localhost:11434, host
-    let host = if let Some(stripped) = authority.strip_prefix('[') {
-        stripped.split(']').next()?
+/// Parse the base URL **once**, with the parser that connects (WHATWG, via `reqwest::Url`). Everything after this reads the parsed `Url`:
+/// the locality check, the shape check and every request URL (see [`OpenAiCompatAdapter::url`]). A hand-written splitter disagrees with the
+/// connecting parser on `#`, `?` and `\\`, and a disagreement is a way to make a remote host pass as loopback; so is parsing the string a
+/// second time when a request is built.
+fn parse_base(base_url: &str) -> Result<reqwest::Url, ConfigError> {
+    reqwest::Url::parse(base_url).map_err(|_| ConfigError::BadUrl)
+}
+
+/// The host of a parsed base URL, lower-cased, with no brackets around an IPv6 literal. The parser has already normalised numeric hosts
+/// (`127.1`, `2130706433`, `0x7f.1`) to dotted-quad form, decoded percent-escapes and mapped IDN names to their ASCII form.
+fn host_of(u: &reqwest::Url) -> Result<String, ConfigError> {
+    let host = u.host_str().ok_or(ConfigError::BadUrl)?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    Ok(host.to_ascii_lowercase())
+}
+
+/// Only http(s), and no user-info, query or fragment: none has a use in a base URL, and each is a way to confuse a reader of the URL about
+/// where the request goes.
+fn check_shape(u: &reqwest::Url) -> Result<(), ConfigError> {
+    let plain = matches!(u.scheme(), "http" | "https")
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.query().is_none()
+        && u.fragment().is_none();
+    if plain {
+        Ok(())
     } else {
-        authority.split(':').next()?
-    };
-    (!host.is_empty()).then(|| host.to_string())
+        Err(ConfigError::BadUrl)
+    }
 }
 
 fn is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
+    // one trailing dot is the root label (`localhost.`); `localhost..` is not a name that resolves, so it is not accepted
+    host.strip_suffix('.').unwrap_or(host) == "localhost"
         || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Is this address one the household owns: private (RFC 1918), unique-local (fc00::/7) or loopback? 169.254.0.0/16 (link-local, which
+/// includes the cloud metadata address) is not: it is refused, not trusted. Nor is 100.64.0.0/10 (carrier-grade NAT); that is how it was
+/// before, and it is not changed here.
+fn ip_is_home(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
 }
 
 fn is_private(host: &str) -> bool {
     match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-        Ok(IpAddr::V6(v6)) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
-        // a name: only the usual home-network suffixes count as the household
+        Ok(ip) => ip_is_home(ip),
+        // a name: only the usual home-network suffixes count as the household. This is a claim about the name, not about where it points:
+        // the address is checked when the name is resolved to connect (see [`ClassResolver`]).
         Err(_) => {
-            host.eq_ignore_ascii_case("localhost")
-                || host.ends_with(".local")
-                || host.ends_with(".lan")
-                || host.ends_with(".home.arpa")
+            let d = host.strip_suffix('.').unwrap_or(host);
+            d == "localhost"
+                || d.ends_with(".local")
+                || d.ends_with(".lan")
+                || d.ends_with(".home.arpa")
         }
+    }
+}
+
+/// Which addresses a Device or Home provider's name may resolve to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddrClass {
+    /// Device: loopback only.
+    Loopback,
+    /// Home: private, unique-local or loopback (see [`ip_is_home`]).
+    Home,
+}
+
+impl AddrClass {
+    /// The class a provider of this locality is held to; a remote provider is held to none (it is meant to leave the home).
+    fn of(locality: Locality) -> Option<Self> {
+        match locality {
+            Locality::Device => Some(AddrClass::Loopback),
+            Locality::Home => Some(AddrClass::Home),
+            _ => None,
+        }
+    }
+
+    fn allows(self, ip: IpAddr) -> bool {
+        match self {
+            AddrClass::Loopback => ip.is_loopback(),
+            AddrClass::Home => ip_is_home(ip),
+        }
+    }
+}
+
+/// How a host name is turned into addresses. The system resolver in production; tests substitute their own so no real DNS is involved.
+type Lookup = Arc<dyn Fn(&str) -> std::io::Result<Vec<IpAddr>> + Send + Sync>;
+
+fn system_lookup() -> Lookup {
+    Arc::new(|host: &str| {
+        use std::net::ToSocketAddrs;
+        (host, 0u16)
+            .to_socket_addrs()
+            .map(|it| it.map(|a| a.ip()).collect())
+    })
+}
+
+/// The DNS resolver of a Device or Home client. A name that merely ends in `.lan` or `.local` (or is `localhost.`, which some resolvers do
+/// not answer from the hosts file) says nothing about where it points, so the classification of the name is **not trusted**: the name is
+/// resolved here, at connect time, and **every** address it resolves to must be in the allowed class, or the connection is refused. There is
+/// no resolution at construction, so there is no window between a check and a use for DNS to change in (no rebinding), and a name with a
+/// mixed answer is refused, not tried address by address. A host given as an IP literal never reaches the resolver; it was classified as
+/// written.
+struct ClassResolver {
+    class: AddrClass,
+    lookup: Lookup,
+}
+
+impl reqwest::dns::Resolve for ClassResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let (class, lookup) = (self.class, self.lookup.clone());
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let ips = tokio::task::spawn_blocking(move || lookup(&host))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??;
+            if ips.is_empty() || !ips.iter().all(|ip| class.allows(*ip)) {
+                // the addresses are not in the message: only the fact that the name does not stay where it was declared to
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the name does not resolve to an address in the provider's locality",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let addrs: Vec<std::net::SocketAddr> = ips
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, 0))
+                .collect();
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
@@ -144,6 +254,17 @@ impl OpenAiCompatAdapter {
         budget: Option<Budget>,
         tweak: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
     ) -> Result<Self, ConfigError> {
+        Self::build_with_lookup(cfg, creds, budget, system_lookup(), tweak)
+    }
+
+    /// `build`, with the function that resolves host names (tests give a fake one, so no real DNS is involved).
+    fn build_with_lookup(
+        cfg: OpenAiCompatConfig,
+        creds: Option<Arc<dyn CredentialSource>>,
+        budget: Option<Budget>,
+        lookup: Lookup,
+        tweak: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    ) -> Result<Self, ConfigError> {
         let mut kinds = vec![RequestKind::TextGeneration];
         if cfg.embedding_model.is_some() {
             kinds.push(RequestKind::Embedding);
@@ -153,7 +274,8 @@ impl OpenAiCompatAdapter {
                 b.validate(&kinds)?;
             }
         }
-        let host = host_of(&cfg.base_url).ok_or(ConfigError::BadUrl)?;
+        let base = parse_base(&cfg.base_url)?;
+        let host = host_of(&base)?;
         match cfg.locality {
             Locality::Device if !is_loopback(&host) => {
                 return Err(ConfigError::DeviceMustBeLoopback)
@@ -172,11 +294,21 @@ impl OpenAiCompatAdapter {
             }
             _ => {}
         }
+        // after the locality check, so a host hidden behind user-info is reported as the wrong place, not just as a malformed URL
+        check_shape(&base)?;
         if let (Some(name), Some(c)) = (&cfg.credential_name, &creds) {
             c.get(name)
                 .map_err(|_| ConfigError::CredentialUnavailable)?;
         }
-        let http = tweak(super::http_builder(cfg.timeout, cfg.connect_timeout))
+        let mut builder = super::http_builder(cfg.timeout, cfg.connect_timeout);
+        if let Some(class) = AddrClass::of(cfg.locality) {
+            // a Device or Home provider must be reached directly: an `HTTP(S)_PROXY` in the environment would otherwise carry household
+            // content off the machine while the locality check had passed
+            builder = builder.no_proxy();
+            // and the name must really point where the locality says, checked when it is resolved to connect
+            builder = builder.dns_resolver(Arc::new(ClassResolver { class, lookup }));
+        }
+        let http = tweak(builder)
             .build()
             .map_err(|_| ConfigError::HttpClient)?;
         Ok(Self {
@@ -186,14 +318,20 @@ impl OpenAiCompatAdapter {
                 kinds,
             },
             cfg,
+            base,
             creds,
             budget,
             http,
         })
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.cfg.base_url.trim_end_matches('/'), path)
+    /// The URL of an endpoint, derived from the base URL that was parsed and classified when the adapter was built: the scheme, host and
+    /// port are the ones the locality check saw, and only the path is added. The base string is never parsed a second time.
+    fn url(&self, path: &str) -> reqwest::Url {
+        let mut u = self.base.clone();
+        let full = format!("{}{}", u.path().trim_end_matches('/'), path);
+        u.set_path(&full);
+        u
     }
 
     fn auth(&self) -> Result<Option<String>, ProviderError> {
@@ -1395,6 +1533,374 @@ mod tests {
         assert_eq!((ledger.spent(), ledger.available()), (0, 10_000_000));
     }
 
+    // ---- the locality check must agree with the URL parser that actually connects ----
+
+    /// Build a Device or Home adapter and also report which host the HTTP client will really connect to.
+    fn locality_of(url: &str, loc: Locality) -> (Option<ConfigError>, Option<String>) {
+        let mut c = OpenAiCompatConfig::ollama("m");
+        c.base_url = url.into();
+        c.locality = loc;
+        let real_host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string));
+        (OpenAiCompatAdapter::new(c, None, None).err(), real_host)
+    }
+
+    #[test]
+    fn a_url_that_hides_a_remote_host_behind_a_loopback_lookalike_is_not_device() {
+        for url in [
+            // '#', '?' and '\' end the authority for the parser reqwest uses, so the host is the remote one
+            "http://remote.example#@127.0.0.1",
+            "http://remote.example?x=@127.0.0.1",
+            "http://remote.example\\@127.0.0.1/",
+            "http://remote.example#@[::1]:11434",
+        ] {
+            let (err, real_host) = locality_of(url, Locality::Device);
+            assert_eq!(
+                real_host.as_deref(),
+                Some("remote.example"),
+                "premise: reqwest connects to the remote host for {url}"
+            );
+            assert_eq!(
+                err,
+                Some(ConfigError::DeviceMustBeLoopback),
+                "{url} must not pass as a Device (loopback) provider"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_that_hides_a_public_host_behind_a_private_lookalike_is_not_home() {
+        let (err, real_host) = locality_of("http://8.8.8.8#@192.168.0.10", Locality::Home);
+        assert_eq!(real_host.as_deref(), Some("8.8.8.8"));
+        assert_eq!(err, Some(ConfigError::HomeMustBePrivate));
+    }
+
+    #[test]
+    fn a_base_url_with_user_info_a_query_a_fragment_or_a_foreign_scheme_is_refused() {
+        for url in [
+            "http://user:pw@127.0.0.1:11434",
+            "http://127.0.0.1:11434/?token=x",
+            "http://127.0.0.1:11434/#frag",
+            "ftp://127.0.0.1/",
+            "file:///etc/hosts",
+        ] {
+            let (err, _) = locality_of(url, Locality::Device);
+            assert_eq!(err, Some(ConfigError::BadUrl), "{url}");
+        }
+    }
+
+    #[test]
+    fn hosts_are_classified_from_the_parsed_host() {
+        // every spelling the URL parser resolves to loopback is loopback, and nothing else is
+        for url in [
+            "http://127.0.0.1:1",
+            "http://127.1:1",
+            "http://2130706433:1",
+            "http://LOCALHOST:1",
+            "http://localhost.:1",
+            "http://[::1]:1",
+        ] {
+            assert_eq!(locality_of(url, Locality::Device).0, None, "{url}");
+        }
+        for url in [
+            "http://127.0.0.1.evil.example",
+            "http://[::2]:1",
+            "http://localhost..:1",
+        ] {
+            assert_eq!(
+                locality_of(url, Locality::Device).0,
+                Some(ConfigError::DeviceMustBeLoopback),
+                "{url}"
+            );
+        }
+    }
+
+    // ---- no redirects, no proxy, one parse ----
+
+    #[tokio::test]
+    async fn a_redirect_is_an_error_and_the_prompt_never_reaches_the_other_origin() {
+        use super::super::test_support::{received, redirector_and_trap};
+        for status in [301u16, 302, 303, 307, 308] {
+            for locality in [Locality::Device, Locality::Home, Locality::Saas] {
+                let (redirector, trap) = redirector_and_trap(status).await;
+                let a = if locality == Locality::Saas {
+                    saas(
+                        &redirector,
+                        &Arc::new(Ledger::new(10_000_000)),
+                        PAID,
+                        Duration::from_secs(5),
+                    )
+                    .unwrap()
+                } else {
+                    let mut c = cfg(&redirector);
+                    c.locality = locality;
+                    OpenAiCompatAdapter::new(c, None, None).unwrap()
+                };
+                assert!(
+                    a.call(&text("a private prompt")).await.is_err(),
+                    "{status} {locality:?}: a redirect is not a reply"
+                );
+                assert_eq!(
+                    received(&trap).await,
+                    0,
+                    "{status} {locality:?}: nothing may be delivered to the redirect target"
+                );
+                assert_eq!(
+                    received(&redirector).await,
+                    1,
+                    "{status} {locality:?}: not retried either"
+                );
+                assert!(
+                    !a.health().await,
+                    "{status} {locality:?}: a model listing is not redirected either"
+                );
+                assert_eq!(received(&trap).await, 0);
+            }
+        }
+    }
+
+    /// The proxy test runs the real adapter in a child process, so the proxy variables are the child's own and no other test can see them
+    /// (changing the environment of a running test binary is a data race). The parent starts a listener that stands in for the proxy.
+    const PROXY_TEST: &str = "providers::openai_compat::tests::a_device_or_home_provider_ignores_a_proxy_in_the_environment";
+
+    #[tokio::test]
+    async fn a_device_or_home_provider_ignores_a_proxy_in_the_environment() {
+        match std::env::var("IK_PROXY_TEST_ROLE").as_deref() {
+            Ok("control") => {
+                // proves the child's environment really does send a plain client to the proxy
+                let s = MockServer::start().await;
+                serve(&s, 200, chat_ok("x", "stop")).await;
+                let _ = reqwest::Client::new().post(s.uri()).send().await;
+                return;
+            }
+            Ok("saas") => {
+                // a remote provider is not forced direct: it honours the environment's proxy like any client
+                let s = MockServer::start().await;
+                serve(&s, 200, chat_ok("x", "stop")).await;
+                let mut c = cfg(&s);
+                c.locality = Locality::Saas;
+                c.credential_name = Some("key".into());
+                let a = OpenAiCompatAdapter::new(
+                    c,
+                    Some(Arc::new(InMemoryCredentials::with("key", "sk-test"))),
+                    Some(Budget {
+                        ledger: Arc::new(Ledger::new(10_000_000)),
+                        pricing: PAID,
+                    }),
+                )
+                .unwrap();
+                let _ = a.call(&text("hi")).await;
+                return;
+            }
+            Ok("adapters") => {
+                let s = MockServer::start().await;
+                serve(&s, 200, chat_ok("direct", "stop")).await;
+                for locality in [Locality::Device, Locality::Home] {
+                    let mut c = cfg(&s);
+                    c.locality = locality;
+                    // the real constructor: nothing is tweaked
+                    let a = OpenAiCompatAdapter::new(c, None, None).unwrap();
+                    assert!(
+                        a.call(&text("hi")).await.is_ok(),
+                        "{locality:?} must reach the server directly"
+                    );
+                }
+                return;
+            }
+            _ => {}
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen_t, stop_t) = (seen.clone(), stop.clone());
+        let addr = listener.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if stop_t.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                if conn.is_ok() {
+                    seen_t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        let run = |role: &str| {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", PROXY_TEST, "--nocapture", "--test-threads=1"])
+                .env("IK_PROXY_TEST_ROLE", role)
+                .env("HTTP_PROXY", &proxy)
+                .env("http_proxy", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env("all_proxy", &proxy)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .output()
+                .unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        };
+        let (control_ok, _) = run("control");
+        let via_proxy = seen.swap(0, std::sync::atomic::Ordering::SeqCst);
+        let (adapters_ok, log) = run("adapters");
+        let adapters_via_proxy = seen.swap(0, std::sync::atomic::Ordering::SeqCst);
+        let (saas_ok, _) = run("saas");
+        let saas_via_proxy = seen.load(std::sync::atomic::Ordering::SeqCst);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
+        t.join().unwrap();
+        assert!(control_ok && saas_ok);
+        assert!(
+            saas_via_proxy > 0,
+            "a SaaS provider is not forced direct: it still goes through the environment's proxy"
+        );
+        assert!(
+            via_proxy > 0,
+            "control: a plain client in that environment does use the proxy, so the test can tell"
+        );
+        assert_eq!(
+            adapters_via_proxy, 0,
+            "Device and Home must not use the proxy"
+        );
+        assert!(
+            adapters_ok,
+            "the child's calls must succeed directly: {log}"
+        );
+    }
+
+    fn adapter_at(url: &str, locality: Locality) -> Result<OpenAiCompatAdapter, ConfigError> {
+        let mut c = OpenAiCompatConfig::ollama("m");
+        c.base_url = url.into();
+        c.locality = locality;
+        OpenAiCompatAdapter::new(c, None, None)
+    }
+
+    #[test]
+    fn request_urls_are_built_from_the_one_parsed_base() {
+        let url = |base: &str, path: &str| {
+            adapter_at(base, Locality::Device)
+                .unwrap()
+                .url(path)
+                .to_string()
+        };
+        assert_eq!(
+            url("http://127.0.0.1:11434", "/v1/models"),
+            "http://127.0.0.1:11434/v1/models"
+        );
+        assert_eq!(
+            url("http://127.0.0.1:11434/", "/v1/models"),
+            "http://127.0.0.1:11434/v1/models"
+        );
+        assert_eq!(
+            url("http://localhost:8080/api/", "/v1/embeddings"),
+            "http://localhost:8080/api/v1/embeddings"
+        );
+        // a spelling the parser normalises is requested in its normal form: the host that was classified is the host that is connected to
+        assert_eq!(
+            url("http://0x7f.1:9", "/v1/models"),
+            "http://127.0.0.1:9/v1/models"
+        );
+        assert_eq!(
+            url("http://LocalHost.:9", "/v1/models"),
+            "http://localhost.:9/v1/models"
+        );
+    }
+
+    /// Every URL the constructor accepts, parsed again the way the client parses a request URL, must have the host the check classified.
+    #[test]
+    fn what_is_checked_is_what_is_requested() {
+        let device = [
+            "http://127.0.0.1:1",
+            "http://0x7f.1:1",
+            "http://%31%32%37.0.0.1:1",
+            "http://127.1:1",
+            "http://2130706433:1",
+            "http://[::1]:1",
+            "http://LocalHost.:1",
+            // full-width letters: the parser maps the name to ASCII `localhost`
+            "http://\u{ff4c}\u{ff4f}\u{ff43}\u{ff41}\u{ff4c}\u{ff48}\u{ff4f}\u{ff53}\u{ff54}:1",
+        ];
+        let home = [
+            "http://nas.lan.:1",
+            "http://NAS.LAN:1",
+            "http://nas.home.arpa.:1",
+            "http://studio.local:1",
+            "http://192.168.0.10:1",
+            "http://10.0.0.5:1",
+        ];
+        for (urls, locality) in [(&device[..], Locality::Device), (&home[..], Locality::Home)] {
+            for u in urls {
+                let a = adapter_at(u, locality).unwrap_or_else(|e| panic!("{u}: {e}"));
+                let request = a.url("/v1/models");
+                let again = reqwest::Url::parse(request.as_str()).unwrap();
+                let host = host_of(&again).unwrap();
+                assert_eq!(
+                    request, again,
+                    "{u}: the request URL survives a second parse unchanged"
+                );
+                assert_eq!(host_of(&a.base).unwrap(), host, "{u}");
+                let ok = match locality {
+                    Locality::Device => is_loopback(&host),
+                    _ => is_private(&host),
+                };
+                assert!(
+                    ok,
+                    "{u}: the host that is requested ({host}) is the one that was classified"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spellings_that_are_not_what_they_look_like_are_refused() {
+        // a mapped IPv6 address is loopback to the connecting stack but is refused here: fail closed, spell it `127.0.0.1`
+        for u in [
+            "http://[::ffff:127.0.0.1]:1",
+            // Cyrillic `o`: a different name, not `localhost`
+            "http://l\u{43e}calhost:1",
+            "http://l%6Fcalhost.evil.example:1",
+            "http://127.0.0.1%2eevil.example:1",
+            "http://localhost..:1",
+        ] {
+            assert!(
+                adapter_at(u, Locality::Device).is_err(),
+                "{u} must not be a Device"
+            );
+        }
+        for u in [
+            "http://nas.lan..:1",
+            "http://lan.:1",
+            "http://nas.lan.evil.example:1",
+            "http://[::ffff:192.168.0.10]:1",
+            "http://8.8.8.8:1",
+        ] {
+            assert!(
+                adapter_at(u, Locality::Home).is_err(),
+                "{u} must not be Home"
+            );
+        }
+    }
+
+    #[test]
+    fn link_local_addresses_are_not_home() {
+        // 169.254.0.0/16 includes the cloud metadata address; it is not a household machine
+        for u in [
+            "http://169.254.169.254:1",
+            "http://169.254.1.1:1",
+            "http://[fe80::1]:1",
+        ] {
+            assert_eq!(
+                adapter_at(u, Locality::Home).err(),
+                Some(ConfigError::HomeMustBePrivate),
+                "{u}"
+            );
+        }
+        assert!(adapter_at("http://172.16.0.1:1", Locality::Home).is_ok());
+    }
+
     fn saas_at(
         base: &str,
         creds: Arc<dyn CredentialSource>,
@@ -1590,5 +2096,295 @@ mod tests {
             OpenAiCompatConfig::ollama("m").connect_timeout,
             Duration::from_secs(10)
         );
+    }
+
+    // ---- names are checked where they resolve, at connect time ----
+
+    fn fake_lookup(
+        table: &'static [(&'static str, &'static [&'static str])],
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Lookup {
+        let calls = calls.clone();
+        Arc::new(move |host: &str| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match table.iter().find(|(n, _)| *n == host) {
+                Some((_, ips)) => Ok(ips.iter().map(|i| i.parse().unwrap()).collect()),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such name",
+                )),
+            }
+        })
+    }
+
+    /// An adapter of the real constructor path, only with the resolver's name lookup replaced.
+    fn named(
+        host: &str,
+        server: &MockServer,
+        locality: Locality,
+        lookup: Lookup,
+    ) -> OpenAiCompatAdapter {
+        let mut c = OpenAiCompatConfig::ollama("m");
+        c.locality = locality;
+        c.base_url = format!("http://{host}:{}", server.address().port());
+        c.timeout = Duration::from_secs(5);
+        OpenAiCompatAdapter::build_with_lookup(c, None, None, lookup, |b| b).unwrap()
+    }
+
+    async fn answers(s: &MockServer) {
+        serve(s, 200, chat_ok("ok", "stop")).await;
+    }
+
+    #[tokio::test]
+    async fn a_home_name_that_resolves_to_a_private_address_is_used() {
+        static T: &[(&str, &[&str])] = &[
+            ("nas.lan", &["127.0.0.1"]),
+            ("nas.lan.", &["127.0.0.1"]),
+            ("x.local.", &["::1"]),
+        ];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = MockServer::start().await;
+        answers(&s).await;
+        for host in ["nas.lan", "nas.lan."] {
+            let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+            let a = named(host, &s, Locality::Home, fake_lookup(T, &calls));
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "no lookup at construction"
+            );
+            assert!(a.call(&text("hi")).await.is_ok(), "{host}");
+        }
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "resolved when connecting"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_resolves_outside_the_locality_is_refused_and_nothing_is_sent() {
+        // `evil.lan` and `x.local.` pass the name check; where they point decides
+        static T: &[(&str, &[&str])] = &[
+            ("evil.lan", &["8.8.8.8"]),
+            ("x.local.", &["2606:4700::1111"]),
+            ("mixed.lan", &["127.0.0.1", "8.8.8.8"]),
+            ("mixed6.lan", &["::1", "2606:4700::1111"]),
+            ("meta.lan", &["169.254.169.254"]),
+            ("empty.lan", &[]),
+            ("localhost.", &["93.184.216.34"]),
+            ("lan-for-device.lan", &["192.168.1.5"]),
+        ];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // a server that is reachable on loopback: a mixed answer must be refused even though one address would have worked
+        let s = MockServer::start().await;
+        answers(&s).await;
+        for host in [
+            "evil.lan",
+            "x.local.",
+            "mixed.lan",
+            "mixed6.lan",
+            "meta.lan",
+            "empty.lan",
+            "unknown.lan",
+        ] {
+            let a = named(host, &s, Locality::Home, fake_lookup(T, &calls));
+            assert_eq!(
+                a.call(&text("hi")).await.unwrap_err(),
+                ProviderError::Unavailable,
+                "{host}"
+            );
+        }
+        // Device: loopback only. `localhost.` that does not resolve to loopback, and a private (non-loopback) answer, are refused
+        for host in ["localhost.", "lan-for-device.lan"] {
+            // (the second needs a Device name; the name check is by the base URL, so use the one that is accepted for Device)
+            let name = if host == "localhost." {
+                host
+            } else {
+                "localhost"
+            };
+            static D: &[(&str, &[&str])] = &[
+                ("localhost", &["192.168.1.5"]),
+                ("localhost.", &["93.184.216.34"]),
+            ];
+            let a = named(name, &s, Locality::Device, fake_lookup(D, &calls));
+            assert_eq!(
+                a.call(&text("hi")).await.unwrap_err(),
+                ProviderError::Unavailable,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            s.received_requests().await.unwrap().len(),
+            0,
+            "nothing was sent to anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_name_that_resolves_to_loopback_is_used() {
+        static T: &[(&str, &[&str])] = &[("localhost.", &["127.0.0.1", "::1"])];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = MockServer::start().await;
+        answers(&s).await;
+        let a = named("localhost.", &s, Locality::Device, fake_lookup(T, &calls));
+        assert!(a.call(&text("hi")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_ip_literal_host_never_reaches_the_resolver() {
+        static T: &[(&str, &[&str])] = &[];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = MockServer::start().await;
+        answers(&s).await;
+        for locality in [Locality::Device, Locality::Home] {
+            let a = named("127.0.0.1", &s, locality, fake_lookup(T, &calls));
+            assert!(a.call(&text("hi")).await.is_ok());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_remote_provider_resolves_names_normally() {
+        // the class resolver is for Device and Home only: a SaaS name is not subject to it
+        static T: &[(&str, &[&str])] = &[];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = MockServer::start().await;
+        answers(&s).await;
+        let mut c = cfg(&s);
+        c.locality = Locality::Saas;
+        c.credential_name = Some("key".into());
+        c.base_url = format!("http://localhost:{}", s.address().port());
+        let a = OpenAiCompatAdapter::build_with_lookup(
+            c,
+            Some(Arc::new(InMemoryCredentials::with("key", "sk-test"))),
+            Some(Budget {
+                ledger: Arc::new(Ledger::new(10_000_000)),
+                pricing: PAID,
+            }),
+            fake_lookup(T, &calls),
+            |b| b.no_proxy(),
+        )
+        .unwrap();
+        assert!(a.call(&text("hi")).await.is_ok());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the fake lookup is not installed for a remote provider"
+        );
+    }
+
+    #[test]
+    fn unique_local_addresses_are_home_and_nothing_else_near_them_is() {
+        for u in [
+            "http://[fd00::1]:1",
+            "http://[fc00::1]:1",
+            "http://[fdff:ffff::1]:1",
+        ] {
+            assert!(adapter_at(u, Locality::Home).is_ok(), "{u}");
+        }
+        for u in [
+            "http://[fe00::1]:1",
+            "http://[fb00::1]:1",
+            "http://[fe80::1]:1",
+            "http://[2001:db8::1]:1",
+            "http://100.64.0.1:1",
+        ] {
+            assert_eq!(
+                adapter_at(u, Locality::Home).err(),
+                Some(ConfigError::HomeMustBePrivate),
+                "{u}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_name_alone_or_a_password_alone_is_refused() {
+        for u in [
+            "http://user@127.0.0.1:1",
+            "http://:secret@127.0.0.1:1",
+            "http://user:@127.0.0.1:1",
+        ] {
+            assert_eq!(
+                adapter_at(u, Locality::Device).err(),
+                Some(ConfigError::BadUrl),
+                "{u}"
+            );
+        }
+    }
+
+    /// What the resolver itself says about a name, without connecting anywhere (so private, non-loopback answers can be tried).
+    async fn resolved(
+        class: AddrClass,
+        name: &str,
+        ips: &'static [&'static str],
+    ) -> Result<Vec<IpAddr>, String> {
+        use reqwest::dns::Resolve;
+        let lookup: Lookup =
+            Arc::new(move |_| Ok(ips.iter().map(|i| i.parse().unwrap()).collect()));
+        let r = ClassResolver { class, lookup };
+        r.resolve(name.parse().unwrap())
+            .await
+            .map(|addrs| addrs.map(|a| a.ip()).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn the_resolver_allows_exactly_the_class_of_the_locality() {
+        // Home: private, unique-local, loopback
+        for ips in [
+            &["192.168.1.5"][..],
+            &["10.0.0.1", "172.16.0.9"],
+            &["fd00::1"],
+            &["fc00::1", "127.0.0.1"],
+        ] {
+            let ips: &'static [&'static str] = Box::leak(ips.to_vec().into_boxed_slice());
+            assert!(
+                resolved(AddrClass::Home, "nas.lan", ips).await.is_ok(),
+                "{ips:?}"
+            );
+        }
+        // Device: loopback only, so a private address is refused for it (and one non-loopback address anywhere refuses the whole answer)
+        assert!(
+            resolved(AddrClass::Loopback, "localhost.", &["127.0.0.1", "::1"])
+                .await
+                .is_ok()
+        );
+        for ips in [
+            &["192.168.1.5"][..],
+            &["127.0.0.1", "192.168.1.5"],
+            &["fd00::1"],
+            &[],
+        ] {
+            let ips: &'static [&'static str] = Box::leak(ips.to_vec().into_boxed_slice());
+            assert!(
+                resolved(AddrClass::Loopback, "localhost.", ips)
+                    .await
+                    .is_err(),
+                "{ips:?}"
+            );
+        }
+        // Home still refuses public, link-local and CGNAT answers
+        for ips in [
+            &["8.8.8.8"][..],
+            &["169.254.169.254"],
+            &["100.64.0.1"],
+            &["fe80::1"],
+            &["192.168.1.5", "1.1.1.1"],
+            &[],
+        ] {
+            let ips: &'static [&'static str] = Box::leak(ips.to_vec().into_boxed_slice());
+            assert!(
+                resolved(AddrClass::Home, "nas.lan", ips).await.is_err(),
+                "{ips:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_locality_is_held_to_its_own_class() {
+        assert_eq!(AddrClass::of(Locality::Device), Some(AddrClass::Loopback));
+        assert_eq!(AddrClass::of(Locality::Home), Some(AddrClass::Home));
+        assert_eq!(AddrClass::of(Locality::Saas), None);
+        assert_eq!(AddrClass::of(Locality::Unspecified), None);
     }
 }

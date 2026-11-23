@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Provider adapters never follow an HTTP redirect.** A 3xx answer is an error: a 307 or 308 would otherwise replay the request body (the prompt) to an origin that was never configured, classified or audited. Applies to all three adapters and every locality.
+- **OpenAI-compatible adapter: the base URL is parsed once and classified from that parse.** The locality check uses the same parser that connects (`reqwest::Url`), and requests are built from the parsed URL. `OpenAiCompatAdapter::new` now returns `ConfigError::BadUrl` for a base URL with a scheme other than http(s), user-info, a query or a fragment.
+  A `Device` or `Home` provider bypasses any `HTTP(S)_PROXY` in the environment. `Home` no longer accepts 169.254.0.0/16 (link-local, which includes the cloud metadata address). A trailing dot (`localhost.`, `nas.lan.`) is accepted once.
+  A `Device` or `Home` provider that is given a host **name** resolves it at connect time with its own DNS resolver and refuses the connection unless every address the name resolves to is loopback (`Device`) or private, unique-local or loopback (`Home`); a name under `.lan`, `.local` or `.home.arpa` is no longer trusted for its suffix alone. Nothing is resolved at construction. IP-literal hosts are classified as written. 100.64.0.0/10 (carrier-grade NAT) is not Home, as before.
 - **Breaking (remote provider adapters, `provider-*` features): the spend ledger fails closed.** A call whose cost is unknown is charged its reserved worst case, never zero: a 200 whose usage is missing or incomplete
   (all three adapters; Gemini's blocked prompt, which has no candidates, is the one exception and is charged for the prompt only), a timeout or a broken reply after the request was sent, and an HTTP 408, 502 or 504 (what a gateway
   says when it gave up on a call the vendor may have finished). Released at no charge: a connection that was never made (including one that hit the connect timeout), a request that could not be built, a credential that could not be read,
