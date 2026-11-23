@@ -475,19 +475,37 @@ impl ai_kit::InferenceService for CommandCloud {
 /// new name rather than followed.
 #[cfg(feature = "candle")]
 fn private_scratch_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
+    scratch_dir_named(base, || scratch_name_at(nanos))
+}
+
+/// A directory name that differs from every other one this process hands out, even for the same `nanos` (the counter does that).
+#[cfg(feature = "candle")]
+fn scratch_name_at(nanos: u128) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "ak-verify-{}-{nanos:x}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// How many names are tried before giving up.
+#[cfg(feature = "candle")]
+const SCRATCH_ATTEMPTS: usize = 16;
+
+/// Create a private directory under `base`, asking `next_name` for a name and asking again whenever it is taken.
+#[cfg(feature = "candle")]
+fn scratch_dir_named(
+    base: &std::path::Path,
+    mut next_name: impl FnMut() -> String,
+) -> std::io::Result<std::path::PathBuf> {
     let mut last = None;
-    for _ in 0..16 {
-        let name = format!(
-            "ak-verify-{}-{nanos:x}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        );
-        let dir = base.join(name);
+    for _ in 0..SCRATCH_ATTEMPTS {
+        let dir = base.join(next_name());
         match create_private_dir(&dir) {
             Ok(()) => return Ok(dir),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
@@ -510,6 +528,7 @@ fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Removes a scratch directory (and what is in it) when dropped, so no exit path of the verifier can leave it behind.
+/// (A SIGINT or SIGKILL of the CLI skips destructors, so the directory is then left behind. It is empty unless the script wrote there.)
 #[cfg(feature = "candle")]
 struct ScratchDir(std::path::PathBuf);
 
@@ -520,33 +539,78 @@ impl Drop for ScratchDir {
     }
 }
 
-/// Write `contents` to a new file `name` in `dir`: created exclusively (it must not already exist), mode 0600 on Unix.
+/// How long the `exec` verifier lets the script run.
 #[cfg(feature = "candle")]
-fn write_private_file(
-    dir: &std::path::Path,
-    name: &str,
-    contents: &str,
-) -> std::io::Result<std::path::PathBuf> {
+const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `program` with `interpreter -` (the program on its standard input) in a fresh private directory under `base`, and say whether it
+/// exited 0 within `timeout`. A program that outlives the timeout is killed and reaped. The directory is removed on every exit path.
+///
+/// The program is **never written to disk**, so there is no file for another user to read, swap or point a symlink at. The directory is
+/// the child's working directory (and so what Python puts first on `sys.path` for `-`): empty and private, so nothing planted in the
+/// caller's directory or in the shared temp directory can be imported by the script.
+#[cfg(feature = "candle")]
+fn run_in_scratch(
+    base: &std::path::Path,
+    interpreter: &str,
+    program: &str,
+    timeout: std::time::Duration,
+) -> bool {
     use std::io::Write;
-    let path = dir.join(name);
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
+    use std::process::Stdio;
+    let Ok(dir) = private_scratch_dir(base).map(ScratchDir) else {
+        return false;
+    };
+    let Ok(mut child) = std::process::Command::new(interpreter)
+        .arg("-")
+        .current_dir(&dir.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    // Written from a thread so a script that never reads its input cannot stall the timeout below. A child that has exited or been
+    // killed closes the pipe, which ends the write with an error that is ignored.
+    let writer = child.stdin.take().map(|mut stdin| {
+        let program = program.to_string();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(program.as_bytes());
+        })
+    });
+    let start = std::time::Instant::now();
+    let ok = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.success(),
+            Ok(None) if start.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                // Kill, then reap so the child is not left as a zombie. Only the direct child is killed: a process it started (a
+                // shell-out, a fork) is not, and keeps running. Not fixed here; see the PR description.
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    if let Some(w) = writer {
+        let _ = w.join();
     }
-    o.open(&path)?.write_all(contents.as_bytes())?;
-    Ok(path)
+    ok
 }
 
 /// `exec` verifier: pull the first ```python block (or the whole answer) out of a completion,
 /// append `tests`, and run it with python3. Passing means exit code 0 within 10 seconds.
 ///
 /// **This runs model-generated code on the host with the caller's full privileges. It is not sandboxed**: no container, no seccomp, no
-/// network or filesystem restriction, no resource limit beyond the 10-second wall-clock kill. The script is kept in a private (0700)
-/// directory with a 0600 file so other local users cannot read or swap it; that protects the file, not the machine. Use it only on a
-/// machine and an account where running arbitrary code from the model is acceptable, never on unreviewed prompts from others.
+/// network or filesystem restriction, no resource limit beyond the 10-second wall-clock kill. The script goes to the interpreter on
+/// its standard input and is never written to disk, and the interpreter runs in a fresh private (0700) directory, so other local users
+/// can neither read nor swap it; that protects the script, not the machine. Because it arrives on standard input, a script that reads
+/// standard input sees end-of-file (it used to inherit the CLI's), and it runs with that empty directory as its working directory
+/// rather than the caller's. Use it only on a machine and an account where running arbitrary code from the model is acceptable, never
+/// on unreviewed prompts from others.
 #[cfg(feature = "candle")]
 fn exec_verifier(tests: String) -> ai_kit::Verifier {
     ai_kit::Verifier::Custom(std::sync::Arc::new(move |out: &str| {
@@ -554,38 +618,12 @@ fn exec_verifier(tests: String) -> ai_kit::Verifier {
             Some(b) => b.strip_prefix("python").unwrap_or(b).to_string(),
             None => out.to_string(),
         };
-        // The guard removes the directory on every exit path: pass, fail, timeout, a failed write or a failed spawn.
-        let Ok(dir) = private_scratch_dir(&std::env::temp_dir()).map(ScratchDir) else {
-            return false;
-        };
-        let Ok(path) = write_private_file(&dir.0, "verify.py", &format!("{code}\n{tests}\n"))
-        else {
-            return false;
-        };
-        let Ok(mut child) = std::process::Command::new("python3")
-            .arg(&path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        else {
-            return false;
-        };
-        let start = std::time::Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break st.success(),
-                Ok(None) if start.elapsed().as_secs() < 10 => {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
-                }
-                _ => {
-                    // Kill, then reap so the child is not left as a zombie. Only the direct child is killed: a process it
-                    // started (a shell-out, a fork) is not, and keeps running. Not fixed here; see the PR description.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break false;
-                }
-            }
-        }
+        run_in_scratch(
+            &std::env::temp_dir(),
+            "python3",
+            &format!("{code}\n{tests}\n"),
+            EXEC_TIMEOUT,
+        )
     }))
 }
 
@@ -1156,45 +1194,17 @@ fn cmd_embed(args: &[String]) -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, MetadataExt};
+    use std::time::Duration;
 
-    #[test]
-    fn the_scratch_dir_is_new_private_and_never_reused() {
-        let base = tempfile::tempdir().unwrap();
-        let a = private_scratch_dir(base.path()).unwrap();
-        let b = private_scratch_dir(base.path()).unwrap();
-        assert_ne!(a, b);
-        assert_eq!(std::fs::metadata(&a).unwrap().mode() & 0o777, 0o700);
-        let f = write_private_file(&a, "verify.py", "print(1)\n").unwrap();
-        assert_eq!(std::fs::metadata(&f).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::read_to_string(&f).unwrap(), "print(1)\n");
-    }
-
-    #[test]
-    fn a_pre_planted_symlink_is_refused_not_followed() {
-        let base = tempfile::tempdir().unwrap();
-        let victim = base.path().join("victim.txt");
-        std::fs::write(&victim, "precious").unwrap();
-        // a symlink where the directory would go: creation must fail rather than follow it
-        let planted = base.path().join("planted");
-        symlink(base.path(), &planted).unwrap();
-        let e = create_private_dir(&planted).unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
-        // and a symlink where the file would go: exclusive creation refuses it
-        let dir = private_scratch_dir(base.path()).unwrap();
-        symlink(&victim, dir.join("verify.py")).unwrap();
-        assert!(write_private_file(&dir, "verify.py", "evil").is_err());
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
-    }
-
-    /// The tests below change `TMPDIR` and `PATH`, which are process-wide, so every test in this module holds this lock (a test
-    /// that only called `tempfile::tempdir()` while another had `TMPDIR` pointed at its own directory would land inside it).
+    /// Every test in this module holds this lock for its whole body. Some change `TMPDIR`, which is process-wide, and any test that
+    /// calls `tempfile::tempdir()` while another has `TMPDIR` pointed at its own directory would land inside that directory and show
+    /// up as a stray entry in its assertions.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Holds the lock, and puts `TMPDIR` / `PATH` back on drop.
+    /// Holds the lock, and puts `TMPDIR` back on drop.
     struct Env {
         _lock: std::sync::MutexGuard<'static, ()>,
         tmpdir: Option<std::ffi::OsString>,
-        path: Option<std::ffi::OsString>,
     }
 
     impl Env {
@@ -1202,18 +1212,15 @@ mod tests {
             Env {
                 _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
                 tmpdir: std::env::var_os("TMPDIR"),
-                path: std::env::var_os("PATH"),
             }
         }
     }
 
     impl Drop for Env {
         fn drop(&mut self) {
-            for (k, v) in [("TMPDIR", &self.tmpdir), ("PATH", &self.path)] {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
+            match &self.tmpdir {
+                Some(v) => std::env::set_var("TMPDIR", v),
+                None => std::env::remove_var("TMPDIR"),
             }
         }
     }
@@ -1226,13 +1233,18 @@ mod tests {
             .is_ok_and(|s| s.success())
     }
 
-    /// True (after saying so) when the test cannot run because there is no `python3`.
+    /// True (after saying so, loudly) when the test cannot run because there is no `python3`. With `CI_REQUIRE_PYTHON3` set that is a
+    /// failure instead, so a CI machine without Python cannot pass these tests by skipping them.
     fn skip_without_python3(test: &str) -> bool {
-        let missing = !python3_on_path();
-        if missing {
-            eprintln!("skipping {test}: python3 is not on PATH");
+        if python3_on_path() {
+            return false;
         }
-        missing
+        assert!(
+            std::env::var_os("CI_REQUIRE_PYTHON3").is_none(),
+            "{test}: python3 is not on PATH and CI_REQUIRE_PYTHON3 is set"
+        );
+        eprintln!("!!!!!! SKIPPED {test}: python3 is not on PATH (set CI_REQUIRE_PYTHON3=1 to make this an error) !!!!!!");
+        true
     }
 
     fn run_exec(tests: &str, out: &str) -> bool {
@@ -1249,6 +1261,85 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    fn is_alive_or_zombie(pid: &str) -> bool {
+        // `kill -0` succeeds for a live process and for a zombie that has not been reaped, and fails once it is gone
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[test]
+    fn the_scratch_dir_is_new_and_private() {
+        let _env = Env::lock();
+        let base = tempfile::tempdir().unwrap();
+        let a = private_scratch_dir(base.path()).unwrap();
+        let b = private_scratch_dir(base.path()).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::metadata(&a).unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn a_name_is_never_handed_out_twice_even_for_the_same_clock_reading() {
+        let _env = Env::lock();
+        let names: std::collections::HashSet<String> =
+            (0..1000).map(|_| scratch_name_at(42)).collect();
+        assert_eq!(names.len(), 1000);
+    }
+
+    #[test]
+    fn a_pre_planted_symlink_is_refused_not_followed() {
+        let _env = Env::lock();
+        let base = tempfile::tempdir().unwrap();
+        let victim = base.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        // a symlink where the directory would go: creation must fail rather than follow it
+        let planted = base.path().join("planted");
+        symlink(base.path(), &planted).unwrap();
+        let e = create_private_dir(&planted).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        // and through the allocator: the planted name is skipped, not followed
+        let dir = scratch_dir_named(base.path(), {
+            let mut names = ["planted", "fresh"].into_iter();
+            move || names.next().unwrap().to_string()
+        })
+        .unwrap();
+        assert_eq!(dir, base.path().join("fresh"));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(
+            entries(&dir).is_empty(),
+            "nothing was written through the link"
+        );
+    }
+
+    #[test]
+    fn a_taken_name_is_retried_under_another_and_the_search_gives_up() {
+        let _env = Env::lock();
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("a")).unwrap();
+        std::fs::write(base.path().join("b"), "a file is in the way too").unwrap();
+        let mut asked = 0;
+        let dir = scratch_dir_named(base.path(), || {
+            asked += 1;
+            ["a", "b", "c"][asked - 1].to_string()
+        })
+        .unwrap();
+        assert_eq!(dir, base.path().join("c"));
+        assert_eq!(asked, 3);
+
+        // always taken: gives up after exactly SCRATCH_ATTEMPTS names, with the collision as the error
+        let mut asked = 0;
+        let e = scratch_dir_named(base.path(), || {
+            asked += 1;
+            "a".to_string()
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(asked, SCRATCH_ATTEMPTS);
+        assert_eq!(SCRATCH_ATTEMPTS, 16);
     }
 
     #[test]
@@ -1281,7 +1372,7 @@ mod tests {
         let victim = victim_dir.path().join("victim.txt");
         std::fs::write(&victim, "precious").unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        // where the previous implementation wrote: `<temp_dir>/ak-verify-<pid>.py`
+        // where the original implementation wrote: `<temp_dir>/ak-verify-<pid>.py`
         let old_path = tmp
             .path()
             .join(format!("ak-verify-{}.py", std::process::id()));
@@ -1303,17 +1394,53 @@ mod tests {
     }
 
     #[test]
-    fn the_scratch_directory_is_removed_when_the_interpreter_cannot_be_spawned() {
-        let env = Env::lock();
+    fn the_program_is_read_from_stdin_and_never_written_to_disk() {
+        let _env = Env::lock();
+        if skip_without_python3("the_program_is_read_from_stdin_and_never_written_to_disk") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
-        let empty_path = tempfile::tempdir().unwrap();
-        std::env::set_var("TMPDIR", tmp.path());
-        std::env::set_var("PATH", empty_path.path());
+        // the script lists its own working directory and fails if it finds anything, then checks it is a fresh private directory
+        let program = "import os, stat\n\
+                       assert os.listdir('.') == [], os.listdir('.')\n\
+                       assert stat.S_IMODE(os.stat('.').st_mode) == 0o700\n\
+                       assert os.path.basename(os.getcwd()).startswith('ak-verify-')\n";
+        assert!(run_in_scratch(
+            tmp.path(),
+            "python3",
+            program,
+            Duration::from_secs(20)
+        ));
+        assert!(entries(tmp.path()).is_empty());
+    }
 
-        // no python3 on this PATH, so the spawn fails; that must be a plain `false` and leave nothing behind
-        assert!(!run_exec("pass", "x = 1"));
+    #[test]
+    fn a_script_that_reads_stdin_sees_end_of_file_instead_of_blocking() {
+        let _env = Env::lock();
+        if skip_without_python3("a_script_that_reads_stdin_sees_end_of_file_instead_of_blocking") {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let program = "import sys\nassert sys.stdin.read() == ''\n";
+        assert!(run_in_scratch(
+            tmp.path(),
+            "python3",
+            program,
+            Duration::from_secs(20)
+        ));
+    }
 
-        drop(env);
+    #[test]
+    fn the_scratch_directory_is_removed_when_the_interpreter_cannot_be_spawned() {
+        let _env = Env::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        // a plain `false` that leaves nothing behind
+        assert!(!run_in_scratch(
+            tmp.path(),
+            "ak-no-such-interpreter",
+            "x = 1",
+            Duration::from_secs(1)
+        ));
         assert!(
             entries(tmp.path()).is_empty(),
             "left: {:?}",
@@ -1323,20 +1450,57 @@ mod tests {
 
     #[test]
     fn the_scratch_directory_is_removed_after_a_failing_run() {
-        let env = Env::lock();
+        let _env = Env::lock();
         if skip_without_python3("the_scratch_directory_is_removed_after_a_failing_run") {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("TMPDIR", tmp.path());
-
-        assert!(!run_exec("assert False", "x = 1"));
-
-        drop(env);
+        assert!(!run_in_scratch(
+            tmp.path(),
+            "python3",
+            "assert False",
+            Duration::from_secs(20)
+        ));
         assert!(
             entries(tmp.path()).is_empty(),
             "left: {:?}",
             entries(tmp.path())
+        );
+    }
+
+    /// A script that outlives the timeout is killed, reaped (not left a zombie), and its directory removed.
+    #[test]
+    fn a_script_that_outlives_the_timeout_is_killed_and_reaped_and_cleaned_up() {
+        let _env = Env::lock();
+        if skip_without_python3(
+            "a_script_that_outlives_the_timeout_is_killed_and_reaped_and_cleaned_up",
+        ) {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("pid.txt");
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        // the script records its pid, then sleeps for far longer than the timeout
+        let program = format!(
+            "import os, time\nopen({:?}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n",
+            pidfile.to_str().unwrap()
+        );
+        let started = std::time::Instant::now();
+        let ok = run_in_scratch(&work, "python3", &program, Duration::from_millis(2500));
+        let took = started.elapsed();
+        assert!(!ok, "a timed-out script is a failure");
+        assert!(took >= Duration::from_millis(2500), "{took:?}");
+        assert!(
+            took < Duration::from_secs(30),
+            "it was not killed: {took:?}"
+        );
+        assert!(entries(&work).is_empty(), "left: {:?}", entries(&work));
+        let pid = std::fs::read_to_string(&pidfile)
+            .expect("the script never started within the timeout; rerun on a less loaded machine");
+        assert!(
+            !is_alive_or_zombie(pid.trim()),
+            "pid {pid} is still running or was not reaped"
         );
     }
 }
