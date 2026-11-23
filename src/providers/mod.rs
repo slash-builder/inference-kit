@@ -51,6 +51,16 @@ pub struct Budget {
     pub pricing: Pricing,
 }
 
+/// The key header value, marked sensitive (see `crate::sensitive_header`). A key that is not a valid header value is an
+/// authentication failure, and the key is not in the error.
+#[cfg(any(feature = "provider-anthropic", feature = "provider-gemini"))]
+pub(crate) fn sensitive_header_value(
+    secret: &str,
+) -> Result<reqwest::header::HeaderValue, crate::provider::ProviderError> {
+    crate::sensitive_header::sensitive_header_value(secret)
+        .ok_or(crate::provider::ProviderError::Auth)
+}
+
 #[cfg(feature = "provider-anthropic")]
 pub mod anthropic;
 #[cfg(feature = "provider-gemini")]
