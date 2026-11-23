@@ -81,14 +81,7 @@ impl Pricing {
             + per_million(u.cache_write_tokens, self.cache_write_micro_per_mtok)
     }
 
-    /// True when neither the input nor the output rate is declared. Such a price makes every worst case zero, so a ledger could never refuse
-    /// the call. This is the all-zero case only; a price with one rate missing is still unable to cap some requests, so a provider that
-    /// leaves home is checked per request kind with [`Pricing::can_cap`] instead.
-    pub fn is_unpriced(&self) -> bool {
-        self.input_micro_per_mtok == 0 && self.output_micro_per_mtok == 0
-    }
-
-    /// Can a ledger enforce a cap on a request of this kind at these prices? Text needs both an input and an output rate (the worst case
+    /// Can a ledger enforce a cap on a request of this kind at these prices? (An all-zero price cannot cap anything.) Text needs both an input and an output rate (the worst case
     /// is the whole prompt plus the whole output allowance); an embedding is reserved at the input rate, so it needs that one. A kind the
     /// ledger does not price (images, audio) is never capped here, so it answers `false`: fail closed.
     pub fn can_cap(&self, kind: crate::modality::RequestKind) -> bool {
@@ -114,16 +107,15 @@ impl Pricing {
 }
 
 /// Money set aside for one in-flight call.
+///
+/// **A reservation that is dropped is neither settled nor released: it stays reserved** (fail closed, and permanent for the life of the
+/// ledger). So a call future that is cancelled between `reserve` and `settle`/`release` (a timeout around the whole call, a dropped task)
+/// leaks its reservation. A guard that released it on drop would fail open (the vendor may have billed a request that was already sent), and
+/// one that charged it would turn dropping a reservation on purpose into spend; neither is a change to make quietly to a public type. Do not put an outer
+/// timeout around a provider call unless a leaked reservation is acceptable.
 #[derive(Debug)]
 #[must_use = "settle or release a reservation, or the money stays reserved"]
 pub struct Reservation(u64);
-
-impl Reservation {
-    /// The micro-dollars this reservation holds.
-    pub fn amount(&self) -> u64 {
-        self.0
-    }
-}
 
 struct State {
     remaining: u64,
