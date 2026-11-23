@@ -559,6 +559,22 @@ models:
             "Research use only",
             "CC-BY-NC-4.0",
             "Apache-2.0 for personal use",
+            "don't use commercially",
+            "cannot be used for commercial purposes",
+            "Commercial use unauthorized",
+            "Commercial use needs permission",
+            "Uso comercial prohibido",
+            "Usage commercial interdit",
+            "Nutzung kommerziell verboten",
+            "Vietato uso commerciale",
+            "MIT; commercial=false",
+            "商用禁止",
+            "禁止商用",
+            "非商用",
+            "MIT evaluation version",
+            "MIT personal edition",
+            "MIT (research model)",
+            "not for commercial use, no restrictions on research",
         ] {
             let mut m = with_licence(Some(l));
             assert_eq!(m.licence_class(), NonCommercial, "{l}");
@@ -640,5 +656,72 @@ models:
             r.check_licence("not-in-the-catalog", false).is_ok(),
             "an unknown id is the service's ModelNotFound to report, not a licence matter"
         );
+    }
+
+    fn with_field(licence: &str, field: Option<&str>) -> ModelMetadata {
+        let mut m = with_licence(Some(licence));
+        if let Some(v) = field {
+            m.metadata.custom.insert("commercial_use".into(), v.into());
+        }
+        m
+    }
+
+    #[test]
+    fn the_commercial_use_field_is_trimmed_and_case_insensitive() {
+        use crate::types::LicenceClass::{Commercial, NonCommercial, Unknown};
+        for v in [
+            "true", "True", "TRUE", " TRUE ", "yes", "Yes", "YES", "\tyes\n",
+        ] {
+            assert_eq!(
+                with_field("custom", Some(v)).licence_class(),
+                Commercial,
+                "{v:?}"
+            );
+        }
+        for v in ["false", "False", " FALSE ", "no", "No", " NO "] {
+            assert_eq!(
+                with_field("custom", Some(v)).licence_class(),
+                NonCommercial,
+                "{v:?}"
+            );
+            // and it wins over a permissive name
+            assert_eq!(
+                with_field("MIT", Some(v)).licence_class(),
+                NonCommercial,
+                "{v:?}"
+            );
+        }
+        // anything else is not an answer: the name decides
+        for v in ["", "maybe", "1", "ok"] {
+            assert_eq!(
+                with_field("custom", Some(v)).licence_class(),
+                Unknown,
+                "{v:?}"
+            );
+            assert_eq!(
+                with_field("MIT", Some(v)).licence_class(),
+                Commercial,
+                "{v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn affirmative_wording_is_commercial_with_and_without_the_field() {
+        use crate::types::LicenceClass::{Commercial, NonCommercial};
+        for l in [
+            "MIT, no commercial restrictions",
+            "Apache 2.0 - commercial use permitted, no restrictions",
+            "Apache-2.0 (commercial use OK, no attribution required)",
+            "MIT-0",
+            "Licensed under MIT",
+        ] {
+            assert_eq!(with_field(l, None).licence_class(), Commercial, "{l}");
+            assert_eq!(
+                with_field(l, Some("false")).licence_class(),
+                NonCommercial,
+                "{l}"
+            );
+        }
     }
 }
